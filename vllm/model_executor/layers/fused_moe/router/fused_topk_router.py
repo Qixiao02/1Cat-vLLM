@@ -1,5 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SX_OPT_ROUTER32 (default "1"; "0" restores the previous behaviour):
+#   Widen the exact SM70 Qwen3.8 E512/K10 Triton router top-k from 1<=M<=16 to
+#   1<=M<=32 (design_1 [C2]). The widened route launches
+#   _sm70_qwen38_router_topk_runtime_m_kernel, a copy of the M<=16 kernel whose
+#   row count M is a runtime (non-specialized) argument, so every width 1..32
+#   shares one compiled variant (plus the M1 packed-half-key variant) instead
+#   of JIT-compiling a new variant per width mid-serving. M is only used for
+#   the integer source-row index; the floating-point body is textually
+#   identical, so each row is bitwise identical to the M<=16 kernel.
+#   It is only armed for routers built while no speculative decoding (MTP /
+#   EAGLE / ...) is configured, tensor_parallel_size == 4 and the text hidden
+#   size is 2560 (the deployed Qwen3.8-Flash-Next contract; Qwen3-Next shares
+#   the E512/K10 router shape but not the hidden size); other deployments
+#   keep the M<=16 constexpr-M kernel and the
+#   generic topk_softmax above M16 exactly as before. Numerics: ids and
+#   source rows equal topk_softmax; weights within the admitted 1e-7 contract
+#   (M17..32 previously used topk_softmax, so those widths are not bitwise
+#   vs. the old route; M1..16 are bitwise vs. the old Triton route).
+import os
 from collections.abc import Callable
 
 import torch
@@ -18,6 +37,46 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
+
+_SX_OPT_ROUTER32 = os.environ.get("SX_OPT_ROUTER32", "1") != "0"
+# Width limits of the exact SM70 Qwen3.8 E512/K10 Triton router.
+_SM70_QWEN38_ROUTER_TOPK_LEGACY_MAX_M = 16
+_SM70_QWEN38_ROUTER_TOPK_RUNTIME_M_MAX_M = 32
+
+
+def _sm70_qwen38_router_runtime_m_for_current_config() -> bool:
+    """Arm the M<=32 runtime-M router only for the no-spec TP4 contract.
+
+    Evaluated once per router at model construction, where the vLLM config is
+    current. Without a config (standalone kernels/benchmarks) the deployment
+    contract is assumed. Speculative decoding, a TP size other than 4, or a
+    text hidden size other than Qwen3.8-Flash-Next's 2560 (e.g. Qwen3-Next,
+    which shares the E512/K10 router shape) keeps the previous route (M<=16
+    constexpr-M kernel, topk_softmax above).
+    """
+    if not _SX_OPT_ROUTER32:
+        return False
+    try:
+        from vllm.config.vllm import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+    except Exception:  # pragma: no cover - defensive import guard
+        config = None
+    if config is None:
+        return True
+    if getattr(config, "speculative_config", None) is not None:
+        return False
+    hidden_size = getattr(
+        getattr(getattr(config, "model_config", None), "hf_text_config", None),
+        "hidden_size",
+        None,
+    )
+    if isinstance(hidden_size, int) and hidden_size != 2560:
+        return False
+    tp_size = getattr(
+        getattr(config, "parallel_config", None), "tensor_parallel_size", None
+    )
+    return tp_size is None or int(tp_size) == 4
 
 
 @triton.jit
@@ -126,6 +185,118 @@ def _sm70_qwen38_router_topk(
     )
 
 
+@triton.jit(do_not_specialize=["M"])
+def _sm70_qwen38_router_topk_runtime_m_kernel(
+    gating_ptr,
+    topk_weights_ptr,
+    topk_ids_ptr,
+    token_expert_indices_ptr,
+    M,
+    E: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    PACKED_HALF_KEY: tl.constexpr = False,
+) -> None:
+    """_sm70_qwen38_router_topk_kernel with a runtime, non-specialized M.
+
+    Everything except the source-row index store is a verbatim copy of the
+    constexpr-M kernel above (same BLOCK_E/K/num_warps layout, sort, softmax
+    and normalization reduction), so every row is bitwise identical to it.
+    """
+
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_E)
+    valid = offsets < E
+    logits = tl.load(
+        gating_ptr + row * E + offsets,
+        mask=valid,
+        other=-float("inf"),
+    ).to(tl.float32)
+    max_logit = tl.max(logits, axis=0)
+
+    # Match topk_softmax's degenerate-row behavior: NaN, +Inf, or all -Inf
+    # produces the first K expert IDs with zero weights.
+    has_nan = tl.max((logits != logits).to(tl.int32), axis=0) != 0
+    invalid_row = has_nan | (max_logit == float("inf")) | (max_logit == -float("inf"))
+    sort_logits = tl.where(invalid_row, -offsets.to(tl.float32), logits)
+    # Numeric ties use the lower expert ID in the generic CUDA op. Canonicalize
+    # signed zero before bit packing so -0.0 and +0.0 remain one tie class.
+    sort_logits = tl.where(sort_logits == 0.0, 0.0, sort_logits)
+
+    # Transform float32 into an ascending-sortable key. Packing the expert ID
+    # into the low bits preserves the generic kernel's lower-ID tie break.
+    if PACKED_HALF_KEY:
+        # FP16 -> FP32 above is exact. Sort the original 16-bit values plus
+        # nine expert-ID bits in one int32, without quantizing any logits.
+        # Degenerate rows use -offsets (0..511), also exactly representable.
+        tl.static_assert(E == 512 and BLOCK_E == 512)
+        bits = sort_logits.to(tl.float16).to(tl.int16, bitcast=True).to(tl.int32)
+        key = tl.where(bits < 0, bits ^ 0x8000, bits ^ 0xFFFF) & 0xFFFF
+        # Original int64 sort is signed: flip the key sign bit when moving
+        # to a positive 25-bit key so positive logits still precede negatives.
+        packed = ((key ^ 0x8000) << 9) | offsets
+        sorted_packed = tl.sort(packed, descending=False)
+        sorted_keys = (sorted_packed >> 9) ^ 0x8000
+        sorted_ids = sorted_packed & 0x1FF
+        sorted_bits = tl.where(
+            (sorted_keys & 0x8000) != 0,
+            sorted_keys ^ 0xFFFF,
+            sorted_keys ^ 0x8000,
+        ).to(tl.uint16)
+        sorted_logits = sorted_bits.to(tl.float16, bitcast=True).to(tl.float32)
+    else:
+        min_i32: tl.constexpr = -2147483648
+        logit_bits = sort_logits.to(tl.int32, bitcast=True)
+        sign = logit_bits >> 31
+        key = tl.where(sign == 0, logit_bits ^ -1, logit_bits ^ min_i32)
+        key = tl.where(valid, key, 0x7FFFFFFF)
+        packed = ((key.to(tl.int64) & 0xFFFFFFFF) << 32) | offsets.to(tl.int64)
+        sorted_packed = tl.sort(packed, descending=False)
+
+        sorted_keys = ((sorted_packed >> 32) & 0xFFFFFFFF).to(tl.int32)
+        sorted_ids = (sorted_packed & 0xFFFFFFFF).to(tl.int32)
+        sorted_sign = sorted_keys >> 31
+        sorted_bits = tl.where(sorted_sign < 0, sorted_keys ^ -1, sorted_keys ^ min_i32)
+        sorted_logits = sorted_bits.to(tl.float32, bitcast=True)
+
+    raw_weights = tl.math.exp2((sorted_logits - max_logit) * 1.4426950408889634)
+    raw_weights = tl.where(invalid_row, 0.0, raw_weights)
+    top_mask = offsets < K
+    denominator = tl.sum(tl.where(top_mask, raw_weights, 0.0), axis=0)
+    denominator = tl.where(denominator > 0.0, denominator, 1.0)
+    weights = raw_weights / denominator
+
+    output_offsets = row * K + offsets
+    tl.store(topk_ids_ptr + output_offsets, sorted_ids, mask=top_mask)
+    tl.store(topk_weights_ptr + output_offsets, weights, mask=top_mask)
+    # Match topkGating's rank-major source-row convention (runtime M).
+    tl.store(
+        token_expert_indices_ptr + output_offsets, offsets * M + row, mask=top_mask
+    )
+
+
+def _sm70_qwen38_router_topk_runtime_m(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    token_expert_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+) -> None:
+    """Launch the runtime-M router; one compiled variant serves M1..M32."""
+    num_tokens = gating_output.shape[0]
+    _sm70_qwen38_router_topk_runtime_m_kernel[(num_tokens,)](
+        gating_output,
+        topk_weights,
+        topk_ids,
+        token_expert_indices,
+        num_tokens,
+        E=512,
+        K=10,
+        BLOCK_E=512,
+        PACKED_HALF_KEY=(gating_output.dtype == torch.float16 and num_tokens == 1),
+        num_warps=8,
+    )
+
+
 def vllm_topk_softmax(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -185,7 +356,16 @@ def fused_topk(
     renormalize: bool,
     indices_type: torch.dtype | None = None,
     scoring_func: str = "softmax",
+    sm70_qwen38_router_runtime_m: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused top-k routing.
+
+    ``sm70_qwen38_router_runtime_m`` (set only by FusedTopKRouter when
+    SX_OPT_ROUTER32 is on for the no-spec Qwen3.8-Flash-Next TP4 contract, see
+    _sm70_qwen38_router_runtime_m_for_current_config) widens the
+    exact SM70 Qwen3.8 E512/K10 Triton router from M<=16 to M<=32 using the
+    runtime-M kernel. Other callers keep the previous M<=16 constexpr route.
+    """
     assert hidden_states.size(0) == gating_output.size(0), "Number of tokens mismatch"
 
     M, _ = hidden_states.size()
@@ -204,9 +384,14 @@ def fused_topk(
     )
 
     if scoring_func == "softmax":
+        router_max_m = (
+            _SM70_QWEN38_ROUTER_TOPK_RUNTIME_M_MAX_M
+            if sm70_qwen38_router_runtime_m
+            else _SM70_QWEN38_ROUTER_TOPK_LEGACY_MAX_M
+        )
         if (
             envs.VLLM_SM70_QWEN38_ROUTER_TOPK
-            and 1 <= M <= 16
+            and 1 <= M <= router_max_m
             and gating_output.shape == (M, 512)
             and gating_output.dtype == torch.float16
             and gating_output.is_contiguous()
@@ -215,15 +400,29 @@ def fused_topk(
             and topk_ids.dtype == torch.int32
             and current_platform.is_device_capability(70)
         ):
-            logger.info_once(
-                "SM70 Qwen3.8 E512/K10 router top-k path enabled for M=%d.", M
-            )
-            _sm70_qwen38_router_topk(
-                topk_weights,
-                topk_ids,
-                token_expert_indices,
-                gating_output,
-            )
+            if sm70_qwen38_router_runtime_m:
+                logger.info_once(
+                    "SM70 Qwen3.8 E512/K10 router top-k path enabled for M=%d "
+                    "(runtime-M kernel, M<=%d).",
+                    M,
+                    router_max_m,
+                )
+                _sm70_qwen38_router_topk_runtime_m(
+                    topk_weights,
+                    topk_ids,
+                    token_expert_indices,
+                    gating_output,
+                )
+            else:
+                logger.info_once(
+                    "SM70 Qwen3.8 E512/K10 router top-k path enabled for M=%d.", M
+                )
+                _sm70_qwen38_router_topk(
+                    topk_weights,
+                    topk_ids,
+                    token_expert_indices,
+                    gating_output,
+                )
             return topk_weights, topk_ids, token_expert_indices
 
         topk_func = dispatch_topk_softmax_func(
@@ -267,6 +466,10 @@ class FusedTopKRouter(BaseRouter):
         )
         self.renormalize = renormalize
         self.scoring_func = scoring_func
+        # SX_OPT_ROUTER32: decided once at construction (config is current).
+        self._sm70_qwen38_router_runtime_m = (
+            _sm70_qwen38_router_runtime_m_for_current_config()
+        )
 
     @property
     def routing_method_type(self) -> RoutingMethodType:
@@ -294,6 +497,9 @@ class FusedTopKRouter(BaseRouter):
             renormalize=self.renormalize,
             indices_type=indices_type,
             scoring_func=self.scoring_func,
+            sm70_qwen38_router_runtime_m=getattr(
+                self, "_sm70_qwen38_router_runtime_m", False
+            ),
         )
 
         return topk_weights, topk_ids

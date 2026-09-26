@@ -1,8 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Opt-in fused checkpoint-FP16 HyperConnection decode route for SM70."""
+"""Opt-in fused checkpoint-FP16 HyperConnection decode route for SM70.
+
+SX batch-1 overlay (dense-multirow, design_4 MR3 + MR9a): decode widths
+M >= 2 in the FULL decode graph run the replicated fused HC chain with
+multi-row Triton kernels instead of the cuBLAS down/SiLU/up/gate-mix chain.
+Per token row the down projection (BLOCK_K 256 / 4 warps, FP16 boundary,
+/4, SiLU) and the row-4 up/gate/mix (BLOCK_K 512 / 8 warps, FP16 gate,
+sigmoid, branch-ordered FMA) are bitwise equal to the M=1 replicated kernels,
+which 1Cat validated bitwise against the production M=1 TP4-sharded route.
+Switches: SX_OPT_ROWS / SX_OPT_ROWS_MAX_M / SX_OPT_ROWS_TABLE ("hc" role),
+SX_OPT_ROWS_FUSED_REDUCE, SX_OPT_ROWS_HC_DOWN_TILE, SX_OPT_ROWS_HC_DOWN_NW,
+SX_OPT_ROWS_HC_UP_TILE and SX_OPT_ROWS_HC_NORM (see sm70_fp16_gemv.py).
+"""
 
 from __future__ import annotations
+
+from typing import NamedTuple
 
 import torch
 from torch import nn
@@ -14,7 +28,15 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from .sm70_fp16_gemv import _exact_runtime_contract
+from .sm70_fp16_gemv import (
+    _exact_runtime_contract,
+    _sx_decode_graph_active,
+    _sx_rows_config,
+    _sx_rows_max_m,
+    _sx_rows_reduce,
+    _sx_rows_x,
+    _sx_split_rows,
+)
 
 logger = init_logger(__name__)
 
@@ -22,6 +44,10 @@ _HC_COUNT = 4
 _HC_DIM = 2560
 _HC_RANK = 320
 _HC_HIDDEN = _HC_COUNT * _HC_DIM
+
+# Set when enable_qwen38_sm70_fp16_fused_hc marks at least one module; the
+# MR9a combine-norm tile switch in ops/hc.py is confined to such models.
+_SX_HC_FUSED_MODULES = 0
 
 
 @triton.jit
@@ -252,6 +278,669 @@ def _qwen38_hc_up_gate_mix_row4_kernel(
     tl.store(out_ptr + hidden, result / HC_COUNT, mask=hidden_mask)
 
 
+@triton.jit
+def _sx_hc_down_store(
+    acc_sum,
+    row,
+    m,
+    M,
+    lora_ptr,
+    injection_ptr,
+    RANK_VALUE: tl.constexpr,
+    HC_COUNT: tl.constexpr,
+    MASK_ROWS: tl.constexpr,
+):
+    # Same epilogue as _qwen38_hc_down_silu_inject_kernel for token row m.
+    value = acc_sum.to(tl.float16).to(tl.float32)
+    is_lora = row < RANK_VALUE
+    is_injection = ~is_lora
+    if MASK_ROWS:
+        row_ok = m < M
+        is_lora = is_lora & row_ok
+        is_injection = is_injection & row_ok
+    scaled = value / HC_COUNT
+    tl.store(
+        lora_ptr + m * RANK_VALUE + row,
+        scaled * tl.sigmoid(scaled),
+        mask=is_lora,
+    )
+    tl.store(
+        injection_ptr + m * HC_COUNT + row - RANK_VALUE,
+        value,
+        mask=is_injection,
+    )
+
+
+@triton.jit
+def _sx_hc_down_epilogue(
+    a0,
+    a1,
+    a2,
+    a3,
+    row,
+    m0,
+    M,
+    lora_ptr,
+    injection_ptr,
+    RANK_VALUE: tl.constexpr,
+    HC_COUNT: tl.constexpr,
+    ROWS: tl.constexpr,
+    MASK_ROWS: tl.constexpr,
+    FUSED_REDUCE: tl.constexpr,
+):
+    v0, v1, v2, v3, _u4, _u5, _u6, _u7 = _sx_rows_reduce(
+        a0, a1, a2, a3, a0, a0, a0, a0, ROWS, FUSED_REDUCE, 0
+    )
+    _sx_hc_down_store(
+        v0, row, m0, M, lora_ptr, injection_ptr, RANK_VALUE, HC_COUNT, MASK_ROWS
+    )
+    if ROWS > 1:
+        _sx_hc_down_store(
+            v1, row, m0 + 1, M, lora_ptr, injection_ptr, RANK_VALUE, HC_COUNT,
+            MASK_ROWS,
+        )  # fmt: skip
+    if ROWS > 2:
+        _sx_hc_down_store(
+            v2, row, m0 + 2, M, lora_ptr, injection_ptr, RANK_VALUE, HC_COUNT,
+            MASK_ROWS,
+        )  # fmt: skip
+    if ROWS > 3:
+        _sx_hc_down_store(
+            v3, row, m0 + 3, M, lora_ptr, injection_ptr, RANK_VALUE, HC_COUNT,
+            MASK_ROWS,
+        )  # fmt: skip
+
+
+@triton.jit
+def _qwen38_hc_down_silu_inject_rows_kernel(
+    x_ptr,
+    weight_ptr,
+    lora_ptr,
+    injection_ptr,
+    M,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    RANK_VALUE: tl.constexpr,
+    HC_COUNT: tl.constexpr,
+    NW: tl.constexpr,
+    ROWS: tl.constexpr,
+    MASK_ROWS: tl.constexpr,
+    FUSED_REDUCE: tl.constexpr,
+):
+    """NW checkpoint rows x ROWS token rows per program (MR3 down).
+
+    Oracle: _qwen38_hc_down_silu_inject_kernel (BLOCK_K 256 / 4 warps).  Each
+    (weight row, token row) pair owns one 1-D accumulator with the M=1
+    layout; x chunks are shared by the NW weight rows, weight chunks by the
+    ROWS token rows.  Grid (cdiv(M, ROWS), 324 // NW): the 324 computed rows
+    are exactly the M=1 grid; the 12 pad rows are never computed.
+    """
+    tl.static_assert(NW >= 1)
+    tl.static_assert(NW <= 4)
+    tl.static_assert(NW != 3)
+    tl.static_assert(ROWS >= 1)
+    tl.static_assert(ROWS <= 4)
+    m0 = tl.program_id(0) * ROWS
+    n0 = tl.program_id(1) * NW
+    offsets = tl.arange(0, BLOCK_K)
+    a00 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    a01 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    a02 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    a03 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    a10 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    a11 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    a12 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    a13 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    a20 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    a21 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    a22 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    a23 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    a30 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    a31 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    a32 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    a33 = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    for block_start in tl.static_range(0, K, BLOCK_K):
+        indices = block_start + offsets
+        mask = indices < K
+        x0 = _sx_rows_x(x_ptr, m0, M, K, indices, mask, True, MASK_ROWS)
+        x1 = x0
+        x2 = x0
+        x3 = x0
+        if ROWS > 1:
+            x1 = _sx_rows_x(x_ptr, m0 + 1, M, K, indices, mask, True, MASK_ROWS)
+        if ROWS > 2:
+            x2 = _sx_rows_x(x_ptr, m0 + 2, M, K, indices, mask, True, MASK_ROWS)
+        if ROWS > 3:
+            x3 = _sx_rows_x(x_ptr, m0 + 3, M, K, indices, mask, True, MASK_ROWS)
+
+        w0 = tl.load(
+            weight_ptr + n0 * K + indices,
+            mask=mask,
+            other=0.0,
+            eviction_policy="evict_first",
+        ).to(tl.float32)
+        a00 += x0 * w0
+        if ROWS > 1:
+            a01 += x1 * w0
+        if ROWS > 2:
+            a02 += x2 * w0
+        if ROWS > 3:
+            a03 += x3 * w0
+        if NW > 1:
+            w1 = tl.load(
+                weight_ptr + (n0 + 1) * K + indices,
+                mask=mask,
+                other=0.0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)
+            a10 += x0 * w1
+            if ROWS > 1:
+                a11 += x1 * w1
+            if ROWS > 2:
+                a12 += x2 * w1
+            if ROWS > 3:
+                a13 += x3 * w1
+        if NW > 2:
+            w2 = tl.load(
+                weight_ptr + (n0 + 2) * K + indices,
+                mask=mask,
+                other=0.0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)
+            w3 = tl.load(
+                weight_ptr + (n0 + 3) * K + indices,
+                mask=mask,
+                other=0.0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)
+            a20 += x0 * w2
+            a30 += x0 * w3
+            if ROWS > 1:
+                a21 += x1 * w2
+                a31 += x1 * w3
+            if ROWS > 2:
+                a22 += x2 * w2
+                a32 += x2 * w3
+            if ROWS > 3:
+                a23 += x3 * w2
+                a33 += x3 * w3
+
+    _sx_hc_down_epilogue(
+        a00, a01, a02, a03, n0, m0, M, lora_ptr, injection_ptr,
+        RANK_VALUE, HC_COUNT, ROWS, MASK_ROWS, FUSED_REDUCE,
+    )  # fmt: skip
+    if NW > 1:
+        _sx_hc_down_epilogue(
+            a10, a11, a12, a13, n0 + 1, m0, M, lora_ptr, injection_ptr,
+            RANK_VALUE, HC_COUNT, ROWS, MASK_ROWS, FUSED_REDUCE,
+        )  # fmt: skip
+    if NW > 2:
+        _sx_hc_down_epilogue(
+            a20, a21, a22, a23, n0 + 2, m0, M, lora_ptr, injection_ptr,
+            RANK_VALUE, HC_COUNT, ROWS, MASK_ROWS, FUSED_REDUCE,
+        )  # fmt: skip
+        _sx_hc_down_epilogue(
+            a30, a31, a32, a33, n0 + 3, m0, M, lora_ptr, injection_ptr,
+            RANK_VALUE, HC_COUNT, ROWS, MASK_ROWS, FUSED_REDUCE,
+        )  # fmt: skip
+
+
+@triton.jit
+def _sx_hc_lora_row(
+    lora_ptr,
+    m,
+    M,
+    K: tl.constexpr,
+    offsets,
+    k_mask,
+    MASK_ROWS: tl.constexpr,
+):
+    if MASK_ROWS:
+        load_mask = k_mask & (m < M)
+    else:
+        load_mask = k_mask
+    return tl.load(
+        lora_ptr + m * K + offsets,
+        mask=load_mask,
+        other=0.0,
+        eviction_policy="evict_last",
+    ).to(tl.float32)
+
+
+@triton.jit
+def _sx_hc_branch_row(
+    x_ptr,
+    m,
+    M,
+    hidden,
+    hidden_mask,
+    STREAM: tl.constexpr,
+    HC_DIMENSION: tl.constexpr,
+    HC_COUNT: tl.constexpr,
+    MASK_ROWS: tl.constexpr,
+):
+    if MASK_ROWS:
+        load_mask = hidden_mask & (m < M)
+    else:
+        load_mask = hidden_mask
+    return tl.load(
+        x_ptr + m * (HC_COUNT * HC_DIMENSION) + STREAM * HC_DIMENSION + hidden,
+        mask=load_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+
+@triton.jit
+def _sx_hc_up_stream(
+    weight,
+    l0,
+    l1,
+    l2,
+    l3,
+    l4,
+    l5,
+    l6,
+    l7,
+    r0,
+    r1,
+    r2,
+    r3,
+    r4,
+    r5,
+    r6,
+    r7,
+    x_ptr,
+    m0,
+    M,
+    hidden,
+    hidden_mask,
+    STREAM: tl.constexpr,
+    HC_DIMENSION: tl.constexpr,
+    HC_COUNT: tl.constexpr,
+    ROWS: tl.constexpr,
+    MASK_ROWS: tl.constexpr,
+    FUSED_REDUCE: tl.constexpr,
+):
+    """One HC stream of _qwen38_hc_up_gate_mix_row4_kernel for ROWS rows."""
+    # Branch loads are issued before the reduction barriers so their latency
+    # overlaps the gate reduction; the values are unchanged.
+    b0 = _sx_hc_branch_row(
+        x_ptr, m0, M, hidden, hidden_mask, STREAM, HC_DIMENSION, HC_COUNT,
+        MASK_ROWS,
+    )  # fmt: skip
+    b1 = b0
+    b2 = b0
+    b3 = b0
+    b4 = b0
+    b5 = b0
+    b6 = b0
+    b7 = b0
+    if ROWS > 1:
+        b1 = _sx_hc_branch_row(
+            x_ptr, m0 + 1, M, hidden, hidden_mask, STREAM, HC_DIMENSION,
+            HC_COUNT, MASK_ROWS,
+        )  # fmt: skip
+    if ROWS > 2:
+        b2 = _sx_hc_branch_row(
+            x_ptr, m0 + 2, M, hidden, hidden_mask, STREAM, HC_DIMENSION,
+            HC_COUNT, MASK_ROWS,
+        )  # fmt: skip
+    if ROWS > 3:
+        b3 = _sx_hc_branch_row(
+            x_ptr, m0 + 3, M, hidden, hidden_mask, STREAM, HC_DIMENSION,
+            HC_COUNT, MASK_ROWS,
+        )  # fmt: skip
+    if ROWS > 4:
+        b4 = _sx_hc_branch_row(
+            x_ptr, m0 + 4, M, hidden, hidden_mask, STREAM, HC_DIMENSION,
+            HC_COUNT, MASK_ROWS,
+        )  # fmt: skip
+    if ROWS > 5:
+        b5 = _sx_hc_branch_row(
+            x_ptr, m0 + 5, M, hidden, hidden_mask, STREAM, HC_DIMENSION,
+            HC_COUNT, MASK_ROWS,
+        )  # fmt: skip
+    if ROWS > 6:
+        b6 = _sx_hc_branch_row(
+            x_ptr, m0 + 6, M, hidden, hidden_mask, STREAM, HC_DIMENSION,
+            HC_COUNT, MASK_ROWS,
+        )  # fmt: skip
+    if ROWS > 7:
+        b7 = _sx_hc_branch_row(
+            x_ptr, m0 + 7, M, hidden, hidden_mask, STREAM, HC_DIMENSION,
+            HC_COUNT, MASK_ROWS,
+        )  # fmt: skip
+
+    # Keep the M=1 product form lora[None, :] * weight_f32 inside the sum:
+    # the first in-thread term is a plain multiply, the rest contract to FMA.
+    wf = weight.to(tl.float32)
+    p0 = l0[None, :] * wf
+    p1 = p0
+    p2 = p0
+    p3 = p0
+    p4 = p0
+    p5 = p0
+    p6 = p0
+    p7 = p0
+    if ROWS > 1:
+        p1 = l1[None, :] * wf
+    if ROWS > 2:
+        p2 = l2[None, :] * wf
+    if ROWS > 3:
+        p3 = l3[None, :] * wf
+    if ROWS > 4:
+        p4 = l4[None, :] * wf
+    if ROWS > 5:
+        p5 = l5[None, :] * wf
+    if ROWS > 6:
+        p6 = l6[None, :] * wf
+    if ROWS > 7:
+        p7 = l7[None, :] * wf
+    g0, g1, g2, g3, g4, g5, g6, g7 = _sx_rows_reduce(
+        p0, p1, p2, p3, p4, p5, p6, p7, ROWS, FUSED_REDUCE, 1
+    )
+    # Baseline GEMV -> FP16 gate -> sigmoid boundary, branch-ordered FMA.
+    r0 += tl.sigmoid(g0.to(tl.float16).to(tl.float32)) * b0
+    if ROWS > 1:
+        r1 += tl.sigmoid(g1.to(tl.float16).to(tl.float32)) * b1
+    if ROWS > 2:
+        r2 += tl.sigmoid(g2.to(tl.float16).to(tl.float32)) * b2
+    if ROWS > 3:
+        r3 += tl.sigmoid(g3.to(tl.float16).to(tl.float32)) * b3
+    if ROWS > 4:
+        r4 += tl.sigmoid(g4.to(tl.float16).to(tl.float32)) * b4
+    if ROWS > 5:
+        r5 += tl.sigmoid(g5.to(tl.float16).to(tl.float32)) * b5
+    if ROWS > 6:
+        r6 += tl.sigmoid(g6.to(tl.float16).to(tl.float32)) * b6
+    if ROWS > 7:
+        r7 += tl.sigmoid(g7.to(tl.float16).to(tl.float32)) * b7
+    return r0, r1, r2, r3, r4, r5, r6, r7
+
+
+@triton.jit
+def _sx_hc_up_store(
+    out_ptr,
+    result,
+    m,
+    M,
+    hidden,
+    hidden_mask,
+    HC_DIMENSION: tl.constexpr,
+    HC_COUNT: tl.constexpr,
+    MASK_ROWS: tl.constexpr,
+):
+    if MASK_ROWS:
+        store_mask = hidden_mask & (m < M)
+    else:
+        store_mask = hidden_mask
+    tl.store(out_ptr + m * HC_DIMENSION + hidden, result / HC_COUNT, mask=store_mask)
+
+
+@triton.jit
+def _qwen38_hc_up_gate_mix_row4_rows_kernel(
+    lora_ptr,
+    weight_ptr,
+    x_ptr,
+    out_ptr,
+    M,
+    K: tl.constexpr,
+    HC_DIMENSION: tl.constexpr,
+    HC_COUNT: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    ROWS: tl.constexpr,
+    MASK_ROWS: tl.constexpr,
+    FUSED_REDUCE: tl.constexpr,
+):
+    """Row-4 HC up/gate/mix for ROWS token rows sharing the weight tiles.
+
+    Oracle: _qwen38_hc_up_gate_mix_row4_kernel (BLOCK_N 4, BLOCK_K 512,
+    8 warps).  The four stream weight tiles are loaded before any reduction
+    (pure data movement: the M=1 kernel re-issues each load after the
+    previous stream's reduction barrier).
+    """
+    tl.static_assert(HC_COUNT == 4)
+    tl.static_assert(ROWS >= 1)
+    tl.static_assert(ROWS <= 8)
+    m0 = tl.program_id(0) * ROWS
+    hidden = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    offsets = tl.arange(0, BLOCK_K)
+    hidden_mask = hidden < HC_DIMENSION
+    k_mask = offsets < K
+    weight_mask = hidden_mask[:, None] & k_mask[None, :]
+
+    l0 = _sx_hc_lora_row(lora_ptr, m0, M, K, offsets, k_mask, MASK_ROWS)
+    l1 = l0
+    l2 = l0
+    l3 = l0
+    l4 = l0
+    l5 = l0
+    l6 = l0
+    l7 = l0
+    if ROWS > 1:
+        l1 = _sx_hc_lora_row(lora_ptr, m0 + 1, M, K, offsets, k_mask, MASK_ROWS)
+    if ROWS > 2:
+        l2 = _sx_hc_lora_row(lora_ptr, m0 + 2, M, K, offsets, k_mask, MASK_ROWS)
+    if ROWS > 3:
+        l3 = _sx_hc_lora_row(lora_ptr, m0 + 3, M, K, offsets, k_mask, MASK_ROWS)
+    if ROWS > 4:
+        l4 = _sx_hc_lora_row(lora_ptr, m0 + 4, M, K, offsets, k_mask, MASK_ROWS)
+    if ROWS > 5:
+        l5 = _sx_hc_lora_row(lora_ptr, m0 + 5, M, K, offsets, k_mask, MASK_ROWS)
+    if ROWS > 6:
+        l6 = _sx_hc_lora_row(lora_ptr, m0 + 6, M, K, offsets, k_mask, MASK_ROWS)
+    if ROWS > 7:
+        l7 = _sx_hc_lora_row(lora_ptr, m0 + 7, M, K, offsets, k_mask, MASK_ROWS)
+
+    w_s0 = tl.load(
+        weight_ptr + (0 * HC_DIMENSION + hidden)[:, None] * K + offsets[None, :],
+        mask=weight_mask,
+        other=0.0,
+        eviction_policy="evict_first",
+    )
+    w_s1 = tl.load(
+        weight_ptr + (1 * HC_DIMENSION + hidden)[:, None] * K + offsets[None, :],
+        mask=weight_mask,
+        other=0.0,
+        eviction_policy="evict_first",
+    )
+    w_s2 = tl.load(
+        weight_ptr + (2 * HC_DIMENSION + hidden)[:, None] * K + offsets[None, :],
+        mask=weight_mask,
+        other=0.0,
+        eviction_policy="evict_first",
+    )
+    w_s3 = tl.load(
+        weight_ptr + (3 * HC_DIMENSION + hidden)[:, None] * K + offsets[None, :],
+        mask=weight_mask,
+        other=0.0,
+        eviction_policy="evict_first",
+    )
+
+    r0 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    r1 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    r2 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    r3 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    r4 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    r5 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    r6 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    r7 = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    r0, r1, r2, r3, r4, r5, r6, r7 = _sx_hc_up_stream(
+        w_s0, l0, l1, l2, l3, l4, l5, l6, l7, r0, r1, r2, r3, r4, r5, r6, r7,
+        x_ptr, m0, M, hidden, hidden_mask, 0, HC_DIMENSION, HC_COUNT, ROWS,
+        MASK_ROWS, FUSED_REDUCE,
+    )  # fmt: skip
+    r0, r1, r2, r3, r4, r5, r6, r7 = _sx_hc_up_stream(
+        w_s1, l0, l1, l2, l3, l4, l5, l6, l7, r0, r1, r2, r3, r4, r5, r6, r7,
+        x_ptr, m0, M, hidden, hidden_mask, 1, HC_DIMENSION, HC_COUNT, ROWS,
+        MASK_ROWS, FUSED_REDUCE,
+    )  # fmt: skip
+    r0, r1, r2, r3, r4, r5, r6, r7 = _sx_hc_up_stream(
+        w_s2, l0, l1, l2, l3, l4, l5, l6, l7, r0, r1, r2, r3, r4, r5, r6, r7,
+        x_ptr, m0, M, hidden, hidden_mask, 2, HC_DIMENSION, HC_COUNT, ROWS,
+        MASK_ROWS, FUSED_REDUCE,
+    )  # fmt: skip
+    r0, r1, r2, r3, r4, r5, r6, r7 = _sx_hc_up_stream(
+        w_s3, l0, l1, l2, l3, l4, l5, l6, l7, r0, r1, r2, r3, r4, r5, r6, r7,
+        x_ptr, m0, M, hidden, hidden_mask, 3, HC_DIMENSION, HC_COUNT, ROWS,
+        MASK_ROWS, FUSED_REDUCE,
+    )  # fmt: skip
+
+    _sx_hc_up_store(
+        out_ptr, r0, m0, M, hidden, hidden_mask, HC_DIMENSION, HC_COUNT, MASK_ROWS
+    )
+    if ROWS > 1:
+        _sx_hc_up_store(
+            out_ptr, r1, m0 + 1, M, hidden, hidden_mask, HC_DIMENSION, HC_COUNT,
+            MASK_ROWS,
+        )  # fmt: skip
+    if ROWS > 2:
+        _sx_hc_up_store(
+            out_ptr, r2, m0 + 2, M, hidden, hidden_mask, HC_DIMENSION, HC_COUNT,
+            MASK_ROWS,
+        )  # fmt: skip
+    if ROWS > 3:
+        _sx_hc_up_store(
+            out_ptr, r3, m0 + 3, M, hidden, hidden_mask, HC_DIMENSION, HC_COUNT,
+            MASK_ROWS,
+        )  # fmt: skip
+    if ROWS > 4:
+        _sx_hc_up_store(
+            out_ptr, r4, m0 + 4, M, hidden, hidden_mask, HC_DIMENSION, HC_COUNT,
+            MASK_ROWS,
+        )  # fmt: skip
+    if ROWS > 5:
+        _sx_hc_up_store(
+            out_ptr, r5, m0 + 5, M, hidden, hidden_mask, HC_DIMENSION, HC_COUNT,
+            MASK_ROWS,
+        )  # fmt: skip
+    if ROWS > 6:
+        _sx_hc_up_store(
+            out_ptr, r6, m0 + 6, M, hidden, hidden_mask, HC_DIMENSION, HC_COUNT,
+            MASK_ROWS,
+        )  # fmt: skip
+    if ROWS > 7:
+        _sx_hc_up_store(
+            out_ptr, r7, m0 + 7, M, hidden, hidden_mask, HC_DIMENSION, HC_COUNT,
+            MASK_ROWS,
+        )  # fmt: skip
+
+
+class _SxHcRowsPlan(NamedTuple):
+    down_rows: int
+    down_nw: int
+    up_rows: int
+    fused_reduce: bool
+
+
+def _sx_hc_rows_plan_for_m(m: int) -> _SxHcRowsPlan | None:
+    if m < 2 or m > _sx_rows_max_m("hc"):
+        return None
+    config = _sx_rows_config()
+    return _SxHcRowsPlan(
+        down_rows=_sx_split_rows(m, config.hc_down_tile),
+        down_nw=config.hc_down_nw,
+        up_rows=_sx_split_rows(m, config.hc_up_tile),
+        fused_reduce=config.fused_reduce,
+    )
+
+
+def _sx_hc_rows_plan(
+    x: torch.Tensor, down_weight: torch.Tensor, up_weight: torch.Tensor
+) -> _SxHcRowsPlan | None:
+    if x.ndim != 2 or envs.VLLM_BATCH_INVARIANT:
+        return None
+    plan = _sx_hc_rows_plan_for_m(x.shape[0])
+    if plan is None:
+        return None
+    if not (
+        x.shape[1] == _HC_HIDDEN
+        and down_weight.shape == (_HC_RANK + _HC_COUNT + 12, _HC_HIDDEN)
+        and up_weight.shape == (_HC_HIDDEN, _HC_RANK)
+        and x.dtype == torch.float16
+        and down_weight.dtype == torch.float16
+        and up_weight.dtype == torch.float16
+        and x.is_cuda
+        and x.device == down_weight.device == up_weight.device
+        and x.is_contiguous()
+        and down_weight.is_contiguous()
+        and up_weight.is_contiguous()
+        and _sx_decode_graph_active()
+    ):
+        return None
+    return plan
+
+
+def _sx_hc_rows_forward(
+    x: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    plan: _SxHcRowsPlan,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Replicated exact HC mix for x (M, 10240): returns (block, injection)."""
+    m = x.shape[0]
+    down_rows = (_HC_RANK + _HC_COUNT) // plan.down_nw
+    if down_rows * plan.down_nw != _HC_RANK + _HC_COUNT:
+        raise ValueError(f"HC down weight-row tile {plan.down_nw} must divide 324")
+    lora = x.new_empty((m, _HC_RANK))
+    injection = x.new_empty((m, _HC_COUNT))
+    block = x.new_empty((m, _HC_DIM))
+    _qwen38_hc_down_silu_inject_rows_kernel[
+        (triton.cdiv(m, plan.down_rows), down_rows)
+    ](
+        x,
+        down_weight,
+        lora,
+        injection,
+        m,
+        K=_HC_HIDDEN,
+        BLOCK_K=256,
+        RANK_VALUE=_HC_RANK,
+        HC_COUNT=_HC_COUNT,
+        NW=plan.down_nw,
+        ROWS=plan.down_rows,
+        MASK_ROWS=m % plan.down_rows != 0,
+        FUSED_REDUCE=plan.fused_reduce,
+        num_warps=4,
+    )
+    _qwen38_hc_up_gate_mix_row4_rows_kernel[
+        (triton.cdiv(m, plan.up_rows), triton.cdiv(_HC_DIM, 4))
+    ](
+        lora,
+        up_weight,
+        x,
+        block,
+        m,
+        K=_HC_RANK,
+        HC_DIMENSION=_HC_DIM,
+        HC_COUNT=_HC_COUNT,
+        BLOCK_N=4,
+        BLOCK_K=512,
+        ROWS=plan.up_rows,
+        MASK_ROWS=m % plan.up_rows != 0,
+        FUSED_REDUCE=plan.fused_reduce,
+        num_warps=8,
+    )
+    return block, injection
+
+
+def sx_hc_rows_norm_admitted(
+    n: int, hc_dim: int, hc_count: int, dtype: torch.dtype
+) -> bool:
+    """MR9a: use the M=1 combine-norm tile at width n (see ops/hc.py)."""
+    return bool(
+        _SX_HC_FUSED_MODULES > 0
+        and hc_dim == _HC_DIM
+        and hc_count == _HC_COUNT
+        and dtype == torch.float16
+        and not envs.VLLM_BATCH_INVARIANT
+        and _sx_rows_config().hc_norm
+        and _sx_hc_rows_plan_for_m(n) is not None
+        and _sx_decode_graph_active()
+    )
+
+
 def _runtime_ok(
     x: torch.Tensor, down_weight: torch.Tensor, up_weight: torch.Tensor
 ) -> bool:
@@ -279,6 +968,15 @@ def _qwen38_sm70_fp16_fused_hc(
     up_weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not _runtime_ok(x, down_weight, up_weight):
+        # SX MR3: exact multi-row replicated chain for admitted decode widths
+        # inside the FULL decode graph (rows == M=1 route, bitwise).
+        rows_plan = _sx_hc_rows_plan(x, down_weight, up_weight)
+        if rows_plan is not None:
+            logger.info_once(
+                "SM70 Qwen3.8 exact multi-row fused FP16 HC route enabled "
+                "(SX_OPT_ROWS)."
+            )
+            return _sx_hc_rows_forward(x, down_weight, up_weight, rows_plan)
         # Preserve the ordinary projection and FP16 materialization boundaries
         # for prefill and any unsupported runtime shape. This fallback lives
         # inside the opaque op so a prefill-first dynamic compile cannot bake
@@ -449,6 +1147,8 @@ def enable_qwen38_sm70_fp16_fused_hc(
         child._sm70_qwen38_fp16_fused_hc = True
         enabled_count += 1
 
+    global _SX_HC_FUSED_MODULES
+    _SX_HC_FUSED_MODULES += enabled_count
     if enabled_count:
         logger.info_once(
             "Prepared %d Qwen3.8 SM70 fused checkpoint-FP16 HC modules.",
@@ -458,7 +1158,10 @@ def enable_qwen38_sm70_fp16_fused_hc(
 
 __all__ = [
     "_qwen38_hc_down_local_shard_kernel",
+    "_qwen38_hc_down_silu_inject_rows_kernel",
+    "_qwen38_hc_up_gate_mix_row4_rows_kernel",
     "_qwen38_hc_up_local_gate_kernel",
     "enable_qwen38_sm70_fp16_fused_hc",
     "maybe_apply_qwen38_sm70_fp16_fused_hc",
+    "sx_hc_rows_norm_admitted",
 ]

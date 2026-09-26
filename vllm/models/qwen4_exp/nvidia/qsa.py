@@ -60,11 +60,71 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa_cache import QSAForwardMetadata
 from .indexer_qsa import QSAIndexer
 
+# SX_OPT_QSA_HOST_METADATA (default "1"; "0" = baseline): attach host copies of
+# query_start_loc and seq_lens to the QSA main-attention metadata so the QSA
+# ops can size launches without a device->host sync (see the SX_OPT_QSA_*
+# switches in ops/qsa.py). Only attached without speculative decoding, where
+# seq_lens_cpu_upper_bound is exact for every row.
+_SX_OPT_QSA_HOST_METADATA = os.environ.get("SX_OPT_QSA_HOST_METADATA", "1") != "0"
+_SX_QSA_QUERY_START_LOC_CPU = "sx_qsa_query_start_loc_cpu"
+_SX_QSA_SEQ_LENS_CPU = "sx_qsa_seq_lens_cpu"
+
+
+def _sx_qsa_host_metadata(
+    metadata: object,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    return (
+        getattr(metadata, _SX_QSA_QUERY_START_LOC_CPU, None),
+        getattr(metadata, _SX_QSA_SEQ_LENS_CPU, None),
+    )
+
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+
+    def build(
+        self,
+        common_prefix_len: int,
+        common_attn_metadata,
+        fast_build: bool = False,
+    ) -> FlashAttentionMetadata:
+        metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        if _SX_OPT_QSA_HOST_METADATA and self._sx_host_metadata_allowed():
+            query_start_loc_cpu = getattr(
+                common_attn_metadata, "query_start_loc_cpu", None
+            )
+            seq_lens_cpu = getattr(common_attn_metadata, "seq_lens_cpu_upper_bound", None)
+            num_reqs = int(getattr(common_attn_metadata, "num_reqs", -1))
+            if (
+                isinstance(query_start_loc_cpu, torch.Tensor)
+                and isinstance(seq_lens_cpu, torch.Tensor)
+                and query_start_loc_cpu.device.type == "cpu"
+                and seq_lens_cpu.device.type == "cpu"
+                and num_reqs >= 1
+                and query_start_loc_cpu.shape[0] >= num_reqs + 1
+                and seq_lens_cpu.shape[0] >= num_reqs
+            ):
+                # Host tensors built for this step only; never read on device.
+                setattr(
+                    metadata,
+                    _SX_QSA_QUERY_START_LOC_CPU,
+                    query_start_loc_cpu[: num_reqs + 1],
+                )
+                setattr(metadata, _SX_QSA_SEQ_LENS_CPU, seq_lens_cpu[:num_reqs])
+        return metadata
+
+    def _sx_host_metadata_allowed(self) -> bool:
+        allowed = getattr(self, "_sx_host_metadata_allowed_cache", None)
+        if allowed is None:
+            vllm_config = getattr(self, "vllm_config", None)
+            allowed = bool(
+                vllm_config is not None
+                and getattr(vllm_config, "speculative_config", None) is None
+            )
+            self._sx_host_metadata_allowed_cache = allowed
+        return allowed
 
 
 class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
@@ -150,6 +210,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         sequence_lengths: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        query_start_loc_cpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del key, value
         if output_scale is not None or output_block_scale is not None:
@@ -202,6 +263,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             kv_cache_dtype=self.kv_cache_dtype,
             k_scale=layer._k_scale_float,
             v_scale=layer._v_scale_float,
+            query_start_loc_cpu=query_start_loc_cpu,
             **qsa_metadata,
         )
         return output
@@ -559,10 +621,16 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 key[:num_tokens],
                 value[:num_tokens],
             )
+        # Optional host copies attached by Qwen4ExpQSAMetadataBuilder. None
+        # (MTP/spec decode, other metadata builders, switch off) keeps the
+        # baseline paths; the ops ignore them while a CUDA graph is captured.
+        query_start_loc_cpu, seq_lens_cpu = _sx_qsa_host_metadata(main_metadata)
         selected = self.indexer(
             hidden_states,
             positions,
             self.topk_indices_buffer[:num_tokens],
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens_cpu=seq_lens_cpu,
         )
         if selected.shape != (
             num_tokens,
@@ -595,6 +663,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             output_gate=output_gate,
             query_positions=side_metadata.logical_positions,
             sequence_lengths=side_metadata.seq_lens,
+            query_start_loc_cpu=query_start_loc_cpu,
         )
         _sm70_dump_qwen_layer_tensor(
             "qsa_core_out",

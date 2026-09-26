@@ -6,6 +6,37 @@ The route keeps ModelOpt W4A16_NVFP4 expert weights packed. It combines the
 checkpoint's FP8 block scales with its explicit ModelOpt global scales once at
 load time, repacks both tensors for TurboMind, and never materializes an FP16
 expert-weight copy.
+
+ShiXiang overlay switches (read once at import; "0" restores the old path):
+
+SX_OPT_MOE_PERSIST32 (default "1"), design_1 [C8]:
+    For the exact Qwen3.8-Flash-Next TP4 contract (E512, hidden 2560, local
+    intermediate 160, top-k 10) without DBO/microbatching and without
+    speculative decoding (MTP/EAGLE/DFlash deployments keep capacity 18 and
+    their load-time memory footprint), the layer-owned
+    persistent decode buffers hold up to 32 tokens instead of 18
+    (``layer.sm70_nvfp4_persistent_max_tokens``). MoE calls with 19..32
+    tokens (the FULL24 decode graph, PIECEWISE graphs with 19..24 tokens and
+    eager 25..32-token steps) then take slices of those buffers instead of
+    ~18 torch.empty allocations plus two torch.arange kernels per layer.
+    Same shapes, same values (arange views), same kernels and the same
+    CUB workspace narrowing: bitwise identical. Cost: 117,520 B per token
+    slot per layer, i.e. 14 x 48 x 117,520 B ~= 79 MB per rank.
+    ``layer.sm70_nvfp4_graph_safe_max_tokens`` deliberately stays 18: the
+    SM70 warmup uses it to choose which widths get TurboMind-tuned, and
+    raising it would change the tuned tactics (and numerics) of deployments
+    that do not set VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS >= 10 * width.
+SX_OPT_MOE_EAGER_IOTA (default "1"), design_3 [P5] item 4:
+    For the same contract (also no speculative decoding), the eager buffers
+    (widths above the persistent
+    capacity: mixed/prefill steps) slice token_expert_indices and
+    compact_offsets from one per-device int32 arange created at load time
+    (max_num_batched_tokens * top_k + 1 entries; 320 KiB at 8192 tokens)
+    and memoize the CUB sort-workspace size per slot count. This removes two
+    arange kernels, two allocations and one op call per layer per eager step.
+    Both tensors are read-only in the eager route (CUB SortPairs values_in;
+    compact offsets are only written for <=80 slots, which never reach the
+    eager route), so results are bitwise identical.
 """
 
 from __future__ import annotations
@@ -62,6 +93,12 @@ _SUPPORTED_CONTRACTS: Final = {
 }
 _SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18
+# SX_OPT_MOE_PERSIST32: persistent decode-buffer capacity for the exact
+# Qwen3.8 TP4 contract (covers capture sizes up to 32).
+_SX_OPT_MOE_PERSIST32: Final = os.environ.get("SX_OPT_MOE_PERSIST32", "1") != "0"
+_QWEN38_PERSISTENT_MAX_TOKENS: Final = 32
+# SX_OPT_MOE_EAGER_IOTA: shared read-only arange for eager MoE buffers.
+_SX_OPT_MOE_EAGER_IOTA: Final = os.environ.get("SX_OPT_MOE_EAGER_IOTA", "1") != "0"
 _COMPACT_GROUPED_MAX_SLOTS: Final = 80
 # V100 real-shape M=1 tuning favors 16 warps. This retains checkpoint NVFP4,
 # FP32 MMA accumulation, and the FP16 W13 output boundary; only the order in
@@ -96,11 +133,106 @@ _QWEN38_DYNAMIC_QPN_BATCH_W13_SPLIT_K: Final = {
 _QWEN38_QPN_BATCH_FUSED_W13_TOKENS: Final = frozenset((4, 8, 16))
 _QWEN38_RAW_SCALE_WORKSPACE_ELEMENTS: Final = 512 * 160 * 320
 _qwen38_raw_scale_workspaces: dict[int, torch.Tensor] = {}
+# SX_OPT_MOE_EAGER_IOTA state: per-device read-only int32 arange, and the
+# memoized CUB sort-workspace size per (slots, experts).
+_qwen38_eager_iotas: dict[int, torch.Tensor] = {}
+_sort_workspace_sizes: dict[tuple[int, int], int] = {}
+_SORT_WORKSPACE_SIZE_CACHE_MAX: Final = 32768
 
 
 def clear_sm70_nvfp4_moe_workspaces() -> None:
     """Release process-global Qwen3.8 raw-scale expansion workspaces."""
     _qwen38_raw_scale_workspaces.clear()
+    _qwen38_eager_iotas.clear()
+    _sort_workspace_sizes.clear()
+
+
+def _is_qwen38_tp4_contract(layer: RoutedExperts) -> bool:
+    """Exact Qwen3.8-Flash-Next TP4 local expert contract."""
+    return bool(
+        int(layer.sm70_nvfp4_num_experts) == 512
+        and int(layer.sm70_nvfp4_hidden_size) == 2560
+        and int(layer.sm70_nvfp4_intermediate_size) == 160
+        and int(layer.sm70_nvfp4_top_k) == 10
+        and int(getattr(layer.moe_config, "tp_size", 0)) == 4
+    )
+
+
+def _ubatching_configured() -> bool:
+    config = get_current_vllm_config_or_none()
+    return bool(
+        config is not None
+        and getattr(getattr(config, "parallel_config", None), "use_ubatching", False)
+    )
+
+
+def _speculative_decoding_configured() -> bool:
+    """MTP/EAGLE/DFlash/... deployments are outside the SX_OPT_* contract."""
+    config = get_current_vllm_config_or_none()
+    return bool(
+        config is not None
+        and getattr(config, "speculative_config", None) is not None
+    )
+
+
+def _persistent_max_tokens_for(layer: RoutedExperts) -> int:
+    """Persistent decode-buffer capacity (SX_OPT_MOE_PERSIST32).
+
+    Layer-owned buffers are shared by every call of that layer, so they are
+    only widened where the existing persistent (<=18) route is already the
+    contract: single-stream execution (no DBO/microbatching). Speculative
+    decoding keeps the original capacity (and load-time memory) unchanged.
+    """
+    if (
+        _SX_OPT_MOE_PERSIST32
+        and _is_qwen38_tp4_contract(layer)
+        and not _ubatching_configured()
+        and not _speculative_decoding_configured()
+    ):
+        return max(_GRAPH_SAFE_MAX_TOKENS, _QWEN38_PERSISTENT_MAX_TOKENS)
+    return _GRAPH_SAFE_MAX_TOKENS
+
+
+def _get_qwen38_eager_iota(
+    layer: RoutedExperts, device: torch.device
+) -> torch.Tensor | None:
+    """Per-device read-only arange for eager buffers (SX_OPT_MOE_EAGER_IOTA).
+
+    Created at load time, never inside CUDA graph capture. Returns None (old
+    per-call torch.arange path) when disabled, outside the no-spec contract or
+    the token budget is unknown.
+    """
+    if not (
+        _SX_OPT_MOE_EAGER_IOTA
+        and _is_qwen38_tp4_contract(layer)
+        and not _speculative_decoding_configured()
+    ):
+        return None
+    config = get_current_vllm_config_or_none()
+    scheduler_config = getattr(config, "scheduler_config", None)
+    max_tokens = int(getattr(scheduler_config, "max_num_batched_tokens", 0) or 0)
+    if max_tokens <= 0:
+        return None
+    numel = max_tokens * int(layer.sm70_nvfp4_top_k) + 1
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.accelerator.current_device_index()
+    iota = _qwen38_eager_iotas.get(device_index)
+    if iota is None or iota.numel() < numel:
+        iota = torch.arange(numel, dtype=torch.int32, device=device)
+        _qwen38_eager_iotas[device_index] = iota
+    return iota
+
+
+def _moe_permute_sort_workspace_size(slots: int, experts: int) -> int:
+    """Memoized pure host query (same value as the uncached op call)."""
+    key = (slots, experts)
+    size = _sort_workspace_sizes.get(key)
+    if size is None:
+        size = int(torch.ops._moe_C.moe_permute_sort_workspace_size(slots, experts))
+        if len(_sort_workspace_sizes) < _SORT_WORKSPACE_SIZE_CACHE_MAX:
+            _sort_workspace_sizes[key] = size
+    return size
 
 
 def _raw_scales_match_prepared(
@@ -1178,7 +1310,14 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
 
         layer.sm70_glm53_fused_permute_q8 = glm53_fused_permute_q8
         layer.sm70_glm53_qpn_w13_q8 = glm53_qpn_w13_q8
+        # Warmup/tuning contract; unchanged by SX_OPT_MOE_PERSIST32 (see top).
         layer.sm70_nvfp4_graph_safe_max_tokens = _GRAPH_SAFE_MAX_TOKENS
+        # Persistent decode-buffer capacity (SX_OPT_MOE_PERSIST32).
+        layer.sm70_nvfp4_persistent_max_tokens = _persistent_max_tokens_for(layer)
+        # Shared read-only arange for eager buffers (SX_OPT_MOE_EAGER_IOTA).
+        layer._nvfp4_sm70_eager_iota = _get_qwen38_eager_iota(
+            layer, layer.w13_tm_weight.device
+        )
         layer.sm70_nvfp4_compact_grouped_max_slots = _COMPACT_GROUPED_MAX_SLOTS
         grouped_requested = bool(
             envs.VLLM_SM70_NVFP4_MOE_GROUPED_DECODE
@@ -1230,9 +1369,23 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             intermediate,
             num_experts,
             layer.sm70_nvfp4_top_k,
-            _GRAPH_SAFE_MAX_TOKENS,
+            layer.sm70_nvfp4_persistent_max_tokens,
             _COMPACT_GROUPED_MAX_SLOTS,
         )
+        if layer.sm70_nvfp4_persistent_max_tokens != _GRAPH_SAFE_MAX_TOKENS:
+            logger.info_once(
+                "SX_OPT_MOE_PERSIST32: SM70 Qwen3.8 NVFP4 MoE persistent decode "
+                "buffers cover B1-B%d (was B1-B%d); warmup/tuning widths "
+                "unchanged.",
+                layer.sm70_nvfp4_persistent_max_tokens,
+                _GRAPH_SAFE_MAX_TOKENS,
+            )
+        if layer._nvfp4_sm70_eager_iota is not None:
+            logger.info_once(
+                "SX_OPT_MOE_EAGER_IOTA: SM70 Qwen3.8 NVFP4 MoE eager buffers "
+                "slice a shared %d-entry int32 arange.",
+                layer._nvfp4_sm70_eager_iota.numel(),
+            )
         if raw_scale:
             logger.info_once(
                 "SM70 Qwen3.8 raw E4M3 expert-scale storage enabled; "
@@ -1262,13 +1415,17 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
     def _allocate_graph_safe_decode_buffers(self, layer: RoutedExperts) -> None:
         device = layer.w13_tm_weight.device
         top_k = int(layer.sm70_nvfp4_top_k)
-        max_slots = _GRAPH_SAFE_MAX_TOKENS * top_k
+        # SX_OPT_MOE_PERSIST32: 32 for the exact Qwen3.8 TP4 contract, else 18.
+        max_tokens = int(
+            getattr(layer, "sm70_nvfp4_persistent_max_tokens", _GRAPH_SAFE_MAX_TOKENS)
+        )
+        max_slots = max_tokens * top_k
         experts = int(layer.sm70_nvfp4_num_experts)
         hidden = int(layer.sm70_nvfp4_hidden_size)
         intermediate = int(layer.sm70_nvfp4_intermediate_size)
 
         layer._nvfp4_sm70_output = torch.empty(
-            _GRAPH_SAFE_MAX_TOKENS, hidden, dtype=torch.float16, device=device
+            max_tokens, hidden, dtype=torch.float16, device=device
         )
         layer._nvfp4_sm70_permuted_input = torch.empty(
             max_slots, hidden, dtype=torch.float16, device=device
@@ -1292,20 +1449,20 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             experts + 1, dtype=torch.int64, device=device
         )
         layer._nvfp4_sm70_inv_permuted_idx = torch.empty(
-            _GRAPH_SAFE_MAX_TOKENS,
+            max_tokens,
             top_k,
             dtype=torch.int32,
             device=device,
         )
         layer._nvfp4_sm70_topk_ids = torch.empty(
-            _GRAPH_SAFE_MAX_TOKENS,
+            max_tokens,
             top_k,
             dtype=torch.int32,
             device=device,
         )
         layer._nvfp4_sm70_token_expert_indices = torch.arange(
             max_slots, dtype=torch.int32, device=device
-        ).view(_GRAPH_SAFE_MAX_TOKENS, top_k)
+        ).view(max_tokens, top_k)
         layer._nvfp4_sm70_permuted_idx = torch.empty(
             max_slots, dtype=torch.int32, device=device
         )
@@ -1321,6 +1478,18 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         workspace_size = torch.ops._moe_C.moe_permute_sort_workspace_size(
             max_slots, layer.global_num_experts
         )
+        if max_tokens > _GRAPH_SAFE_MAX_TOKENS:
+            # The permute op narrows this buffer to the exact per-call size;
+            # cover every admitted width even if CUB's size is not monotonic.
+            workspace_size = max(
+                int(workspace_size),
+                *(
+                    _moe_permute_sort_workspace_size(
+                        tokens * top_k, int(layer.global_num_experts)
+                    )
+                    for tokens in range(1, max_tokens + 1)
+                ),
+            )
         layer._nvfp4_sm70_sort_workspace = torch.empty(
             workspace_size, dtype=torch.int8, device=device
         )
@@ -1373,9 +1542,29 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         experts = int(layer.sm70_nvfp4_num_experts)
         hidden = int(layer.sm70_nvfp4_hidden_size)
         intermediate = int(layer.sm70_nvfp4_intermediate_size)
-        workspace_size = torch.ops._moe_C.moe_permute_sort_workspace_size(
-            slots, layer.global_num_experts
-        )
+        iota = getattr(layer, "_nvfp4_sm70_eager_iota", None)
+        if iota is not None and slots + 1 <= iota.numel():
+            # SX_OPT_MOE_EAGER_IOTA: same values as the per-call aranges
+            # below, sliced from a load-time buffer that is never written.
+            # compact_offsets is only written by the compact/GLM grouping
+            # kernels (<=80 slots); keep a private arange if that could apply.
+            workspace_size = _moe_permute_sort_workspace_size(
+                slots, int(layer.global_num_experts)
+            )
+            token_expert_indices = iota[:slots].view(num_tokens, top_k)
+            compact_offsets = (
+                iota[: slots + 1]
+                if slots > _COMPACT_GROUPED_MAX_SLOTS
+                else torch.arange(slots + 1, dtype=torch.int32, device=device)
+            )
+        else:
+            workspace_size = torch.ops._moe_C.moe_permute_sort_workspace_size(
+                slots, layer.global_num_experts
+            )
+            token_expert_indices = torch.arange(
+                slots, dtype=torch.int32, device=device
+            ).view(num_tokens, top_k)
+            compact_offsets = torch.arange(slots + 1, dtype=torch.int32, device=device)
         return {
             "output": torch.empty(
                 num_tokens, hidden, dtype=torch.float16, device=device
@@ -1411,9 +1600,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             "topk_ids": torch.empty(
                 num_tokens, top_k, dtype=torch.int32, device=device
             ),
-            "token_expert_indices": torch.arange(
-                slots, dtype=torch.int32, device=device
-            ).view(num_tokens, top_k),
+            "token_expert_indices": token_expert_indices,
             "permuted_idx": torch.empty(slots, dtype=torch.int32, device=device),
             "sort_workspace": torch.empty(
                 workspace_size, dtype=torch.int8, device=device
@@ -1422,16 +1609,19 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             "sorted_row_idx": torch.empty(slots, dtype=torch.int32, device=device),
             "topk_ids_for_sort": torch.empty(slots, dtype=torch.int32, device=device),
             "dense_expert_ids": layer._nvfp4_sm70_dense_expert_ids,
-            "compact_offsets": torch.arange(
-                slots + 1, dtype=torch.int32, device=device
-            ),
+            "compact_offsets": compact_offsets,
             "active_expert_ids": torch.empty(slots, dtype=torch.int32, device=device),
         }
 
     def _get_buffers(
         self, layer: RoutedExperts, num_tokens: int, indexed_w13: bool
     ) -> dict[str, torch.Tensor]:
-        if 0 < num_tokens <= _GRAPH_SAFE_MAX_TOKENS:
+        # SX_OPT_MOE_PERSIST32: per-layer capacity (32 for the exact Qwen3.8
+        # TP4 contract, otherwise the original 18).
+        max_tokens = getattr(
+            layer, "sm70_nvfp4_persistent_max_tokens", _GRAPH_SAFE_MAX_TOKENS
+        )
+        if 0 < num_tokens <= max_tokens:
             return self._persistent_buffers(layer, num_tokens)
         return self._eager_buffers(layer, num_tokens, indexed_w13)
 

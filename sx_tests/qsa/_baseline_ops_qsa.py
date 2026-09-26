@@ -1,3 +1,6 @@
+# Baseline copy of vllm/models/qwen4_exp/nvidia/ops/qsa.py at git 71c1822
+# (== shixiang/1cat-vllm-v100:1.7.2-sm70main). Used by sx_tests/qsa as the
+# 'old implementation'. Do not edit.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton kernels for the Qwen4Exp weight-free QSA path."""
@@ -21,28 +24,9 @@ logger = init_logger(__name__)
 
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
-_SM70_QSA_TOPK_LIBRARY = os.getenv("VLLM_SM70_QSA_TOPK_LIBRARY")
-if _SM70_QSA_TOPK_LIBRARY is not None:
-    torch.ops.load_library(_SM70_QSA_TOPK_LIBRARY)
-    _topk_version = getattr(
-        torch.ops._C_qsa_sm70, "decode_specialization_version", None
-    )
-    if _topk_version is not None:
-        logger.info(
-            "SM70 QSA source-overlay decode specialization version %d.", _topk_version()
-        )
-
-if hasattr(torch.ops._C_qsa_sm70, "qsa_lexicographic_topk"):
-
-    @torch.library.register_fake("_C_qsa_sm70::qsa_lexicographic_topk")
-    def _qsa_lexicographic_topk_sidecar_fake(
-        logits: torch.Tensor,
-        lengths: torch.Tensor,
-        output: torch.Tensor,
-        topk: int,
-    ) -> None:
-        del logits, lengths, output, topk
-        return None
+# [sx_tests] The sidecar load/register_fake block of the baseline module is
+# omitted: the live vllm module already performed it, and registering the
+# fake twice raises. Everything else is byte-identical to commit 71c1822.
 
 
 _SM70_INDEXER_CUBLAS = os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS", "1") == "1"
@@ -85,105 +69,6 @@ _SM70_QSA_GROUPED_PAGE4_WORKSPACES: dict[
     ],
 ] = {}
 _SM70_QSA_GROUPED_PAGE4_ABI_CACHE: tuple[object, int] | None = None
-
-
-# ---------------------------------------------------------------------------
-# ShiXiang batch-1 QSA optimisation switches (group "qsa").
-#
-# Every switch is read once at import, defaults to ON, and "0" restores the
-# exact baseline code path (the old launch sequence is kept verbatim behind
-# each switch):
-#
-#   SX_OPT_QSA_HOST_BOUND      Single-request cuBLAS indexer: take the score
-#                              width from the host seq_lens copy instead of
-#                              int(all_visible.max().item()) (one blocking
-#                              cudaStreamSynchronize per QSA layer). Bitwise.
-#   SX_OPT_QSA_HOST_BOUND_CHECK  Debug only, default "0". "1" additionally runs
-#                              the old .item() and raises if it disagrees
-#                              (single-request host bound and every
-#                              SX_OPT_QSA_MIXED_CUBLAS per-request width).
-#   SX_OPT_QSA_TWO_WARP32      Two-warp split-K sparse partial for M <= 32
-#                              (was M <= 16). Bitwise (design_1 [C1]).
-#   SX_OPT_QSA_RESOLVED_ROWS   Exact physical-address resolver for every decode
-#                              width 1 <= M <= 32 and any int32-safe page size
-#                              (was M == 1, page 400). Bitwise (design_4 [MR4]).
-#   SX_OPT_QSA_SCORER_STRIDE   OPT-IN ("1"; default "0" after V100 validation
-#                              showed it slower). Paged indexer scorer walks the visible tiles with
-#                              a bounded grid-stride loop for 2 <= M <= 32
-#                              instead of a max_model_len/4-wide grid of mostly
-#                              empty CTAs. Bitwise (design_1 [C7]).
-#   SX_OPT_QSA_MIXED_GROUPS    Grouped page4 sparse attention: never put rows of
-#                              different requests into one 8-query group. Decode
-#                              rows of a mixed step go to the row-wise XQA page4
-#                              kernel instead of forming 8-request groups that
-#                              one CTA must walk serially (the 3.6 vs 1.5 ms per
-#                              layer mixed-step straggler). NOT bitwise versus
-#                              the old mixed step; prefill rows become bitwise
-#                              equal to the same request run alone. Only used
-#                              when an old 8-row group would mix at least
-#                              SX_OPT_QSA_MIXED_MIN_GROUP_REQUESTS (default 3)
-#                              requests; otherwise the old launch runs.
-#   SX_OPT_QSA_MIXED_CUBLAS    Indexer: inside a mixed batch, score each large
-#                              prefill request with the single-request cuBLAS
-#                              path (design_3 [P2]). NOT bitwise versus the old
-#                              mixed step for that request (Triton FMA scorer
-#                              vs cuBLAS HMMA); bitwise equal to the request run
-#                              alone. Other rows stay bitwise unchanged.
-#
-# The host metadata these paths need (query_start_loc / seq_lens CPU copies)
-# is attached by Qwen4ExpQSAMetadataBuilder in ../qsa.py only when no
-# speculative decoding is configured; without it every path falls back to the
-# baseline behaviour.
-# ---------------------------------------------------------------------------
-def _sx_opt_enabled(name: str) -> bool:
-    return os.environ.get(f"SX_OPT_{name}", "1") != "0"
-
-
-_SX_OPT_QSA_HOST_BOUND = _sx_opt_enabled("QSA_HOST_BOUND")
-_SX_OPT_QSA_HOST_BOUND_CHECK = (
-    os.environ.get("SX_OPT_QSA_HOST_BOUND_CHECK", "0") == "1"
-)
-_SX_OPT_QSA_TWO_WARP32 = _sx_opt_enabled("QSA_TWO_WARP32")
-_SX_OPT_QSA_RESOLVED_ROWS = _sx_opt_enabled("QSA_RESOLVED_ROWS")
-# Validation (opt180dev1, V100): the grid-stride scorer measured 2.5-5x SLOWER than
-# the old rectangular grid (M24 x12 layers: 1.0 -> 4.0 ms at <=8K, 4.6 -> 22.5 ms at
-# <=128K), so it is opt-in ("1"); the default keeps the baseline launch.
-_SX_OPT_QSA_SCORER_STRIDE = os.environ.get("SX_OPT_QSA_SCORER_STRIDE", "0") == "1"
-_SX_OPT_QSA_MIXED_GROUPS = _sx_opt_enabled("QSA_MIXED_GROUPS")
-_SX_OPT_QSA_MIXED_CUBLAS = _sx_opt_enabled("QSA_MIXED_CUBLAS")
-# Decode widths served by the two-warp partial and the address resolver.
-_SX_QSA_DECODE_MAX_ROWS = 32
-# The strided scorer targets roughly one wave of two-warp CTAs.
-_SX_QSA_SCORER_TARGET_CTAS = 2560
-# A mixed step with more routing segments than this keeps the old grouping.
-_SX_QSA_MIXED_MAX_SEGMENTS = 16
-# Validation (opt180dev1, V100): the request-aligned routing only pays off when some
-# old 8-row group mixes at least this many requests (decode rows of different
-# requests). Prefill-only multi-request steps, whose old groups mix at most 2
-# requests, keep the single grouped launch, which measured faster (two 1570-row
-# prefills: 5.14 vs 5.97 ms/layer; 450+784 rows: 2.22 vs 2.26 ms/layer).
-try:
-    _SX_QSA_MIXED_MIN_GROUP_REQUESTS = int(
-        os.environ.get("SX_OPT_QSA_MIXED_MIN_GROUP_REQUESTS", "3")
-    )
-except ValueError:
-    _SX_QSA_MIXED_MIN_GROUP_REQUESTS = 3
-
-
-def _host_int_list(tensor: torch.Tensor | None, length: int | None = None):
-    """Return a CPU int tensor as a Python list, or None if it is unusable.
-
-    Never touches a device tensor, so it cannot introduce a host sync.
-    """
-    if (
-        tensor is None
-        or not isinstance(tensor, torch.Tensor)
-        or tensor.device.type != "cpu"
-        or tensor.ndim != 1
-        or (length is not None and tensor.shape[0] != length)
-    ):
-        return None
-    return [int(value) for value in tensor.tolist()]
 
 
 def _qsa_grouped_page4_abi_version(flash_attn_v100_cuda) -> int:
@@ -306,114 +191,6 @@ def _qsa_mqa_paged_kernel(
     )
     column_offsets = tl.arange(0, BLOCK_N)
     for tile in tl.range(tile_start, tile_end, num_stages=STAGES):
-        columns = tile * BLOCK_N + column_offsets
-        live = columns < visible
-        logical_page = tl.minimum(columns // PAGE_SIZE, PAGE_TABLE_WIDTH - 1)
-        page_offset = columns % PAGE_SIZE
-        physical_page = tl.load(
-            page_table_ptr
-            + safe_request * stride_table_req
-            + logical_page * stride_table_page,
-            mask=live,
-            other=-1,
-        )
-        page_valid = live & (physical_page >= 0) & (physical_page < num_pages)
-        # physical_page * block stride can overflow int32 for large caches.
-        safe_physical_page = tl.maximum(physical_page, 0).to(tl.int64)
-        keys = tl.load(
-            k_cache_ptr
-            + safe_physical_page[:, None] * stride_cache_block
-            + page_offset[:, None] * stride_cache_token
-            + dims[None, :] * stride_cache_dim,
-            mask=page_valid[:, None] & (dims[None, :] < HEAD_DIM),
-            other=0.0,
-            eviction_policy="evict_first",
-        )
-        scores = tl.dot(keys, query, out_dtype=tl.float32)
-        scores = tl.where(heads[None, :] < NUM_HEADS, tl.maximum(scores, 0.0), 0.0)
-        score = tl.sum(scores, axis=1) / score_divisor
-        tl.store(
-            logits_ptr + row * stride_logits_row + columns,
-            tl.where(page_valid, score, -float("inf")),
-            mask=live & (columns < num_columns),
-        )
-
-
-@triton.jit(do_not_specialize=["num_requests", "col_programs"])
-def _qsa_mqa_paged_strided_kernel(
-    q_ptr,
-    k_cache_ptr,
-    page_table_ptr,
-    token_to_req_ptr,
-    query_positions_ptr,
-    sequence_lengths_ptr,
-    visible_blocks_ptr,
-    logits_ptr,
-    stride_q_row,
-    stride_q_head,
-    stride_q_dim,
-    stride_cache_block,
-    stride_cache_token,
-    stride_cache_dim,
-    stride_table_req,
-    stride_table_page,
-    stride_logits_row,
-    num_rows,
-    num_columns,
-    num_pages,
-    num_requests,
-    score_divisor,
-    col_programs,
-    PAGE_SIZE: tl.constexpr,
-    PAGE_TABLE_WIDTH: tl.constexpr,
-    NUM_HEADS: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    STAGES: tl.constexpr,
-    MAX_N: tl.constexpr,
-    COMPRESS_RATIO: tl.constexpr,
-) -> None:
-    """Grid-stride twin of _qsa_mqa_paged_kernel with TILES_PER_PROG=1.
-
-    Program (row, p) scores tiles p, p + col_programs, ... below the row's
-    visible bound. The per-tile body is copied verbatim from the original
-    kernel, so every written score is bitwise identical; only the number of
-    CTAs that exit without work changes.
-    """
-    row = tl.program_id(0)
-    dims = tl.arange(0, BLOCK_D)
-    heads = tl.arange(0, MAX_N)
-    request = tl.load(token_to_req_ptr + row)
-    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
-    query_position = tl.load(query_positions_ptr + row)
-    sequence_length = tl.load(
-        sequence_lengths_ptr + safe_request,
-        mask=(request >= 0) & (request < num_requests),
-        other=0,
-    )
-    visible = tl.minimum(
-        (query_position + 1) // COMPRESS_RATIO,
-        sequence_length // COMPRESS_RATIO,
-    )
-    if tl.program_id(1) == 0:
-        tl.store(visible_blocks_ptr + row, visible)
-    last_tile = tl.minimum(tl.cdiv(visible, BLOCK_N), tl.cdiv(num_columns, BLOCK_N))
-    first_tile = tl.program_id(1)
-    # Top-k is bounded by visible_blocks, so columns beyond it need no value.
-    if first_tile >= last_tile:
-        return
-
-    query = tl.load(
-        q_ptr
-        + row * stride_q_row
-        + heads[None, :] * stride_q_head
-        + dims[:, None] * stride_q_dim,
-        mask=(heads[None, :] < NUM_HEADS) & (dims[:, None] < HEAD_DIM),
-        other=0.0,
-    )
-    column_offsets = tl.arange(0, BLOCK_N)
-    for tile in tl.range(first_tile, last_tile, col_programs, num_stages=STAGES):
         columns = tile * BLOCK_N + column_offsets
         live = columns < visible
         logical_page = tl.minimum(columns // PAGE_SIZE, PAGE_TABLE_WIDTH - 1)
@@ -1295,15 +1072,8 @@ def qsa_mqa_paged(
     compress_ratio: int,
     num_columns: int | None = None,
     score_scale: float | None = None,
-    *,
-    launch_rows: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute QSA scores directly from a paged compressed-key cache.
-
-    ``launch_rows`` (internal) selects the tile profile as if the call had that
-    many rows. The mixed-batch indexer uses it so rows scored in a smaller
-    sub-call keep exactly the tile shape they had in the full-batch call.
-    """
+    """Compute QSA scores directly from a paged compressed-key cache."""
 
     _validate_mqa(q)
     if not q.is_cuda or not HAS_TRITON:
@@ -1336,9 +1106,7 @@ def qsa_mqa_paged(
     visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
         return logits, visible_blocks
-    profile_rows = q.shape[0] if launch_rows is None else launch_rows
-    is_sm70 = current_platform.is_device_capability(70)
-    sm70_single_token = profile_rows == 1 and is_sm70
+    sm70_single_token = q.shape[0] == 1 and current_platform.is_device_capability(70)
     # On V100 the GB300 decode tile leaves the 128-d scorer badly
     # under-occupied. A 32-column, two-warp tile preserves the selected QSA
     # blocks while exposing enough independent CTAs for the single-row path.
@@ -1346,58 +1114,7 @@ def qsa_mqa_paged(
     BLOCK_D = max(16, triton.next_power_of_2(q.shape[2]))
     MAX_N = max(16, triton.next_power_of_2(q.shape[1]))
     # Tuned on GB300: larger row batches provide enough parallelism to reuse Q.
-    tiles_per_program = 1 if profile_rows <= 32 else 8
-    if (
-        _SX_OPT_QSA_SCORER_STRIDE
-        and is_sm70
-        and launch_rows is None
-        and 2 <= q.shape[0] <= _SX_QSA_DECODE_MAX_ROWS
-    ):
-        # Decode widths: the rectangular grid is sized by the model capacity
-        # (max_model_len / ratio columns) although a row only has
-        # cdiv(visible, BLOCK_N) live tiles. Walk those tiles with a bounded
-        # grid-stride loop; the per-tile arithmetic is unchanged (bitwise).
-        assert tiles_per_program == 1 and BLOCK_N == 64
-        col_programs = min(
-            triton.cdiv(columns, BLOCK_N),
-            max(1, triton.cdiv(_SX_QSA_SCORER_TARGET_CTAS, q.shape[0])),
-        )
-        _qsa_mqa_paged_strided_kernel[(q.shape[0], col_programs)](
-            q,
-            k_cache,
-            page_table,
-            token_to_req,
-            query_positions,
-            sequence_lengths,
-            visible_blocks,
-            logits,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k_cache.stride(0),
-            k_cache.stride(1),
-            k_cache.stride(3),
-            page_table.stride(0),
-            page_table.stride(1),
-            logits.stride(0),
-            q.shape[0],
-            columns,
-            k_cache.shape[0],
-            page_table.shape[0],
-            float(score_divisor),
-            col_programs,
-            PAGE_SIZE=k_cache.shape[1],
-            PAGE_TABLE_WIDTH=page_table.shape[1],
-            NUM_HEADS=q.shape[1],
-            HEAD_DIM=q.shape[2],
-            BLOCK_N=BLOCK_N,
-            BLOCK_D=BLOCK_D,
-            STAGES=2,
-            MAX_N=MAX_N,
-            COMPRESS_RATIO=compress_ratio,
-            num_warps=2,
-        )
-        return logits, visible_blocks
+    tiles_per_program = 1 if q.shape[0] <= 32 else 8
     _qsa_mqa_paged_kernel[
         (q.shape[0], triton.cdiv(columns, BLOCK_N * tiles_per_program))
     ](
@@ -1649,115 +1366,7 @@ def expand_qsa_block_indices_cuda(
     return out
 
 
-def _qsa_host_max_visible(
-    page_table: torch.Tensor,
-    rows: int,
-    compress_ratio: int,
-    query_start_loc_cpu: torch.Tensor | None,
-    seq_lens_cpu: torch.Tensor | None,
-) -> int | None:
-    """Host value of int(_qsa_visible_blocks(...).max()) for one request.
-
-    The QSA metadata builder writes position = seq_len - query_len + i for the
-    i-th mapped row of a request and -1 for unmapped (padded) rows, so the last
-    mapped row has position seq_len - 1. The per-row visible bound
-    min((pos + 1) // r, seq_len // r) therefore peaks at seq_len // r, and
-    padded rows contribute 0. Returns None when the host copies are missing or
-    do not describe exactly this single-request batch; callers then keep the
-    old device-side max (one host sync).
-    """
-
-    if (
-        not _SX_OPT_QSA_HOST_BOUND
-        or page_table.shape[0] != 1
-        or seq_lens_cpu is None
-        or torch.cuda.is_current_stream_capturing()
-    ):
-        return None
-    seq_lens = _host_int_list(seq_lens_cpu, 1)
-    query_starts = _host_int_list(query_start_loc_cpu, 2)
-    if seq_lens is None or query_starts is None:
-        return None
-    sequence_length = seq_lens[0]
-    mapped_rows = query_starts[1] - query_starts[0]
-    if (
-        query_starts[0] != 0
-        or not 1 <= mapped_rows <= rows
-        or sequence_length < mapped_rows
-    ):
-        return None
-    return sequence_length // compress_ratio
-
-
-def _plan_qsa_indexer_cublas_segments(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    query_start_loc_cpu: torch.Tensor | None,
-    seq_lens_cpu: torch.Tensor | None,
-    capacity_columns: int,
-    block_topk: int,
-    compress_ratio: int,
-) -> list[tuple[int, int, int | None, int]] | None:
-    """Split a multi-request indexer batch into cuBLAS and Triton row ranges.
-
-    A request qualifies for the single-request cuBLAS scorer under exactly the
-    conditions (and with exactly the score width) the old code applies when the
-    request runs alone. Returns None, i.e. keep the old all-Triton path, when no
-    request qualifies or the host metadata does not describe this batch.
-    Segments are (start, end, request or None, score_columns).
-    """
-
-    rows = q.shape[0]
-    num_requests = page_table.shape[0]
-    if (
-        not _SX_OPT_QSA_MIXED_CUBLAS
-        or num_requests <= 1
-        or rows < _SM70_INDEXER_CUBLAS_MIN_ROWS
-        or query_start_loc_cpu is None
-        or seq_lens_cpu is None
-        or not _SM70_INDEXER_CUBLAS
-        or not current_platform.is_device_capability(70)
-        or not _qsa_indexer_cublas_shape_supported(q, k_cache, page_table[:1])
-        or torch.cuda.is_current_stream_capturing()
-    ):
-        return None
-    query_starts = _host_int_list(query_start_loc_cpu, num_requests + 1)
-    seq_lens = _host_int_list(seq_lens_cpu, num_requests)
-    if query_starts is None or seq_lens is None:
-        return None
-    if query_starts[0] != 0 or query_starts[-1] > rows:
-        return None
-    segments: list[tuple[int, int, int | None, int]] = []
-    cursor = 0
-    for request in range(num_requests):
-        start, end = query_starts[request], query_starts[request + 1]
-        if end < start:
-            return None
-        request_rows = end - start
-        if request_rows < _SM70_INDEXER_CUBLAS_MIN_ROWS:
-            continue
-        sequence_length = seq_lens[request]
-        if sequence_length < request_rows:
-            return None
-        score_columns = min(
-            capacity_columns,
-            max(block_topk, sequence_length // compress_ratio),
-        )
-        if not _qsa_indexer_cublas_work_supported(request_rows, score_columns):
-            continue
-        if cursor < start:
-            segments.append((cursor, start, None, 0))
-        segments.append((start, end, request, score_columns))
-        cursor = end
-    if not segments:
-        return None
-    if cursor < rows:
-        segments.append((cursor, rows, None, 0))
-    return segments
-
-
-def _qsa_select_rows(
+def qsa_select_paged_tokens(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -1766,17 +1375,56 @@ def _qsa_select_rows(
     sequence_lengths: torch.Tensor,
     token_topk: int,
     compress_ratio: int,
-    out: torch.Tensor,
-    score_columns: int,
-    contiguous_keys: torch.Tensor | None,
-    key_valid: torch.Tensor | None,
-    all_visible: torch.Tensor | None,
-    launch_rows: int | None = None,
-) -> None:
-    """Chunked score -> top-k -> expand loop (verbatim baseline body)."""
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Score, select, and expand QSA indices without host synchronization."""
 
     rows = q.shape[0]
+    output_width = token_topk + compress_ratio - 1
+    if out is None:
+        out = torch.empty((rows, output_width), dtype=torch.int32, device=q.device)
+    if out.shape != (rows, output_width):
+        raise ValueError("QSA selection output has an invalid shape")
+    if not rows:
+        return out
+
+    capacity_columns = page_table.shape[1] * k_cache.shape[1]
+    score_columns = capacity_columns
     block_topk = token_topk // compress_ratio
+    contiguous_keys: torch.Tensor | None = None
+    key_valid: torch.Tensor | None = None
+    all_visible: torch.Tensor | None = None
+    if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table):
+        all_visible = _qsa_visible_blocks(
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            compress_ratio,
+        )
+        # cuBLAS has a rectangular host-side launch shape, unlike the paged
+        # Triton kernel's device-side early exit. Bound it to this chunk's live
+        # prefix so early-context prefill does not multiply the unused 140K
+        # model-capacity tail. This is one scalar sync per QSA layer.
+        score_columns = min(
+            capacity_columns,
+            max(block_topk, int(all_visible.max().item())),
+        )
+        if _qsa_indexer_cublas_work_supported(rows, score_columns):
+            logger.info_once(
+                "Using SM70 QSA indexer prefill cuBLAS path "
+                "(single-request FP16, rows=%d, score_tile_mib=%d).",
+                rows,
+                _SM70_INDEXER_SCORE_TILE_BYTES // (1024 * 1024),
+            )
+            # Gather this request's paged MQA keys once, then reuse them across
+            # every bounded logits chunk below. Generic, short-work and
+            # multi-request batches keep the paged Triton fallback.
+            contiguous_keys, key_valid = _qsa_gather_single_request_keys(
+                k_cache, page_table, score_columns
+            )
+        else:
+            score_columns = capacity_columns
+            all_visible = None
     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(score_columns * 4, 1))
     chunk_rows = min(rows, rows_per_chunk)
     blocks_buffer = torch.empty(
@@ -1805,7 +1453,6 @@ def _qsa_select_rows(
                 query_positions[row_slice],
                 sequence_lengths,
                 compress_ratio,
-                launch_rows=launch_rows,
             )
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (
@@ -1848,228 +1495,6 @@ def _qsa_select_rows(
             token_topk,
             out[row_slice],
         )
-
-
-def _qsa_select_mixed_batch(
-    segments: list[tuple[int, int, int | None, int]],
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    token_to_req: torch.Tensor,
-    query_positions: torch.Tensor,
-    sequence_lengths: torch.Tensor,
-    token_topk: int,
-    compress_ratio: int,
-    out: torch.Tensor,
-) -> None:
-    rows = q.shape[0]
-    capacity_columns = page_table.shape[1] * k_cache.shape[1]
-    for start, end, request, score_columns in segments:
-        rows_slice = slice(start, end)
-        if request is None:
-            # Unchanged paged Triton scorer; keep the full-batch tile profile
-            # so these rows stay bitwise equal to the old mixed-batch result.
-            _qsa_select_rows(
-                q[rows_slice],
-                k_cache,
-                page_table,
-                token_to_req[rows_slice],
-                query_positions[rows_slice],
-                sequence_lengths,
-                token_topk,
-                compress_ratio,
-                out[rows_slice],
-                capacity_columns,
-                None,
-                None,
-                None,
-                launch_rows=rows,
-            )
-            continue
-        # No per-call arguments: info_once de-duplicates on them, and every
-        # new mixed-step shape would otherwise log another line.
-        logger.info_once(
-            "Using SM70 QSA indexer prefill cuBLAS path per request inside "
-            "mixed batches (SX_OPT_QSA_MIXED_CUBLAS)."
-        )
-        page_row = page_table[request : request + 1]
-        # Same launches, shapes and score width as the request run alone.
-        all_visible = _qsa_visible_blocks(
-            token_to_req[rows_slice],
-            query_positions[rows_slice],
-            sequence_lengths,
-            compress_ratio,
-        )
-        if _SX_OPT_QSA_HOST_BOUND_CHECK:
-            # Debug only (one host sync per request): the width planned from
-            # the host seq_lens copy must equal the width the request would
-            # get alone from the device-side visible maximum.
-            device_max_visible = int(all_visible.max().item())
-            device_score_columns = min(
-                capacity_columns,
-                max(token_topk // compress_ratio, device_max_visible),
-            )
-            if device_score_columns != score_columns:
-                raise RuntimeError(
-                    "QSA host score width disagrees with the device value for "
-                    f"mixed-batch request {request} "
-                    f"({score_columns} != {device_score_columns})"
-                )
-        # Memory-safety net for the host-derived width (no-op when exact).
-        all_visible.clamp_(max=score_columns)
-        contiguous_keys, key_valid = _qsa_gather_single_request_keys(
-            k_cache, page_row, score_columns
-        )
-        _qsa_select_rows(
-            q[rows_slice],
-            k_cache,
-            page_row,
-            token_to_req[rows_slice],
-            query_positions[rows_slice],
-            sequence_lengths,
-            token_topk,
-            compress_ratio,
-            out[rows_slice],
-            score_columns,
-            contiguous_keys,
-            key_valid,
-            all_visible,
-        )
-
-
-def qsa_select_paged_tokens(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    token_to_req: torch.Tensor,
-    query_positions: torch.Tensor,
-    sequence_lengths: torch.Tensor,
-    token_topk: int,
-    compress_ratio: int,
-    out: torch.Tensor | None = None,
-    *,
-    query_start_loc_cpu: torch.Tensor | None = None,
-    seq_lens_cpu: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Score, select, and expand QSA indices without host synchronization.
-
-    ``query_start_loc_cpu`` / ``seq_lens_cpu`` are optional host copies of the
-    batch's query starts and sequence lengths. With them the single-request
-    cuBLAS path needs no device->host sync, and large prefill requests inside
-    a mixed batch can use the cuBLAS scorer too. Without them the baseline
-    behaviour is kept.
-    """
-
-    rows = q.shape[0]
-    output_width = token_topk + compress_ratio - 1
-    if out is None:
-        out = torch.empty((rows, output_width), dtype=torch.int32, device=q.device)
-    if out.shape != (rows, output_width):
-        raise ValueError("QSA selection output has an invalid shape")
-    if not rows:
-        return out
-
-    capacity_columns = page_table.shape[1] * k_cache.shape[1]
-    score_columns = capacity_columns
-    block_topk = token_topk // compress_ratio
-
-    mixed_segments = _plan_qsa_indexer_cublas_segments(
-        q,
-        k_cache,
-        page_table,
-        query_start_loc_cpu,
-        seq_lens_cpu,
-        capacity_columns,
-        block_topk,
-        compress_ratio,
-    )
-    if mixed_segments is not None:
-        _qsa_select_mixed_batch(
-            mixed_segments,
-            q,
-            k_cache,
-            page_table,
-            token_to_req,
-            query_positions,
-            sequence_lengths,
-            token_topk,
-            compress_ratio,
-            out,
-        )
-        return out
-
-    contiguous_keys: torch.Tensor | None = None
-    key_valid: torch.Tensor | None = None
-    all_visible: torch.Tensor | None = None
-    if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table):
-        all_visible = _qsa_visible_blocks(
-            token_to_req,
-            query_positions,
-            sequence_lengths,
-            compress_ratio,
-        )
-        # cuBLAS has a rectangular host-side launch shape, unlike the paged
-        # Triton kernel's device-side early exit. Bound it to this chunk's live
-        # prefix so early-context prefill does not multiply the unused 140K
-        # model-capacity tail. The bound comes from the host seq_lens copy when
-        # available; otherwise it is one scalar sync per QSA layer.
-        max_visible = _qsa_host_max_visible(
-            page_table,
-            rows,
-            compress_ratio,
-            query_start_loc_cpu,
-            seq_lens_cpu,
-        )
-        host_bound = max_visible is not None
-        if max_visible is None:
-            max_visible = int(all_visible.max().item())
-        elif _SX_OPT_QSA_HOST_BOUND_CHECK:
-            device_max_visible = int(all_visible.max().item())
-            if device_max_visible != max_visible:
-                raise RuntimeError(
-                    "QSA host visible bound disagrees with the device value "
-                    f"({max_visible} != {device_max_visible})"
-                )
-        score_columns = min(
-            capacity_columns,
-            max(block_topk, max_visible),
-        )
-        if host_bound and _qsa_indexer_cublas_work_supported(rows, score_columns):
-            # Memory-safety net: top-k reads visible_blocks columns of a
-            # score_columns-wide buffer. With an exact host bound every row
-            # already satisfies visible <= score_columns (no-op, bitwise).
-            all_visible.clamp_(max=score_columns)
-        if _qsa_indexer_cublas_work_supported(rows, score_columns):
-            logger.info_once(
-                "Using SM70 QSA indexer prefill cuBLAS path "
-                "(single-request FP16, rows=%d, score_tile_mib=%d).",
-                rows,
-                _SM70_INDEXER_SCORE_TILE_BYTES // (1024 * 1024),
-            )
-            # Gather this request's paged MQA keys once, then reuse them across
-            # every bounded logits chunk below. Generic, short-work and
-            # multi-request batches keep the paged Triton fallback.
-            contiguous_keys, key_valid = _qsa_gather_single_request_keys(
-                k_cache, page_table, score_columns
-            )
-        else:
-            score_columns = capacity_columns
-            all_visible = None
-    _qsa_select_rows(
-        q,
-        k_cache,
-        page_table,
-        token_to_req,
-        query_positions,
-        sequence_lengths,
-        token_topk,
-        compress_ratio,
-        out,
-        score_columns,
-        contiguous_keys,
-        key_valid,
-        all_visible,
-    )
     return out
 
 
@@ -2489,182 +1914,6 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4_batch(
     return out
 
 
-def _plan_qsa_page4_request_segments(
-    query_start_loc_cpu: torch.Tensor | None,
-    rows: int,
-) -> list[tuple[int, int, bool]] | None:
-    """Plan grouped/row-wise page4 ranges that never mix requests in a group.
-
-    Each request contributes floor(len / 8) * 8 grouped rows starting at its
-    first row, and its remaining rows (all rows of a decode or short request)
-    go to the row-wise XQA kernel. Adjacent ranges of the same kind merge;
-    merged grouped ranges still only contain whole 8-row groups of a single
-    request because every grouped range length is a multiple of 8. Rows after
-    the last mapped token (padding) are row-wise. Returns None if the host
-    query starts do not describe this batch.
-    """
-
-    query_starts = _host_int_list(query_start_loc_cpu)
-    if query_starts is None or len(query_starts) < 2:
-        return None
-    if query_starts[0] != 0 or query_starts[-1] > rows:
-        return None
-    group = _SM70_QSA_GROUPED_PAGE4_QUERIES
-    segments: list[tuple[int, int, bool]] = []
-
-    def add(start: int, end: int, grouped: bool) -> None:
-        if end <= start:
-            return
-        if segments and segments[-1][2] == grouped and segments[-1][1] == start:
-            segments[-1] = (segments[-1][0], end, grouped)
-        else:
-            segments.append((start, end, grouped))
-
-    for request in range(len(query_starts) - 1):
-        start, end = query_starts[request], query_starts[request + 1]
-        if end < start:
-            return None
-        grouped_end = start + (end - start) // group * group
-        add(start, grouped_end, True)
-        add(grouped_end, end, False)
-    add(query_starts[-1], rows, False)
-    return segments
-
-
-def _qsa_page4_old_group_max_requests(
-    query_start_loc_cpu: torch.Tensor | None,
-    rows: int,
-) -> int:
-    """Most requests that share one 8-row group under the old whole-batch split.
-
-    A request boundary b splits the old group b // 8 unless it is 8-aligned;
-    rows after the last mapped token (padding) count as one more "request".
-    Host-only; returns 0 when the host query starts are unusable.
-    """
-
-    query_starts = _host_int_list(query_start_loc_cpu)
-    if not query_starts:
-        return 0
-    group = _SM70_QSA_GROUPED_PAGE4_QUERIES
-    grouped_rows = rows // group * group
-    interior: dict[int, int] = {}
-    for boundary in query_starts[1:]:
-        if 0 < boundary < grouped_rows and boundary % group:
-            interior[boundary // group] = interior.get(boundary // group, 0) + 1
-    return 1 + max(interior.values(), default=0)
-
-
-def _qsa_page4_segments_match_baseline(
-    segments: list[tuple[int, int, bool]],
-    rows: int,
-) -> bool:
-    """Whether the per-request plan equals the old whole-batch split."""
-
-    grouped_rows = rows // _SM70_QSA_GROUPED_PAGE4_QUERIES * (
-        _SM70_QSA_GROUPED_PAGE4_QUERIES
-    )
-    baseline = []
-    if grouped_rows:
-        baseline.append((0, grouped_rows, True))
-    if grouped_rows < rows:
-        baseline.append((grouped_rows, rows, False))
-    return segments == baseline
-
-
-def _qsa_sparse_paged_attention_sm70_page4_segments(
-    segments: list[tuple[int, int, bool]],
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    logical_indices: torch.Tensor,
-    block_table: torch.Tensor,
-    token_to_req: torch.Tensor,
-    query_positions: torch.Tensor,
-    sequence_lengths: torch.Tensor,
-    out: torch.Tensor,
-    kv_cache_dtype: str,
-    k_scale: float,
-    v_scale: float,
-    flash_attn_v100_cuda,
-) -> torch.Tensor:
-    """Run request-aligned grouped ranges plus one row-wise XQA launch."""
-
-    # No per-call arguments: info_once de-duplicates on them.
-    logger.info_once(
-        "Using SM70 QSA request-aligned grouped page4 routing for mixed "
-        "batches (SX_OPT_QSA_MIXED_GROUPS)."
-    )
-    rowwise = [(start, end) for start, end, grouped in segments if not grouped]
-    for start, end, grouped in segments:
-        if not grouped:
-            continue
-        # The planner and grouped kernel are CUDA; row offsets need no
-        # particular alignment and every group holds rows of one request.
-        _qsa_sparse_paged_attention_sm70_grouped_page4(
-            q[start:end],
-            k_cache,
-            v_cache,
-            logical_indices[start:end],
-            block_table,
-            token_to_req[start:end],
-            query_positions[start:end],
-            sequence_lengths,
-            out[start:end],
-            kv_cache_dtype,
-            k_scale,
-            v_scale,
-            flash_attn_v100_cuda,
-        )
-    if not rowwise:
-        return out
-    if len(rowwise) == 1 and rowwise[0][0] % 4 == 0:
-        # A single range at a 4-row-aligned offset keeps the 16-byte pointer
-        # alignment of every metadata slice, so the Triton table kernel reuses
-        # its existing specialisation. Row-wise XQA is per-row independent.
-        start, end = rowwise[0]
-        _qsa_sparse_paged_attention_sm70_xqa_page4_batch(
-            q[start:end],
-            k_cache,
-            v_cache,
-            logical_indices[start:end],
-            block_table,
-            token_to_req[start:end],
-            query_positions[start:end],
-            sequence_lengths,
-            out[start:end],
-            kv_cache_dtype,
-            k_scale,
-            v_scale,
-            flash_attn_v100_cuda,
-        )
-        return out
-    # Several short ranges (decodes plus per-request remainders): gather them
-    # into fresh contiguous buffers, launch the row-wise kernel once and
-    # scatter the rows back. Device-side copies only; no host sync.
-    rowwise_q = torch.cat([q[start:end] for start, end in rowwise])
-    rowwise_out = torch.empty_like(rowwise_q)
-    _qsa_sparse_paged_attention_sm70_xqa_page4_batch(
-        rowwise_q,
-        k_cache,
-        v_cache,
-        torch.cat([logical_indices[start:end] for start, end in rowwise]),
-        block_table,
-        torch.cat([token_to_req[start:end] for start, end in rowwise]),
-        torch.cat([query_positions[start:end] for start, end in rowwise]),
-        sequence_lengths,
-        rowwise_out,
-        kv_cache_dtype,
-        k_scale,
-        v_scale,
-        flash_attn_v100_cuda,
-    )
-    offset = 0
-    for start, end in rowwise:
-        out[start:end].copy_(rowwise_out[offset : offset + end - start])
-        offset += end - start
-    return out
-
-
 def _qsa_sparse_paged_attention_sm70_xqa_page4(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -2678,7 +1927,6 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
     kv_cache_dtype: str,
     k_scale: float,
     v_scale: float,
-    query_start_loc_cpu: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     try:
         from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
@@ -2698,42 +1946,6 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
     grouped_enabled = _SM70_QSA_GROUPED_PAGE4 and _qsa_grouped_page4_supported(
         flash_attn_v100_cuda, kv_cache_dtype
     )
-    if (
-        grouped_enabled
-        and _SX_OPT_QSA_MIXED_GROUPS
-        and query_start_loc_cpu is not None
-        and kv_cache_dtype in ("auto", "float16")
-        and not torch.cuda.is_current_stream_capturing()
-    ):
-        # The grouped kernel runs one CTA per 8-row group and that CTA walks
-        # the union of the 8 rows' selections. Rows of one prefill request
-        # share most pages, but 8 decode rows of 8 different requests have
-        # disjoint selections (8x the pages), so in a mixed step those groups
-        # become the kernel's critical path. Group rows per request instead.
-        segments = _plan_qsa_page4_request_segments(query_start_loc_cpu, q.shape[0])
-        if (
-            segments is not None
-            and len(segments) <= _SX_QSA_MIXED_MAX_SEGMENTS
-            and not _qsa_page4_segments_match_baseline(segments, q.shape[0])
-            and _qsa_page4_old_group_max_requests(query_start_loc_cpu, q.shape[0])
-            >= _SX_QSA_MIXED_MIN_GROUP_REQUESTS
-        ):
-            return _qsa_sparse_paged_attention_sm70_page4_segments(
-                segments,
-                q,
-                k_cache,
-                v_cache,
-                logical_indices,
-                block_table,
-                token_to_req,
-                query_positions,
-                sequence_lengths,
-                out,
-                kv_cache_dtype,
-                k_scale,
-                v_scale,
-                flash_attn_v100_cuda,
-            )
     if grouped_enabled:
         grouped_rows = (
             q.shape[0] // _SM70_QSA_GROUPED_PAGE4_QUERIES
@@ -2831,31 +2043,7 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
 
 
 def _use_sm70_qsa_resolved_indices(q, k_cache, indices, kv_cache_dtype):
-    """Admit only the measured checkpoint-FP16 TP4 decode cache geometry.
-
-    Baseline: M == 1 with 400-token pages. With SX_OPT_QSA_RESOLVED_ROWS the
-    same address-only rewrite covers every decode width 1 <= M <= 32 and any
-    page size whose physical token slots fit in int32 (e.g. the 784-token
-    pages of the mamba-align deployment). The resolver only replaces the
-    partial kernel's dependent page-table load with a precomputed physical
-    slot: logical order, duplicates and invalid slots are preserved, so the
-    attention arithmetic and its output are bitwise unchanged.
-    """
-    if _SX_OPT_QSA_RESOLVED_ROWS:
-        rows = q.shape[0] if len(q.shape) == 3 else 0
-        page_size = k_cache.shape[1] if len(k_cache.shape) == 4 else 0
-        return bool(
-            current_platform.is_device_capability(70)
-            and 1 <= rows <= _SX_QSA_DECODE_MAX_ROWS
-            and q.shape[1:] == (6, 256)
-            and q.dtype == k_cache.dtype == torch.float16
-            and page_size > 0
-            and k_cache.shape[2:] == (1, 256)
-            and k_cache.shape[0] * page_size < 2**31
-            and indices.shape == (rows, 2051)
-            and indices.dtype == torch.int32
-            and kv_cache_dtype in ("auto", "float16")
-        )
+    """Admit only the measured checkpoint-FP16 M1 TP4 cache geometry."""
     return bool(
         current_platform.is_device_capability(70)
         and q.shape == (1, 6, 256)
@@ -2882,15 +2070,8 @@ def qsa_sparse_paged_attention(
     kv_cache_dtype: str = "auto",
     k_scale: float = 1.0,
     v_scale: float = 1.0,
-    *,
-    query_start_loc_cpu: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA over paged FP16/BF16 or calibrated E4M3 K/V.
-
-    ``query_start_loc_cpu`` (optional host copy of the batch's query starts)
-    lets the SM70 grouped page4 prefill route keep every 8-row group inside a
-    single request; without it the baseline grouping is used.
-    """
+    """Run sparse GQA over paged FP16/BF16 or calibrated E4M3 K/V."""
 
     if not q.is_cuda or not HAS_TRITON:
         raise RuntimeError("paged QSA sparse attention requires CUDA and Triton")
@@ -2970,7 +2151,6 @@ def qsa_sparse_paged_attention(
             "fp8_e4m3" if kv_e4m3 else "auto",
             k_scale,
             v_scale,
-            query_start_loc_cpu=query_start_loc_cpu,
         )
         if xqa_output is not None:
             if output_gate_view is not None:
@@ -2980,34 +2160,7 @@ def qsa_sparse_paged_attention(
     resolved_indices = _use_sm70_qsa_resolved_indices(
         q, k_cache, logical_indices, kv_cache_dtype
     )
-    if resolved_indices and _SX_OPT_QSA_RESOLVED_ROWS:
-        resolved_rows, resolved_topk = logical_indices.shape
-        # A fresh contiguous buffer: the resolver writes at row * TOPK while
-        # the partial kernel reads with this tensor's own row stride.
-        physical_indices = torch.empty(
-            (resolved_rows, resolved_topk),
-            dtype=logical_indices.dtype,
-            device=logical_indices.device,
-        )
-        _qsa_resolve_physical_indices_kernel[
-            (resolved_rows, triton.cdiv(resolved_topk, 256))
-        ](
-            logical_indices,
-            block_table,
-            token_to_req,
-            physical_indices,
-            logical_indices.stride(0),
-            block_table.stride(0),
-            k_cache.shape[0],
-            block_table.shape[0],
-            TOPK=resolved_topk,
-            PAGE_SIZE=k_cache.shape[1],
-            PAGE_TABLE_WIDTH=block_table.shape[1],
-            BLOCK=256,
-            num_warps=4,
-        )
-        logical_indices = physical_indices
-    elif resolved_indices:
+    if resolved_indices:
         physical_indices = torch.empty_like(logical_indices)
         _qsa_resolve_physical_indices_kernel[(1, triton.cdiv(2051, 256))](
             logical_indices,
@@ -3170,16 +2323,9 @@ def _use_sm70_qsa_two_warp_partial(
     group_size: int,
     head_dim: int,
 ) -> bool:
-    """Gate the bitwise small-batch SM70 sparse-QSA launch policy.
-
-    With SX_OPT_QSA_TWO_WARP32 the gate covers M <= 32 (baseline M <= 16).
-    M17..31 compile to the same constexpr set as M16 (BLOCK_N 16, 32 splits);
-    M32 is the 8-split variant. The per-tile code is identical for every trip
-    count, so the two-warp result equals the four-warp one bitwise.
-    """
-    max_query_tokens = _SX_QSA_DECODE_MAX_ROWS if _SX_OPT_QSA_TWO_WARP32 else 16
+    """Gate the bitwise small-batch SM70 sparse-QSA launch policy."""
     return bool(
-        0 < num_query_tokens <= max_query_tokens
+        0 < num_query_tokens <= 16
         and group_size == 6
         and head_dim == 256
         and current_platform.is_device_capability(70)

@@ -72,6 +72,72 @@ def _ddtree_debug_log(message: str, *args: object) -> None:
         logger.info("DFlash DDTree debug: %s", message % args if args else message)
 
 
+# ---------------------------------------------------------------------------
+# SX_OPT align multi-block prefill chunking (design_2 [MA-1] / design_3 [P1]).
+#
+# With prefix caching, Mamba ``align`` mode used to end a prefill chunk at
+# EVERY recurrent-state block boundary (784 tokens here), so one request never
+# prefilled more than one block per step. The allocator, the prefix cache and
+# the MRV2 pre-copy already support a chunk that spans several blocks when the
+# chunk STARTS on a block boundary: only the block holding the chunk-end state
+# is real, interior blocks are null and are skipped by caching and hit lookup.
+# A chunk starting mid-block must still stop at the next boundary, otherwise
+# the partially filled start block (state at the unaligned start) would be
+# registered under the next boundary's hash.
+#
+# Switches (read once per Scheduler instance; "0" restores the old behaviour):
+#   SX_OPT_ALIGN_MULTIBLOCK        default "1". Multi-block chunks for the exact
+#       SM70 Qwen3.8 no-MTP contract without spec decode or a KV connector.
+#       "force" also admits other align-mode hybrids (still no spec decode /
+#       no KV connector). Chunk = largest block multiple that fits the budget.
+#   SX_OPT_ALIGN_TAIL_CHECKPOINT   default "1". Also end a chunk at the last
+#       cacheable boundary of the prompt, so identical and extended prompts
+#       (retries, multi-turn) still hit there.
+#   SX_OPT_ALIGN_MAX_CHUNK_BLOCKS  default "0" (no cap). Cap one multi-block
+#       chunk at this many state blocks (bounds decode ITL in mixed steps).
+#   SX_OPT_ALIGN_SHARED_CHECKPOINT default "1". When a new request's attention
+#       KV prefix hit is longer than its usable recurrent-state hit (the state
+#       at that boundary was never checkpointed), end a chunk there so later
+#       requests sharing the prefix can restore state at that boundary.
+# Every added stop is a block multiple above the chunk start, so a stop can only
+# create checkpoints; it can never register a state that was not materialized.
+# ---------------------------------------------------------------------------
+def _sx_env_enabled(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).strip() != "0"
+
+
+def _sx_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)).strip())
+    except ValueError:
+        return default
+
+
+def _sx_is_sm70_qwen38_align_contract(vllm_config: VllmConfig) -> bool:
+    """Same admission as the SM70 Qwen3.8 no-MTP fast paths (config/vllm.py)."""
+    try:
+        from vllm.config.vllm import (
+            _any_participating_device_is_capability,
+            _is_sm70_qwen38_nomtp_dual_compile_contract,
+        )
+
+        return bool(
+            _is_sm70_qwen38_nomtp_dual_compile_contract(
+                vllm_config.model_config,
+                vllm_config.speculative_config,
+                vllm_config.parallel_config,
+            )
+            and _any_participating_device_is_capability(vllm_config, (7, 0))
+        )
+    except Exception:  # pragma: no cover - defensive: never block startup
+        logger.warning(
+            "SX align multi-block: contract check failed; keeping per-block "
+            "chunking.",
+            exc_info=True,
+        )
+        return False
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -301,6 +367,7 @@ class Scheduler(SchedulerInterface):
         self.mamba_state_block_size = (
             next(iter(mamba_state_block_sizes)) if mamba_state_block_sizes else None
         )
+        self._sx_init_mamba_align_policy(vllm_config)
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
@@ -410,6 +477,122 @@ class Scheduler(SchedulerInterface):
             - request.num_output_placeholders,
         )
 
+    def _sx_init_mamba_align_policy(self, vllm_config: VllmConfig) -> None:
+        """Resolve the SX_OPT align multi-block policy once (see module top)."""
+        self._sx_align_multiblock = False
+        self._sx_align_tail = True
+        self._sx_align_max_blocks = 0
+        self._sx_align_shared = False
+        if not self.need_mamba_block_aligned_split:
+            return
+        mode = os.environ.get("SX_OPT_ALIGN_MULTIBLOCK", "1").strip().lower()
+        reason = None
+        if mode == "0":
+            reason = "SX_OPT_ALIGN_MULTIBLOCK=0"
+        elif (
+            vllm_config.speculative_config is not None
+            or self.use_eagle
+            or self.num_spec_tokens
+        ):
+            reason = "speculative decoding keeps per-block checkpoints"
+        elif self.connector is not None:
+            reason = "KV connector keeps per-block checkpoints"
+        elif mode != "force" and not _sx_is_sm70_qwen38_align_contract(vllm_config):
+            reason = "outside the SM70 Qwen3.8 no-MTP contract"
+        if reason is not None:
+            logger.info(
+                "SX align multi-block prefill chunking disabled (%s); every "
+                "Mamba state block boundary ends a prefill chunk.",
+                reason,
+            )
+            return
+        self._sx_align_multiblock = True
+        self._sx_align_tail = _sx_env_enabled("SX_OPT_ALIGN_TAIL_CHECKPOINT")
+        self._sx_align_max_blocks = max(
+            0, _sx_env_int("SX_OPT_ALIGN_MAX_CHUNK_BLOCKS", 0)
+        )
+        self._sx_align_shared = bool(
+            self.cache_config.enable_prefix_caching
+            and _sx_env_enabled("SX_OPT_ALIGN_SHARED_CHECKPOINT")
+        )
+        logger.info(
+            "SX align multi-block prefill chunking enabled: state block %s, "
+            "tail_checkpoint=%s, max_chunk_blocks=%s, shared_checkpoint=%s.",
+            self.mamba_state_block_size,
+            self._sx_align_tail,
+            self._sx_align_max_blocks or "budget",
+            self._sx_align_shared,
+        )
+
+    def _sx_attention_prefix_hit_tokens(self, request: Request) -> int:
+        """Prefix-cache hit length of the full-attention groups alone.
+
+        Mirrors the full-attention step of
+        HybridKVCacheCoordinator.find_longest_cache_hit (read-only lookups, no
+        block is touched). Returns 0 when the layout has no such group.
+        """
+        from vllm.v1.core.kv_cache_utils import BlockHashListWithBlockSize
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        coordinator = self.kv_cache_manager.coordinator
+        attention_groups = getattr(coordinator, "attention_groups", None)
+        if not attention_groups:
+            return 0
+        hash_block_size = coordinator.hash_block_size
+        hit_length = request.num_tokens - 1
+        found = False
+        for spec, group_ids, manager_cls in attention_groups:
+            if not isinstance(spec, FullAttentionSpec):
+                continue
+            block_hashes = request.block_hashes
+            if spec.block_size != hash_block_size:
+                block_hashes = BlockHashListWithBlockSize(
+                    block_hashes, hash_block_size, spec.block_size
+                )
+            hit_blocks = manager_cls.find_longest_cache_hit(
+                block_hashes=block_hashes,
+                max_length=hit_length,
+                kv_cache_group_ids=group_ids,
+                block_pool=coordinator.block_pool,
+                kv_cache_spec=spec,
+                use_eagle=False,
+                alignment_tokens=coordinator.lcm_block_size,
+            )
+            hit_length = min(hit_length, len(hit_blocks[0]) * spec.block_size)
+            found = True
+        return max(hit_length, 0) if found else 0
+
+    def _sx_record_shared_prefix_stop(
+        self, request: Request, num_hit_tokens: int
+    ) -> None:
+        """Remember a checkpoint boundary for a KV-only shared prefix.
+
+        Called once per admission attempt, right after the prefix lookup. When
+        the attention KV of a longer prefix is cached but no recurrent state
+        was checkpointed there, the request ends a chunk at that boundary so
+        later requests with the same prefix can restore state there.
+        """
+        request._sx_align_shared_stop = 0  # type: ignore[attr-defined]
+        if not getattr(self, "_sx_align_shared", False):
+            return
+        try:
+            attention_hit = self._sx_attention_prefix_hit_tokens(request)
+        except Exception:
+            self._sx_align_shared = False
+            logger.warning(
+                "SX align shared-prefix checkpoint lookup failed; disabled.",
+                exc_info=True,
+            )
+            return
+        block_size = (
+            self.mamba_state_block_size
+            if self.mamba_state_block_size is not None
+            else self.cache_config.block_size
+        )
+        stop = attention_hit // block_size * block_size
+        if stop > num_hit_tokens:
+            request._sx_align_shared_stop = stop  # type: ignore[attr-defined]
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -456,9 +639,30 @@ class Scheduler(SchedulerInterface):
             if aligned_end > start:
                 end = aligned_end
 
+        if getattr(self, "_sx_align_multiblock", False) and start % block_size == 0:
+            # SX_OPT_ALIGN_MULTIBLOCK: a chunk that starts on a state-block
+            # boundary may span several blocks. Its end is a block multiple
+            # (aligned_end above) or the end of the prefill, the allocator
+            # null-pads the interior blocks and only the chunk-end block is
+            # a real state that caching can register. Extra stops below are
+            # block multiples, i.e. extra checkpoints only.
+            stops = []
+            if getattr(self, "_sx_align_tail", True):
+                stops.append(last_cache_position)
+            max_blocks = getattr(self, "_sx_align_max_blocks", 0)
+            if max_blocks > 0:
+                stops.append(start + max_blocks * block_size)
+            shared_stop = getattr(request, "_sx_align_shared_stop", 0)
+            if shared_stop:
+                stops.append(shared_stop)
+            end = min((stop for stop in stops if start < stop < end), default=end)
+            return max(end - start, 0)
+
         # The align allocator materializes one recurrent-state column per
         # scheduler step. A step spanning multiple state blocks leaves the
         # interior slots null, so every crossed boundary must end a chunk.
+        # (Per-block policy; with SX_OPT_ALIGN_MULTIBLOCK it still applies to
+        # chunks starting mid-block, whose start block is filled in place.)
         next_block_boundary = (start // block_size + 1) * block_size
         end = min(
             (
@@ -846,6 +1050,10 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
                     )
+                    if getattr(self, "_sx_align_shared", False):
+                        self._sx_record_shared_prefix_stop(
+                            request, num_new_local_computed_tokens
+                        )
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:

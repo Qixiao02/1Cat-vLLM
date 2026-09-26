@@ -4,6 +4,7 @@
 
 import torch
 
+from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -335,6 +336,22 @@ def _hc_combine_norm_kernel(
     tl.store(y_ptr + row * stride_y + offs, y, mask_inner)
 
 
+# SX batch-1 overlay (dense-multirow, design_4 MR9a).  Upper bound for the
+# cheap pre-check only; the real admission is the HC rows table
+# (SX_OPT_ROWS*, SX_OPT_ROWS_HC_NORM=0 disables) in sm70_fp16_hc.py.
+_SX_NORM_MAX_N = 64
+
+
+def _sx_rows_norm_uses_m1_tile(
+    n: int, hc_dim: int, hc_count: int, dtype: torch.dtype
+) -> bool:
+    try:
+        from ..sm70_fp16_hc import sx_hc_rows_norm_admitted
+    except Exception:  # fail closed: keep the generic tile
+        return False
+    return sx_hc_rows_norm_admitted(n, hc_dim, hc_count, dtype)
+
+
 def _hc_combine_norm(
     residual: torch.Tensor,
     block_output: torch.Tensor,
@@ -360,6 +377,18 @@ def _hc_combine_norm(
     # A 1024-wide tile keeps identical reduction/rounding results and is
     # measurably faster on V100; retain the generic tile for larger batches.
     sm70_decode = N == 1 and current_platform.is_device_capability(70)
+    if (
+        not sm70_decode
+        and 2 <= N <= _SX_NORM_MAX_N
+        and is_sm70_decode_graph_compiling()
+    ):
+        # SX MR9a: the (4, 1024) and (8, 512) tiles associate the sum of
+        # squares differently, so a batched row could differ from the same
+        # row at N=1.  Where the exact multi-row HC route is admitted (FULL
+        # decode graph, Qwen3.8 FP16 HC), use the M=1 tile for every row.
+        sm70_decode = _sx_rows_norm_uses_m1_tile(
+            N, hc_dim, hc_count, residual.dtype
+        )
     BLOCK_SIZE = 1024 if sm70_decode else 512
     _hc_combine_norm_kernel[(N, hc_count)](
         block_output,

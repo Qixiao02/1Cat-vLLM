@@ -195,8 +195,17 @@ class QSAIndexer(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         out: torch.Tensor | None = None,
+        *,
+        query_start_loc_cpu: torch.Tensor | None = None,
+        seq_lens_cpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return fixed-width request-relative token indices padded with ``-1``."""
+        """Return fixed-width request-relative token indices padded with ``-1``.
+
+        ``query_start_loc_cpu`` / ``seq_lens_cpu`` are optional host copies of
+        this step's query starts and sequence lengths (see SX_OPT_QSA_* in
+        ops/qsa.py). They only size host-side launches; None keeps the
+        baseline behaviour.
+        """
 
         metadata = self._metadata()
         if metadata is None:
@@ -349,6 +358,8 @@ class QSAIndexer(nn.Module):
             self.token_topk,
             self.compress_ratio,
             out,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens_cpu=seq_lens_cpu,
         )
 
 

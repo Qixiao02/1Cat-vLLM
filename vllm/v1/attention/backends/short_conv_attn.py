@@ -66,6 +66,11 @@ class PleShortConvAttentionMetadata(ShortConvAttentionMetadata):
     # packing buffer without a device->host sync (``lengths.max().item()``).
     # 0 when there are no prefill requests.
     max_prefill_query_len: int = 0
+    # SX_OPT (opt180dev1): host copy of the non-spec prefill query lengths, in
+    # prefill order. Lets the PLE dilated short-conv bound its padded packing
+    # buffer (num_prefills x max_len rows) without a device->host sync. None on
+    # the spec-decode builder path (the packing then behaves as before).
+    prefill_query_lens_cpu: tuple[int, ...] | None = None
     query_start_loc: torch.Tensor | None = None
 
     # ``state_indices_tensor`` keeps the historical (non-spec) layout used by
@@ -216,6 +221,7 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
                 has_initial_states_d = self.has_initial_states_d[:num_decode_rows]
 
         max_prefill_query_len = 0
+        prefill_query_lens_cpu = None
         if metadata.num_prefills > 0:
             query_lens_cpu = torch.diff(common_attn_metadata.query_start_loc_cpu)
             max_prefill_query_len = int(
@@ -227,12 +233,22 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
                 .max()
                 .item()
             )
+            # CPU tensor -> tuple: no device synchronization.
+            prefill_query_lens_cpu = tuple(
+                int(v)
+                for v in query_lens_cpu[
+                    metadata.num_decodes : (
+                        metadata.num_decodes + metadata.num_prefills
+                    )
+                ].tolist()
+            )
 
         return replace(
             metadata,
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             spec_query_len=self.num_spec + 1,
             max_prefill_query_len=max_prefill_query_len,
+            prefill_query_lens_cpu=prefill_query_lens_cpu,
             query_start_loc=common_attn_metadata.query_start_loc,
             state_indices_tensor=state_indices_tensor,
             has_initial_states_d=has_initial_states_d,
