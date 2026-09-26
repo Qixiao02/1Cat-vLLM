@@ -37,11 +37,43 @@ SX_OPT_MOE_EAGER_IOTA (default "1"), design_3 [P5] item 4:
     Both tensors are read-only in the eager route (CUB SortPairs values_in;
     compact offsets are only written for <=80 slots, which never reach the
     eager route), so results are bitwise identical.
+
+Batch 2 (native; needs the v2 grouped-decode ops from
+csrc/sm70_turbomind/ops/nvfp4_grouped_decode_sm70.cu, either in a rebuilt
+vllm._C or in the sidecar ``_C_qwen38_grouped`` library, which is loaded from
+$SX_OPT_MOE_GROUPED32_LIBRARY or a bundled vllm/_sx_nvfp4_grouped32_C*.so).
+Both switches only act with VLLM_SM70_NVFP4_MOE_GROUPED_DECODE=1 and the exact
+Qwen3.8 TP4 contract without DBO and without speculative decoding; when the v2
+ops are absent they log a warning and keep the previous routes.
+
+SX_OPT_MOE_GROUPED32 (default "1"), design_1 [C3]:
+    Pure-decode MoE calls with 17..32 tokens (the FULL24 decode graph, and a
+    FULL32 graph if max_num_seqs is raised) use the native grouped W13/W2
+    kernels instead of the generic TurboMind 512-expert route. The v2 planner
+    (deterministic prefix scan, 320 routes, ~24 KB shared memory) feeds the
+    unchanged grouped kernels at W13 split 8, so every row is bitwise
+    identical to the admitted M16 grouped path on the same row (rows are
+    independent). Versus the TurboMind route it is an FP32-association change
+    of the same class as the admitted M16 grouped route.
+    SX_OPT_MOE_GROUPED32_SPLIT ("8" default, or "4") selects the W13 split for
+    17..32 tokens; "4" is M8's association and not bitwise to M16.
+SX_OPT_MOE_GROUPED_MASK (default "1"), design_1 [C5]:
+    Every grouped decode width (8, 16, 17..32) passes the live decode-row count
+    to the v2 planner as a device scalar: the last element of the pure-decode
+    attention metadata's query_start_loc view (both model runners write
+    query_start_loc[num_reqs + 1:] = num_tokens every step, and FULL graphs
+    hold the pointer-stable persistent buffer). Padded rows (e.g. B17..23 in
+    the 24 graph) add no routes, groups or weight loads; their MoE output rows
+    are zero. Live rows are bitwise identical to the unmasked computation.
+    If the metadata does not expose exactly one such view, masking is skipped
+    for that call (logged once). "0" restores the old op at M8/M16 and runs
+    17..32 unmasked.
 """
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Final
 
 import torch
@@ -99,6 +131,34 @@ _SX_OPT_MOE_PERSIST32: Final = os.environ.get("SX_OPT_MOE_PERSIST32", "1") != "0
 _QWEN38_PERSISTENT_MAX_TOKENS: Final = 32
 # SX_OPT_MOE_EAGER_IOTA: shared read-only arange for eager MoE buffers.
 _SX_OPT_MOE_EAGER_IOTA: Final = os.environ.get("SX_OPT_MOE_EAGER_IOTA", "1") != "0"
+# SX_OPT_MOE_GROUPED32 / SX_OPT_MOE_GROUPED_MASK (batch 2, see the docstring).
+_SX_OPT_MOE_GROUPED32: Final = os.environ.get("SX_OPT_MOE_GROUPED32", "1") != "0"
+_SX_OPT_MOE_GROUPED_MASK: Final = (
+    os.environ.get("SX_OPT_MOE_GROUPED_MASK", "1") != "0"
+)
+
+
+def _grouped32_split_from_env() -> int:
+    value = os.environ.get("SX_OPT_MOE_GROUPED32_SPLIT", "8").strip()
+    if value in ("4", "8"):
+        return int(value)
+    logger.warning(
+        "Ignoring SX_OPT_MOE_GROUPED32_SPLIT=%r (allowed: 4, 8); using 8.", value
+    )
+    return 8
+
+
+# W13 split for 17..32 grouped decode rows (8 = M16's association).
+_SX_MOE_GROUPED32_SPLIT: Final = _grouped32_split_from_env()
+# Admitted legacy widths and their W13 splits (unchanged).
+_GROUPED_DECODE_LEGACY_SPLIT: Final = {8: 4, 16: 8}
+_QWEN38_GROUPED32_MAX_TOKENS: Final = 32
+_GROUPED_V2_NAMESPACE: Final = "_C_qwen38_grouped"
+_GROUPED_V2_W13: Final = "nvfp4_grouped_w13_v2_sm70_out"
+_GROUPED_V2_W2: Final = "nvfp4_grouped_w2_v2_sm70_out"
+_GROUPED_V2_MAX_ROUTES: Final = "nvfp4_grouped_decode_v2_max_routes"
+_GROUPED_LIVE_ROWS_KEY: Final = "sx_grouped_moe_live_rows"
+_grouped_v2_state: dict[str, object] = {}
 _COMPACT_GROUPED_MAX_SLOTS: Final = 80
 # V100 real-shape M=1 tuning favors 16 warps. This retains checkpoint NVFP4,
 # FP32 MMA accumulation, and the FP16 W13 output boundary; only the order in
@@ -233,6 +293,175 @@ def _moe_permute_sort_workspace_size(slots: int, experts: int) -> int:
         if len(_sort_workspace_sizes) < _SORT_WORKSPACE_SIZE_CACHE_MAX:
             _sort_workspace_sizes[key] = size
     return size
+
+
+def _grouped_v2_contract(layer: RoutedExperts) -> bool:
+    """Batch-2 grouped decode contract (same gates as SX_OPT_MOE_PERSIST32)."""
+    return bool(
+        _is_qwen38_tp4_contract(layer)
+        and not _ubatching_configured()
+        and not _speculative_decoding_configured()
+    )
+
+
+def _find_grouped_v2_namespace() -> str | None:
+    """Prefer the sidecar namespace, then a rebuilt vllm._C."""
+    for name in (_GROUPED_V2_NAMESPACE, "_C"):
+        namespace = getattr(torch.ops, name)
+        if all(
+            hasattr(namespace, op)
+            for op in (_GROUPED_V2_W13, _GROUPED_V2_W2, _GROUPED_V2_MAX_ROUTES)
+        ):
+            return name
+    return None
+
+
+def _grouped_v2_library_path() -> tuple[str | None, bool]:
+    """(path, explicit): $SX_OPT_MOE_GROUPED32_LIBRARY or a bundled sidecar."""
+    path = os.environ.get("SX_OPT_MOE_GROUPED32_LIBRARY")
+    if path:
+        return path, True
+    # .../vllm. Not resolve(): a symlinked overlay of this file must still
+    # search the installed package directory, not the overlay's directory.
+    package_dir = Path(os.path.abspath(__file__)).parents[3]
+    bundled = sorted(package_dir.glob("_sx_nvfp4_grouped32_C*.so"))
+    return (str(bundled[-1]), False) if bundled else (None, False)
+
+
+def _grouped_w13_v2_fake(
+    out, x, w, s, ids, rows, experts, sizes, total, split, interleaved,
+    valid_tokens=None,
+):
+    return None
+
+
+def _grouped_w2_v2_fake(
+    out, routed, x, w, s, topk, rows, experts, sizes, total, valid_tokens=None
+):
+    return None
+
+
+def _register_grouped_v2_fakes(namespace: str) -> None:
+    """Fake kernels for tracing (the SM70 MoE apply normally runs inside the
+    opaque vllm::moe_forward op, so this is defensive only)."""
+    try:
+        from torch.library import register_fake
+    except ImportError:  # pragma: no cover - older torch
+        from torch.library import impl_abstract as register_fake
+    for op, fake in (
+        (_GROUPED_V2_W13, _grouped_w13_v2_fake),
+        (_GROUPED_V2_W2, _grouped_w2_v2_fake),
+    ):
+        qualname = f"{namespace}::{op}"
+        key = f"fake:{qualname}"
+        if key in _grouped_v2_state:
+            continue
+        _grouped_v2_state[key] = True
+        try:
+            register_fake(qualname)(fake)
+        except Exception as exc:  # noqa: BLE001 - defensive; never fail serving
+            logger.debug("Fake for %s not registered: %s", qualname, exc)
+
+
+def _load_grouped_v2_ops() -> tuple | None:
+    """Return (w13_v2, w2_v2, max_routes, namespace) or None.
+
+    Loads the sidecar at most once per process (load time, never during graph
+    capture). An explicit $SX_OPT_MOE_GROUPED32_LIBRARY that fails to load
+    raises; a bundled sidecar that fails to load only warns.
+    """
+    if "ops" in _grouped_v2_state:
+        return _grouped_v2_state["ops"]  # type: ignore[return-value]
+    namespace = _find_grouped_v2_namespace()
+    if namespace is None:
+        path, explicit = _grouped_v2_library_path()
+        if path is not None:
+            try:
+                torch.ops.load_library(path)
+            except (OSError, RuntimeError) as exc:
+                if explicit:
+                    raise RuntimeError(
+                        "SX_OPT_MOE_GROUPED32_LIBRARY could not be loaded: "
+                        f"{path!r}"
+                    ) from exc
+                logger.warning(
+                    "Bundled SM70 grouped-decode v2 sidecar %s failed to load "
+                    "(%s); keeping the previous grouped-decode widths.",
+                    path,
+                    exc,
+                )
+            namespace = _find_grouped_v2_namespace()
+    ops = None
+    if namespace is not None:
+        ns = getattr(torch.ops, namespace)
+        ops = (
+            getattr(ns, _GROUPED_V2_W13),
+            getattr(ns, _GROUPED_V2_W2),
+            int(getattr(ns, _GROUPED_V2_MAX_ROUTES)()),
+            namespace,
+        )
+        _register_grouped_v2_fakes(namespace)
+    _grouped_v2_state["ops"] = ops
+    return ops
+
+
+def _find_live_rows_view(
+    metadata: object, num_tokens: int, device: torch.device
+) -> torch.Tensor | None:
+    """The query_start_loc tail shared by every pure-decode metadata object.
+
+    Pure decode maps token i to request i, so the live decode rows are the
+    first ``query_start_loc[-1]`` rows. Both model runners write
+    ``query_start_loc[num_reqs + 1:] = num_tokens`` (the real, unpadded count)
+    every step and at capture, and the attention metadata of FULL graphs
+    holds a view of the persistent buffer, so the tail is a pointer-stable,
+    per-step live-row count. Fails closed (None) unless every metadata
+    object exposing ``query_start_loc`` agrees on one int32 view of
+    ``num_tokens + 1`` entries on ``device``.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    view = None
+    seen: set[int] = set()
+    for meta in metadata.values():
+        if id(meta) in seen:
+            continue
+        seen.add(id(meta))
+        qsl = getattr(meta, "query_start_loc", None)
+        if qsl is None:
+            continue
+        if not (
+            isinstance(qsl, torch.Tensor)
+            and qsl.device == device
+            and qsl.dtype == torch.int32
+            and qsl.ndim == 1
+            and qsl.numel() == num_tokens + 1
+        ):
+            return None
+        tail = qsl[num_tokens:]
+        if view is None:
+            view = tail
+        elif tail.data_ptr() != view.data_ptr():
+            return None
+    return view
+
+
+def _grouped_decode_live_rows(x: torch.Tensor) -> torch.Tensor | None:
+    """Device scalar with the live decode-row count, cached per forward."""
+    context = get_forward_context()
+    num_tokens = int(x.shape[0])
+    cached = context.additional_kwargs.get(_GROUPED_LIVE_ROWS_KEY)
+    if cached is not None and cached[0] == num_tokens:
+        return cached[1]
+    live = _find_live_rows_view(context.attn_metadata, num_tokens, x.device)
+    context.additional_kwargs[_GROUPED_LIVE_ROWS_KEY] = (num_tokens, live)
+    if live is None:
+        logger.info_once(
+            "SX_OPT_MOE_GROUPED_MASK: no unique query_start_loc view in the "
+            "decode metadata (tokens=%d); padded rows are computed.",
+            num_tokens,
+        )
+    return live
 
 
 def _raw_scales_match_prepared(
@@ -444,12 +673,20 @@ def _grouped_decode_context_ok() -> bool:
     return bool(context.additional_kwargs[key])
 
 
+def _grouped_decode_width_ok(layer, tokens: int) -> bool:
+    """Legacy widths 8/16; 17..sm70_nvfp4_grouped_max_tokens only when load
+    time admitted SX_OPT_MOE_GROUPED32 (the attribute is absent otherwise)."""
+    return tokens in _GROUPED_DECODE_LEGACY_SPLIT or (
+        16 < tokens <= int(getattr(layer, "sm70_nvfp4_grouped_max_tokens", 16))
+    )
+
+
 def _use_grouped_decode(layer, x: torch.Tensor, topk_ids: torch.Tensor) -> bool:
     """Local operator contract only; no TP/KV/scheduler/model-name binding."""
     return bool(
         getattr(layer, "sm70_nvfp4_grouped_decode", False)
         and x.ndim == 2
-        and x.shape[0] in (8, 16)
+        and _grouped_decode_width_ok(layer, x.shape[0])
         and x.shape[1] == 2560
         and x.dtype == torch.float16
         and x.is_contiguous()
@@ -458,6 +695,18 @@ def _use_grouped_decode(layer, x: torch.Tensor, topk_ids: torch.Tensor) -> bool:
         and topk_ids.is_contiguous()
         and _grouped_decode_context_ok()
     )
+
+
+def _grouped_decode_split(
+    layer, x: torch.Tensor, topk_ids: torch.Tensor
+) -> int | None:
+    """W13 split of an admitted grouped-decode call, else None."""
+    if not _use_grouped_decode(layer, x, topk_ids):
+        return None
+    legacy = _GROUPED_DECODE_LEGACY_SPLIT.get(int(x.shape[0]))
+    if legacy is not None:
+        return legacy
+    return int(getattr(layer, "sm70_nvfp4_grouped32_split", _SX_MOE_GROUPED32_SPLIT))
 
 
 def _use_qwen38_qpn_batch_fused_w2(
@@ -1331,18 +1580,62 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE requires a matching native build."
             )
         layer.sm70_nvfp4_grouped_decode = grouped_requested
+        # SX_OPT_MOE_GROUPED32 / SX_OPT_MOE_GROUPED_MASK (batch 2): widths
+        # 17..32 and padded-row masking through the v2 grouped-decode ops.
+        layer.sm70_nvfp4_grouped_max_tokens = 16
+        layer.sm70_nvfp4_grouped_mask = False
+        layer.sm70_nvfp4_grouped32_split = _SX_MOE_GROUPED32_SPLIT
+        layer._nvfp4_grouped_v2_ops = None
+        if (
+            grouped_requested
+            and (_SX_OPT_MOE_GROUPED32 or _SX_OPT_MOE_GROUPED_MASK)
+            and _grouped_v2_contract(layer)
+        ):
+            grouped_v2 = _load_grouped_v2_ops()
+            if grouped_v2 is None:
+                logger.warning_once(
+                    "SX_OPT_MOE_GROUPED32/SX_OPT_MOE_GROUPED_MASK: the v2 SM70 "
+                    "grouped-decode ops are absent (rebuild vllm._C or set "
+                    "SX_OPT_MOE_GROUPED32_LIBRARY); grouped decode stays at "
+                    "B8/B16 without padded-row masking."
+                )
+            else:
+                w13_v2, w2_v2, max_routes, namespace = grouped_v2
+                native_max_tokens = min(
+                    _QWEN38_GROUPED32_MAX_TOKENS, int(max_routes) // 10
+                )
+                layer._nvfp4_grouped_v2_ops = (w13_v2, w2_v2)
+                if _SX_OPT_MOE_GROUPED32 and native_max_tokens > 16:
+                    layer.sm70_nvfp4_grouped_max_tokens = native_max_tokens
+                layer.sm70_nvfp4_grouped_mask = _SX_OPT_MOE_GROUPED_MASK
+                logger.info_once(
+                    "SX_OPT_MOE_GROUPED32: SM70 grouped native-NVFP4 decode "
+                    "admits B8/B16%s (B17+ W13 split%d), padded-row masking "
+                    "%s; v2 ops from torch.ops.%s (%d routes).",
+                    (
+                        f" and B17-B{layer.sm70_nvfp4_grouped_max_tokens}"
+                        if layer.sm70_nvfp4_grouped_max_tokens > 16
+                        else ""
+                    ),
+                    layer.sm70_nvfp4_grouped32_split,
+                    "on" if layer.sm70_nvfp4_grouped_mask else "off",
+                    namespace,
+                    int(max_routes),
+                )
         if grouped_requested:
             # Layer-owned metadata; W2 reuses sorted_output. No process-global
             # cache or additional activation buffer inside graph capture.
+            # 160 routes (B16) unless SX_OPT_MOE_GROUPED32 admits B17..B32.
             device = layer.w13_tm_weight.device
+            grouped_routes = 10 * max(16, int(layer.sm70_nvfp4_grouped_max_tokens))
             layer._nvfp4_grouped_rows = torch.empty(
-                160, 8, dtype=torch.int32, device=device
+                grouped_routes, 8, dtype=torch.int32, device=device
             )
             layer._nvfp4_grouped_experts = torch.empty(
-                160, dtype=torch.int32, device=device
+                grouped_routes, dtype=torch.int32, device=device
             )
             layer._nvfp4_grouped_sizes = torch.empty(
-                160, dtype=torch.int32, device=device
+                grouped_routes, dtype=torch.int32, device=device
             )
             layer._nvfp4_grouped_total = torch.empty(
                 1, dtype=torch.int32, device=device
@@ -1699,7 +1992,60 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         buffers = self._get_buffers(layer, num_tokens, indexed_w13)
         output = buffers["output"]
         slots = num_tokens * top_k
-        if _use_grouped_decode(layer, x, topk_ids):
+        grouped_split = _grouped_decode_split(layer, x, topk_ids)
+        if grouped_split is not None:
+            grouped_v2_ops = getattr(layer, "_nvfp4_grouped_v2_ops", None)
+            # SX_OPT_MOE_GROUPED_MASK: device view of the live decode-row
+            # count (query_start_loc tail); None computes every row.
+            live_rows = (
+                _grouped_decode_live_rows(x)
+                if grouped_v2_ops is not None
+                and getattr(layer, "sm70_nvfp4_grouped_mask", False)
+                else None
+            )
+            if grouped_v2_ops is not None and (
+                num_tokens > 16 or live_rows is not None
+            ):
+                w13_v2, w2_v2 = grouped_v2_ops
+                w13_v2(
+                    buffers["intermediate"],
+                    x,
+                    layer.w13_tm_weight,
+                    layer.w13_tm_scales,
+                    topk_ids.view(-1),
+                    layer._nvfp4_grouped_rows,
+                    layer._nvfp4_grouped_experts,
+                    layer._nvfp4_grouped_sizes,
+                    layer._nvfp4_grouped_total,
+                    grouped_split,
+                    interleaved_w13,
+                    live_rows,
+                )
+                w2_v2(
+                    output,
+                    buffers["sorted_output"],
+                    buffers["intermediate"],
+                    layer.w2_tm_weight,
+                    layer.w2_tm_scales,
+                    topk_weights,
+                    layer._nvfp4_grouped_rows,
+                    layer._nvfp4_grouped_experts,
+                    layer._nvfp4_grouped_sizes,
+                    layer._nvfp4_grouped_total,
+                    live_rows,
+                )
+                logger.info_once(
+                    "SX_OPT_MOE_GROUPED32: SM70 grouped native-NVFP4 decode v2 "
+                    "selected (tokens=%d, W13 split%d, padded-row masking %s).",
+                    num_tokens,
+                    grouped_split,
+                    "on" if live_rows is not None else "off",
+                )
+                return output
+            if num_tokens > 16:  # load time admits 17+ only with the v2 ops
+                raise RuntimeError(
+                    "SM70 grouped NVFP4 decode above 16 tokens needs the v2 ops."
+                )
             sm70_ops.nvfp4_grouped_w13_sm70_out(
                 buffers["intermediate"],
                 x,
@@ -1710,7 +2056,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 layer._nvfp4_grouped_experts,
                 layer._nvfp4_grouped_sizes,
                 layer._nvfp4_grouped_total,
-                4 if num_tokens == 8 else 8,
+                grouped_split,
                 interleaved_w13,
             )
             sm70_ops.nvfp4_grouped_w2_sm70_out(

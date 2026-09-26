@@ -45,6 +45,19 @@ if hasattr(torch.ops._C_qsa_sm70, "qsa_lexicographic_topk"):
         return None
 
 
+if hasattr(torch.ops._C_qsa_sm70, "qsa_lexicographic_topk_decode_rows"):
+
+    @torch.library.register_fake("_C_qsa_sm70::qsa_lexicographic_topk_decode_rows")
+    def _qsa_lexicographic_topk_decode_rows_sidecar_fake(
+        logits: torch.Tensor,
+        lengths: torch.Tensor,
+        output: torch.Tensor,
+        topk: int,
+    ) -> None:
+        del logits, lengths, output, topk
+        return None
+
+
 _SM70_INDEXER_CUBLAS = os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS", "1") == "1"
 _SM70_INDEXER_SCORE_TILE_BYTES = (
     int(os.getenv("VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB", "64")) * 1024 * 1024
@@ -130,6 +143,22 @@ _SM70_QSA_GROUPED_PAGE4_ABI_CACHE: tuple[object, int] | None = None
 #                              vs cuBLAS HMMA); bitwise equal to the request run
 #                              alone. Other rows stay bitwise unchanged.
 #
+# Batch 2 (group "small-native"):
+#
+#   SX_OPT_QSA_TOPK_ROWS       Exact lexicographic block top-k: run the
+#                              decode-specialised selector (coarse radix byte +
+#                              shared-memory candidate refinement) for every
+#                              row of a 2 <= M <= 32 batch, grid = M, instead of
+#                              the generic four-full-scan kernel (the decode
+#                              kernel used to serve M == 1 only). Bitwise: the
+#                              same selected ids and order as the generic
+#                              kernel and as the M == 1 kernel on each row
+#                              (design_4 [MR5]). Needs the rebuilt
+#                              _C_stable_libtorch (op
+#                              qsa_lexicographic_topk_decode_rows) or a
+#                              validation sidecar built from this source;
+#                              without the op the old launch runs.
+#
 # The host metadata these paths need (query_start_loc / seq_lens CPU copies)
 # is attached by Qwen4ExpQSAMetadataBuilder in ../qsa.py only when no
 # speculative decoding is configured; without it every path falls back to the
@@ -151,6 +180,7 @@ _SX_OPT_QSA_RESOLVED_ROWS = _sx_opt_enabled("QSA_RESOLVED_ROWS")
 _SX_OPT_QSA_SCORER_STRIDE = os.environ.get("SX_OPT_QSA_SCORER_STRIDE", "0") == "1"
 _SX_OPT_QSA_MIXED_GROUPS = _sx_opt_enabled("QSA_MIXED_GROUPS")
 _SX_OPT_QSA_MIXED_CUBLAS = _sx_opt_enabled("QSA_MIXED_CUBLAS")
+_SX_OPT_QSA_TOPK_ROWS = _sx_opt_enabled("QSA_TOPK_ROWS")
 # Decode widths served by the two-warp partial and the address resolver.
 _SX_QSA_DECODE_MAX_ROWS = 32
 # The strided scorer targets roughly one wave of two-warp CTAs.
@@ -1489,6 +1519,33 @@ def _sm70_qsa_lexicographic_topk_op():
     return torch.ops._C.qsa_lexicographic_topk
 
 
+def _sm70_qsa_lexicographic_topk_rows_op():
+    """Decode-specialised selector for every row (grid = rows), or None.
+
+    Follows the same source as _sm70_qsa_lexicographic_topk_op: when a
+    validation sidecar is loaded, only its own rows op is used (an older
+    sidecar build has none, so the old launch stays), never the wheel's rows
+    op mixed with a sidecar M == 1 op.
+    """
+
+    sidecar = torch.ops._C_qsa_sm70
+    if hasattr(sidecar, "qsa_lexicographic_topk"):
+        return getattr(sidecar, "qsa_lexicographic_topk_decode_rows", None)
+    return getattr(torch.ops._C, "qsa_lexicographic_topk_decode_rows", None)
+
+
+def _sx_qsa_topk_rows_op(rows: int):
+    """SX_OPT_QSA_TOPK_ROWS admission: 2 <= rows <= 32 and the op is built.
+
+    M == 1 keeps the existing launch (already the decode kernel); larger row
+    counts (prefill chunks) keep the generic kernel.
+    """
+
+    if not _SX_OPT_QSA_TOPK_ROWS or not 2 <= rows <= _SX_QSA_DECODE_MAX_ROWS:
+        return None
+    return _sm70_qsa_lexicographic_topk_rows_op()
+
+
 def _qsa_visible_blocks(
     token_to_req: torch.Tensor,
     query_positions: torch.Tensor,
@@ -1819,12 +1876,27 @@ def _qsa_select_rows(
                 "Using exact SM70 QSA lexicographic top-k "
                 "(score descending, block index ascending)."
             )
-            _sm70_qsa_lexicographic_topk_op()(
-                logits,
-                visible_blocks,
-                blocks,
-                block_topk,
-            )
+            rows_topk_op = _sx_qsa_topk_rows_op(blocks.shape[0])
+            if rows_topk_op is not None:
+                logger.info_once(
+                    "Using exact SM70 QSA decode-specialised lexicographic "
+                    "top-k for every row of 2 <= M <= %d batches "
+                    "(SX_OPT_QSA_TOPK_ROWS).",
+                    _SX_QSA_DECODE_MAX_ROWS,
+                )
+                rows_topk_op(
+                    logits,
+                    visible_blocks,
+                    blocks,
+                    block_topk,
+                )
+            else:
+                _sm70_qsa_lexicographic_topk_op()(
+                    logits,
+                    visible_blocks,
+                    blocks,
+                    block_topk,
+                )
         else:
             topk_op = (
                 torch.ops._C.cooperative_topk

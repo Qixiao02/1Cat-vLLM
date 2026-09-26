@@ -25,6 +25,7 @@
 # limitations under the License.
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 from typing import Any
@@ -36,7 +37,7 @@ from transformers import Qwen2MoeConfig
 
 import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config_or_none
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -76,6 +77,78 @@ logger = init_logger(__name__)
 
 _SM70_FUSED_SHARED_GATE_MAX_TOKENS = 16
 
+# ---------------------------------------------------------------------------
+# ShiXiang batch-2 switch (group "small-native", design_4 [MR6]).
+#
+#   SX_OPT_SHARED_GATE_ROWS  Exact fused shared-expert gate (FP16 gate dot,
+#                            sigmoid, in-place output multiply) for every
+#                            token row of a small batch, 1 <= M <= 32
+#                            (was M == 1 only). The native kernel runs one CTA
+#                            per row with the unchanged single-row code, so
+#                            each row is bitwise identical to the M == 1 fused
+#                            gate on that row alone. Versus the old unfused
+#                            M > 1 path (F.linear + sigmoid + mul) values move
+#                            at FP16 ULP level. Default "1"; "0" restores the
+#                            M == 1-only gate. Needs the rebuilt native op
+#                            (qwen38_shared_gate_exact_out accepting (M, 2560));
+#                            an old extension is detected once at model
+#                            construction and keeps the M == 1 gate.
+#                            Speculative decoding (MTP/EAGLE/...) is outside
+#                            the SX_OPT_* contract and keeps the M == 1 gate
+#                            (its M > 1 numerics stay unchanged).
+# ---------------------------------------------------------------------------
+_SX_OPT_SHARED_GATE_ROWS = os.environ.get("SX_OPT_SHARED_GATE_ROWS", "1") != "0"
+# Covers every decode CUDA-graph width (captures up to 24) and the 32-row
+# decode contract shared with the other multi-row paths.
+_SX_SHARED_GATE_ROWS_MAX_TOKENS = 32
+_SX_SHARED_GATE_ROWS_CAPABLE: bool | None = None
+
+
+def _sx_speculative_decoding_configured() -> bool:
+    """MTP/EAGLE/... deployments stay on the previous (M == 1) gate.
+
+    Evaluated at model construction, where the vLLM config is current. The
+    target model's verify rows and the MTP draft's ``.mlp.shared_expert``
+    would otherwise move from the unfused M > 1 gate to the fused one.
+    """
+    config = get_current_vllm_config_or_none()
+    return getattr(config, "speculative_config", None) is not None
+
+
+def _sx_probe_shared_gate_rows() -> bool:
+    """Run the native gate once on a (3, 2560) batch and check every row.
+
+    An extension built before the multi-row change rejects any shape other
+    than (1, 2560) with a RuntimeError before launching anything. The probe
+    uses zero activations and a zero gate weight: sigmoid(0) = 0.5 exactly in
+    FP16, so a multi-row kernel turns every element of the all-ones output
+    into 0.5, while a kernel that only handled row 0 would leave rows 1-2 at
+    1.0. One tiny launch plus one host sync, once per process, at model
+    construction (never inside CUDA-graph capture).
+    """
+    from vllm import _sm70_ops as sm70_ops
+
+    if not torch.cuda.is_available() or not sm70_ops.has_qwen38_shared_gate_exact():
+        return False
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    try:
+        device = torch.device("cuda", torch.cuda.current_device())
+        x = torch.zeros((3, 2560), dtype=torch.float16, device=device)
+        weight = torch.zeros((1, 2560), dtype=torch.float16, device=device)
+        out = torch.ones((3, 2560), dtype=torch.float16, device=device)
+        sm70_ops.qwen38_shared_gate_exact_out(out, x, weight)
+        return bool(torch.all(out == 0.5).item())
+    except RuntimeError:
+        return False
+
+
+def _sx_shared_gate_rows_capable() -> bool:
+    global _SX_SHARED_GATE_ROWS_CAPABLE
+    if _SX_SHARED_GATE_ROWS_CAPABLE is None:
+        _SX_SHARED_GATE_ROWS_CAPABLE = _sx_probe_shared_gate_rows()
+    return _SX_SHARED_GATE_ROWS_CAPABLE
+
 
 def _sm70_dump_qwen_mlp_tensor(
     label: str,
@@ -109,6 +182,7 @@ def _sm70_force_shared_expert_silu_custom_op(prefix: str) -> bool:
 def _sm70_fused_shared_expert_gate_shape_supported(
     x: torch.Tensor,
     out: torch.Tensor,
+    max_tokens: int = _SM70_FUSED_SHARED_GATE_MAX_TOKENS,
 ) -> bool:
     """Return whether the exact small-batch SM70 gate kernel can run.
 
@@ -119,7 +193,7 @@ def _sm70_fused_shared_expert_gate_shape_supported(
     return bool(
         x.ndim == 2
         and out.ndim == 2
-        and 0 < x.shape[0] <= _SM70_FUSED_SHARED_GATE_MAX_TOKENS
+        and 0 < x.shape[0] <= max_tokens
         and out.shape[0] == x.shape[0]
         and x.dtype == torch.float16
         and out.dtype == torch.float16
@@ -193,6 +267,32 @@ class Qwen2MoeMLP(nn.Module):
             logger.info_once(
                 "SM70 Qwen3Next exact single-token shared-expert gate enabled."
             )
+        # SX_OPT_SHARED_GATE_ROWS: the same exact gate for 1 < M <= 32 rows.
+        sx_rows_requested = bool(
+            self._sm70_exact_shared_expert_gate and _SX_OPT_SHARED_GATE_ROWS
+        )
+        sx_rows_spec = sx_rows_requested and _sx_speculative_decoding_configured()
+        self._sx_shared_gate_rows = bool(
+            sx_rows_requested and not sx_rows_spec and _sx_shared_gate_rows_capable()
+        )
+        if sx_rows_requested:
+            if self._sx_shared_gate_rows:
+                logger.info_once(
+                    "SM70 Qwen3.8 exact multi-row shared-expert gate enabled "
+                    "for 1 <= M <= %d (SX_OPT_SHARED_GATE_ROWS).",
+                    _SX_SHARED_GATE_ROWS_MAX_TOKENS,
+                )
+            elif sx_rows_spec:
+                logger.info_once(
+                    "SX_OPT_SHARED_GATE_ROWS: speculative decoding is "
+                    "configured; keeping the M == 1 shared-expert gate."
+                )
+            else:
+                logger.warning_once(
+                    "SX_OPT_SHARED_GATE_ROWS: the loaded native "
+                    "qwen38_shared_gate_exact_out accepts only one row (built "
+                    "before the multi-row change); keeping the M == 1 gate."
+                )
 
     def forward(self, x):
         x = _sm70_dump_qwen_mlp_tensor("mlp_input", self.layer_idx, x)
@@ -207,10 +307,22 @@ class Qwen2MoeMLP(nn.Module):
         out = _sm70_dump_qwen_mlp_tensor("mlp_down_out", self.layer_idx, out)
 
         used_exact_gate = False
+        num_rows = x.shape[0]
+        # M == 1 is the original gate. SX_OPT_SHARED_GATE_ROWS admits
+        # 1 < M <= 32 contiguous rows (grid = M, per-row code unchanged);
+        # instances built without the attribute keep the M == 1 gate.
+        exact_gate_rows = num_rows == 1 or (
+            getattr(self, "_sx_shared_gate_rows", False)
+            and num_rows <= _SX_SHARED_GATE_ROWS_MAX_TOKENS
+            and x.is_contiguous()
+            and out.is_contiguous()
+        )
         if (
             self._sm70_exact_shared_expert_gate
-            and x.shape[0] == 1
-            and _sm70_fused_shared_expert_gate_shape_supported(x, out)
+            and exact_gate_rows
+            and _sm70_fused_shared_expert_gate_shape_supported(
+                x, out, max_tokens=_SX_SHARED_GATE_ROWS_MAX_TOKENS
+            )
         ):
             from vllm import _sm70_ops as sm70_ops
 
@@ -226,6 +338,11 @@ class Qwen2MoeMLP(nn.Module):
                         "contiguous FP16 gate weight."
                     )
                 logger.info_once("SM70 Qwen3.8 exact shared-expert gate path enabled.")
+                if num_rows > 1:
+                    logger.info_once(
+                        "SM70 Qwen3.8 exact multi-row shared-expert gate path "
+                        "hit (SX_OPT_SHARED_GATE_ROWS)."
+                    )
                 sm70_ops.qwen38_shared_gate_exact_out(out, x, gate_weight)
                 used_exact_gate = True
         if self.expert_gate is not None and not used_exact_gate:

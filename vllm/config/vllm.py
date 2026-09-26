@@ -347,6 +347,224 @@ def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
     return sorted(capture_sizes)
 
 
+# SX PW-1 (batch 2): PIECEWISE-only CUDA graphs for mixed prefill+decode and
+# prefill steps above the FULL decode sizes of the SM70 Qwen3.8 no-MTP
+# dual-compile lane. These helpers never touch
+# compilation_config.cudagraph_capture_sizes: the V2 ModelCudaGraphManager
+# (vllm/v1/worker/gpu/cudagraph_utils.py) adds the extra sizes as PIECEWISE
+# descriptors only, so the FULL decode graphs, max_cudagraph_capture_size and
+# the decode compiler range stay exactly as before. Switches (read locally):
+#   SX_OPT_PIECEWISE_MIXED=0           previous behaviour (no extra sizes, no
+#                                      decode-range decoupling)
+#   SX_OPT_PIECEWISE_MAX_TOKENS=<int>  largest extra size (default 1024, 0 = off)
+#   SX_OPT_PIECEWISE_SIZES=<a,b,...>   explicit extra size list (default: grid)
+_SX_PIECEWISE_DEFAULT_MAX_TOKENS = 1024
+_SX_PIECEWISE_MIN_SIZE = 32
+
+
+def _sx_piecewise_mixed_enabled() -> bool:
+    return os.environ.get("SX_OPT_PIECEWISE_MIXED", "1").strip() != "0"
+
+
+def _sx_piecewise_max_tokens() -> int:
+    raw = os.environ.get("SX_OPT_PIECEWISE_MAX_TOKENS", "").strip()
+    if not raw:
+        return _SX_PIECEWISE_DEFAULT_MAX_TOKENS
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        logger.warning_once(
+            "Ignoring invalid SX_OPT_PIECEWISE_MAX_TOKENS=%r; using %d.",
+            raw,
+            _SX_PIECEWISE_DEFAULT_MAX_TOKENS,
+        )
+        return _SX_PIECEWISE_DEFAULT_MAX_TOKENS
+
+
+def _sx_piecewise_explicit_sizes() -> list[int] | None:
+    raw = os.environ.get("SX_OPT_PIECEWISE_SIZES", "").strip()
+    if not raw:
+        return None
+    sizes: set[int] = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            value = int(item)
+        except ValueError:
+            logger.warning_once(
+                "Ignoring invalid SX_OPT_PIECEWISE_SIZES entry %r.", item
+            )
+            continue
+        if value > 0:
+            sizes.add(value)
+    return sorted(sizes)
+
+
+def _sm70_qwen38_mixed_piecewise_grid(max_tokens: int) -> list[int]:
+    """Default PIECEWISE token grid 32..max_tokens (23 sizes for 1024).
+
+    Steps are 16 below 128 tokens, 32 below 256, 64 below 1024, 128 below
+    2048 and 256 above, so a step pads by at most 63 tokens up to 1024
+    (at most 1/3 of the size below 128 tokens, 1/5 above); ``max_tokens``
+    itself is always the last size so the whole admitted range
+    [capture max + 1, max_tokens] has a graph.
+    """
+    sizes: list[int] = []
+    size = _SX_PIECEWISE_MIN_SIZE
+    while size < max_tokens:
+        sizes.append(size)
+        if size < 128:
+            size += 16
+        elif size < 256:
+            size += 32
+        elif size < 1024:
+            size += 64
+        elif size < 2048:
+            size += 128
+        else:
+            size += 256
+    if max_tokens > 0:
+        sizes.append(max_tokens)
+    return sizes
+
+
+def _sm70_qwen38_decode_graph_sizes(
+    capture_sizes: Iterable[int],
+    max_num_seqs: int,
+    decode_query_len: int = 1,
+) -> list[int]:
+    """Capture sizes that can hold a FULL uniform-decode graph.
+
+    Mirrors the V2 CudaGraphManager rule (tokens <= max_num_seqs * q): larger
+    sizes can only ever be PIECEWISE graphs of the main compile, so they must
+    not widen the dual-compile decode range.
+    """
+    sizes = sorted({int(size) for size in capture_sizes if int(size) > 0})
+    if not sizes:
+        return [1]
+    limit = max(int(max_num_seqs), 1) * max(int(decode_query_len), 1)
+    decode_sizes = [size for size in sizes if size <= limit]
+    return decode_sizes or [sizes[0]]
+
+
+def _sm70_qwen38_decode_range_decoupled(vllm_config: Any) -> bool:
+    """Limit the dual-compile decode range to the FULL decode sizes?
+
+    Only in the lane PW-1 serves (SM70 Qwen3.8 TP4 no-MTP contract with
+    FULL_AND_PIECEWISE), where every capture size above max_num_seqs can only
+    be a PIECEWISE graph of the main compile. Every other configuration keeps
+    the previous range max(capture sizes): cudagraph_mode FULL captures mixed
+    FULL graphs at every size through the decode compiler (a narrower range
+    would reject them), and spec/MTP lanes are outside the contract.
+    """
+    if vllm_config is None or not _sx_piecewise_mixed_enabled():
+        return False
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    return bool(
+        getattr(compilation_config, "cudagraph_mode", None)
+        == CUDAGraphMode.FULL_AND_PIECEWISE
+        and _is_sm70_qwen38_nomtp_dual_compile_contract(
+            getattr(vllm_config, "model_config", None),
+            getattr(vllm_config, "speculative_config", None),
+            getattr(vllm_config, "parallel_config", None),
+        )
+    )
+
+
+def _sx_piecewise_platform_ok() -> bool:
+    """Every visible device is SM70.
+
+    Evaluated per TP rank; asking about all visible devices (identical on
+    every rank) rather than the current one keeps the decision rank-invariant,
+    so all ranks capture the same graphs (custom all-reduce capture is a
+    collective).
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return False
+    count = int(current_platform.device_count())
+    return count > 0 and all(
+        current_platform.is_device_capability((7, 0), device_id=device_id)
+        for device_id in range(count)
+    )
+
+
+def _sm70_qwen38_mixed_piecewise_sizes(
+    vllm_config: Any,
+    capture_sizes: Iterable[int],
+) -> list[int]:
+    """Extra PIECEWISE-only sizes for the SM70 Qwen3.8 no-MTP TP4 lane.
+
+    Returns [] (previous behaviour) unless every contract below holds; the
+    caller must still restrict the result to PIECEWISE descriptors.
+    """
+    if not _sx_piecewise_mixed_enabled():
+        return []
+    max_tokens = _sx_piecewise_max_tokens()
+    if max_tokens <= 0 or vllm_config is None:
+        return []
+    model_config = getattr(vllm_config, "model_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    if scheduler_config is None or compilation_config is None:
+        return []
+    if not _is_sm70_qwen38_nomtp_dual_compile_contract(
+        model_config,
+        getattr(vllm_config, "speculative_config", None),
+        parallel_config,
+    ):
+        return []
+    # Same lane as the FULL decode graphs: dual compile (the main backbone is
+    # the PIECEWISE graph owner), no hybrid/offloaded PLE (its GPU wait op and
+    # CPU worker are outside this contract), single-stream TP4 execution.
+    if not (
+        envs.VLLM_SM70_QWEN38_DUAL_COMPILE
+        and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+        and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
+        and not envs.VLLM_PLE_CPU_OFFLOAD
+    ):
+        return []
+    if (
+        getattr(vllm_config, "lora_config", None) is not None
+        or int(getattr(parallel_config, "data_parallel_size", 1) or 1) != 1
+        or getattr(parallel_config, "enable_dbo", False)
+        or getattr(parallel_config, "enable_expert_parallel", False)
+    ):
+        return []
+    pass_config = getattr(compilation_config, "pass_config", None)
+    splitting_ops = getattr(compilation_config, "splitting_ops", None) or ()
+    if (
+        getattr(compilation_config, "mode", None) != CompilationMode.VLLM_COMPILE
+        or getattr(compilation_config, "cudagraph_mode", None)
+        != CUDAGraphMode.FULL_AND_PIECEWISE
+        or getattr(compilation_config, "use_inductor_graph_partition", False)
+        or getattr(pass_config, "enable_sp", False)
+        or not all(op in splitting_ops for op in CompilationConfig._attention_ops)
+    ):
+        return []
+    if not _sx_piecewise_platform_ok():
+        return []
+
+    base_sizes = {int(size) for size in capture_sizes if int(size) > 0}
+    if not base_sizes:
+        return []
+    limit = min(
+        max_tokens,
+        int(getattr(scheduler_config, "max_num_batched_tokens", 0) or 0),
+    )
+    base_max = max(base_sizes)
+    grid = _sx_piecewise_explicit_sizes()
+    if grid is None:
+        grid = _sm70_qwen38_mixed_piecewise_grid(limit)
+    return sorted(
+        {size for size in grid if base_max < size <= limit} - base_sizes
+    )
+
+
 def _sm70_mtp_cudagraph_capture_sizes(
     max_num_seqs: int,
     decode_query_len: int,

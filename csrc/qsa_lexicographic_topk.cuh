@@ -225,15 +225,20 @@ __launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_topk_kernel(
 // the other three bytes wastes most of the work. Compact the selected coarse
 // bucket into shared memory and refine that much smaller set instead. Integer
 // counters and the final increasing-index pass retain exact tie-breaking.
+//
+// This is the per-row body of the decode-specialised selector. It is shared,
+// unchanged, by the single-row kernel (row 0, the original M == 1 launch) and
+// by the multi-row decode kernel below (one CTA per row), so every row of the
+// multi-row launch executes exactly the validated single-row code on its own
+// score row. `logits` and `output` point at the row; `length` is the clamped
+// live length of that row. All branches below depend only on per-row block
+// uniform values, so the early return and __syncthreads() stay block uniform.
 template <int TopK>
-__global__
-__launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_decode_topk_kernel(
-    const float* __restrict__ logits, const int32_t* __restrict__ lengths,
-    int32_t* __restrict__ output, uint32_t columns) {
+__device__ __forceinline__ void qsa_lexicographic_decode_topk_row(
+    const float* __restrict__ logits, const uint32_t length,
+    int32_t* __restrict__ output,
+    LexicographicDecodeTopKShared<TopK>& shared) {
   const uint32_t tx = threadIdx.x;
-  const int32_t raw_length = lengths[0];
-  const uint32_t length =
-      raw_length > 0 ? min(static_cast<uint32_t>(raw_length), columns) : 0;
 
   if (length <= TopK) {
     for (uint32_t index = tx; index < TopK;
@@ -243,7 +248,6 @@ __launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_decode_topk_
     return;
   }
 
-  __shared__ LexicographicDecodeTopKShared<TopK> shared;
   if (tx == 0) {
     shared.prefix = 0;
     shared.remaining = TopK;
@@ -396,6 +400,48 @@ __launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_decode_topk_
   }
 }
 
+// Original single-row decode kernel (num_rows == 1 launch of
+// launch_qsa_lexicographic_topk). Reads lengths[0] and one score row.
+template <int TopK>
+__global__
+__launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_decode_topk_kernel(
+    const float* __restrict__ logits, const int32_t* __restrict__ lengths,
+    int32_t* __restrict__ output, uint32_t columns) {
+  const int32_t raw_length = lengths[0];
+  const uint32_t length =
+      raw_length > 0 ? min(static_cast<uint32_t>(raw_length), columns) : 0;
+  __shared__ LexicographicDecodeTopKShared<TopK> shared;
+  qsa_lexicographic_decode_topk_row<TopK>(logits, length, output, shared);
+}
+
+// Multi-row decode kernel (ShiXiang batch 2, design_4 [MR5]): grid = num_rows,
+// one 1024-thread CTA per score row, each running the unchanged single-row
+// body above. Row addressing matches the generic kernel (row * stride for the
+// scores, row * TopK for the output, lengths[row] clamped to columns), so the
+// selected ids equal the generic kernel's exactly (same score-descending,
+// index-ascending selection, emitted in increasing index order) and equal the
+// single-row kernel run on that row alone. Static shared memory is the same
+// LexicographicDecodeTopKShared<512> as the single-row kernel, ~29 KiB
+// (3 KiB histograms + 18 KiB candidates + ~8.3 KiB uint64 raking BlockScan
+// storage), below the 48 KiB static limit; at most two 1024-thread CTAs fit
+// per SM, and a decode batch (<= 32 rows) needs at most one per SM.
+template <int TopK>
+__global__
+__launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_decode_topk_rows_kernel(
+    const float* __restrict__ logits, const int32_t* __restrict__ lengths,
+    int32_t* __restrict__ output, uint32_t num_rows, uint32_t columns,
+    uint32_t stride) {
+  const uint32_t row = blockIdx.x;
+  if (row >= num_rows) return;
+  const int32_t raw_length = lengths[row];
+  const uint32_t length =
+      raw_length > 0 ? min(static_cast<uint32_t>(raw_length), columns) : 0;
+  __shared__ LexicographicDecodeTopKShared<TopK> shared;
+  qsa_lexicographic_decode_topk_row<TopK>(
+      logits + static_cast<uint64_t>(row) * stride, length,
+      output + static_cast<uint64_t>(row) * TopK, shared);
+}
+
 template <int TopK>
 void launch_qsa_lexicographic_topk(const float* logits, const int32_t* lengths,
                                    int32_t* output, uint32_t num_rows,
@@ -410,6 +456,21 @@ void launch_qsa_lexicographic_topk(const float* logits, const int32_t* lengths,
         <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(
             logits, lengths, output, num_rows, columns, stride);
   }
+}
+
+// Decode-specialised selector for every row (grid = num_rows). Exact for any
+// row count and any per-row length (rows longer than the shared candidate
+// capacity take the in-kernel four-pass fallback); callers choose it for small
+// decode batches, where the generic kernel's four full radix scans dominate.
+template <int TopK>
+void launch_qsa_lexicographic_decode_topk_rows(
+    const float* logits, const int32_t* lengths, int32_t* output,
+    uint32_t num_rows, uint32_t columns, uint32_t stride,
+    cudaStream_t stream) {
+  if (num_rows == 0) return;
+  qsa_lexicographic_decode_topk_rows_kernel<TopK>
+      <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(
+          logits, lengths, output, num_rows, columns, stride);
 }
 
 }  // namespace vllm::qsa

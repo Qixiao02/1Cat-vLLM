@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -18,6 +19,7 @@ from vllm.config.speculative import (
     get_dflash_model_draft_tokens,
     uses_adaptive_dflash_lookup,
 )
+from vllm.config.vllm import _sm70_qwen38_mixed_piecewise_sizes
 from vllm.distributed.parallel_state import (
     get_pp_group,
     graph_capture,
@@ -138,6 +140,15 @@ def get_uniform_token_count(
 
 
 class CudaGraphManager:
+    # SX PW-1: only the target-model manager may add PIECEWISE-only mixed-step
+    # sizes (drafter/Eagle/DFlash managers keep their exact size lists).
+    _sx_mixed_piecewise_owner: bool = False
+    # Extra PIECEWISE-only token sizes (never FULL); () = previous behaviour.
+    _sx_piecewise_only_sizes: tuple[int, ...] = ()
+    # SX_OPT_PIECEWISE_EAGER_PADDED=1 (diagnostic): dispatch those sizes as
+    # eager NONE at the same padded token count, for graph-vs-eager checks.
+    _sx_eager_padded: bool = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -228,7 +239,70 @@ class CudaGraphManager:
                     if query_len not in self._capture_sizes:
                         self._capture_sizes.append(query_len)
                 self._capture_sizes.sort()
+        self._sx_init_piecewise_only()
         self._init_candidates()
+
+    def _sx_init_piecewise_only(self) -> None:
+        """SX PW-1: resolve the PIECEWISE-only sizes and the diagnostic mode.
+
+        Must run after self._capture_sizes is final and before
+        _init_candidates(); leaves both attributes at their previous-behaviour
+        values (``()`` / False) unless the contract admits the lane.
+        """
+        self._sx_piecewise_only_sizes = self._sx_resolve_piecewise_only_sizes()
+        self._sx_eager_padded = bool(
+            self._sx_piecewise_only_sizes
+            and os.environ.get("SX_OPT_PIECEWISE_EAGER_PADDED", "0").strip() == "1"
+        )
+        if self._sx_eager_padded:
+            logger.warning(
+                "SX_OPT_PIECEWISE_EAGER_PADDED=1 (diagnostic): mixed steps of "
+                "%d..%d tokens run EAGER at the padded PIECEWISE token count "
+                "instead of replaying the captured graphs.",
+                max(self._capture_sizes) + 1,
+                self._sx_piecewise_only_sizes[-1],
+            )
+
+    def _sx_resolve_piecewise_only_sizes(self) -> tuple[int, ...]:
+        """SX PW-1: PIECEWISE-only sizes for mixed/prefill steps.
+
+        Admitted only for the target-model manager of the SM70 Qwen3.8 no-MTP
+        TP4 dual-compile lane (contract in vllm.config.vllm) with
+        FULL_AND_PIECEWISE, a q=1 decode routine and no DP. The FULL decode
+        descriptors and self._capture_sizes are left untouched.
+        """
+        if not (
+            self._sx_mixed_piecewise_owner
+            and self.cudagraph_mode
+            and self._capture_sizes
+            and self.cudagraph_mode.separate_routine()
+            and self.cudagraph_mode.mixed_mode() == CUDAGraphMode.PIECEWISE
+            and self.decode_query_len == 1
+            and self.decode_query_lens == (1,)
+            and not self._sm70_dflash2_tail_graphs
+            and self.dp_size == 1
+            and not _use_split_sm70_mtp_cudagraphs(self.vllm_config)
+        ):
+            return ()
+        sizes = tuple(
+            _sm70_qwen38_mixed_piecewise_sizes(self.vllm_config, self._capture_sizes)
+        )
+        if sizes:
+            full_sizes = tuple(
+                size
+                for size in sorted(self._capture_sizes)
+                if size <= self.max_num_reqs * self.decode_query_len
+            )
+            logger.info_once(
+                "SX PW-1: PIECEWISE CUDA graphs for mixed/prefill steps of "
+                "%d..%d tokens at sizes %s (main compile, attention/QSA/GDN/PLE "
+                "ops stay eager); FULL decode sizes %s unchanged.",
+                max(self._capture_sizes) + 1,
+                sizes[-1],
+                sizes,
+                full_sizes,
+            )
+        return sizes
 
     def _init_candidates(self) -> None:
         """Build priority-ordered candidate lists for each token count."""
@@ -244,7 +318,21 @@ class CudaGraphManager:
         descs_by_token_count = defaultdict(list)
         descs_by_mode = defaultdict(list)
 
-        for num_tokens in capture_sizes:
+        # SX PW-1: PIECEWISE-only sizes join the loop but never produce a FULL
+        # descriptor. With none, the iteration is exactly the previous one.
+        piecewise_only: set[int] = set()
+        if mixed_mode == CUDAGraphMode.PIECEWISE:
+            piecewise_only = set(self._sx_piecewise_only_sizes) - set(capture_sizes)
+        for num_tokens in sorted(capture_sizes + sorted(piecewise_only)):
+            if num_tokens in piecewise_only:
+                desc = BatchExecutionDescriptor(
+                    cg_mode=CUDAGraphMode.PIECEWISE,
+                    num_tokens=num_tokens,
+                    num_reqs=None,
+                )
+                descs_by_mode[CUDAGraphMode.PIECEWISE].append(desc)
+                descs_by_token_count[num_tokens].append(desc)
+                continue
             # Capture uniform decode specfifc graphs if required
             #  (i.e. separate decode routine)
             if separate_decode_routine and decode_mode:
@@ -398,6 +486,17 @@ class CudaGraphManager:
         if self._graphs_captured and 0 < num_tokens < len(self._candidates):
             for desc in self._candidates[num_tokens]:
                 if _is_compatible(desc, num_reqs, num_tokens, uniform_token_count):
+                    if (
+                        self._sx_eager_padded
+                        and desc.cg_mode == CUDAGraphMode.PIECEWISE
+                        and desc.num_tokens in self._sx_piecewise_only_sizes
+                    ):
+                        # Diagnostic: identical padded inputs, no graph replay.
+                        return BatchExecutionDescriptor(
+                            cg_mode=CUDAGraphMode.NONE,
+                            num_tokens=desc.num_tokens,
+                            num_reqs=num_reqs,
+                        )
                     return desc
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE, num_tokens=num_tokens, num_reqs=num_reqs
@@ -421,6 +520,8 @@ class CudaGraphManager:
 
 class ModelCudaGraphManager(CudaGraphManager):
     """CudaGraphManager with model-specific capture and hidden state management."""
+
+    _sx_mixed_piecewise_owner = True
 
     def __init__(
         self,

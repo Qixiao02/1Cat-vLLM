@@ -16,6 +16,9 @@ namespace {
 
 constexpr int kQwen38SharedGateHidden = 2560;
 constexpr int kQwen38SharedGateThreads = 256;
+// Row bound of the wrapper (grid = M). The kernel itself is row independent;
+// the bound only keeps the launch inside every gridDim.x limit.
+constexpr int64_t kQwen38SharedGateMaxRows = 65535;
 
 __device__ __forceinline__ float qwen38_shared_gate_warp_sum(float value) {
 #pragma unroll
@@ -25,9 +28,17 @@ __device__ __forceinline__ float qwen38_shared_gate_warp_sum(float value) {
   return value;
 }
 
+// One CTA per token row (grid = M). Each CTA runs the unchanged single-row
+// body on its own input/output row, so every row is bitwise identical to the
+// original M == 1 launch (grid = 1, row 0) on that row alone: the same strided
+// FMA chain tid + 256 * i, the same shfl_down warp tree, the same 8-warp
+// partial tree, the same FP16 linear/sigmoid materialisation and hmul2.
 __global__ void qwen38_shared_gate_exact_kernel(
     half* __restrict__ output, const half* __restrict__ input,
     const half* __restrict__ weight) {
+  const int64_t row = blockIdx.x;
+  input += row * kQwen38SharedGateHidden;
+  output += row * kQwen38SharedGateHidden;
   constexpr int kValuesPerThread =
       kQwen38SharedGateHidden / kQwen38SharedGateThreads;
   const int tid = threadIdx.x;
@@ -1402,16 +1413,23 @@ void qwen38_shared_gate_exact_out(torch::Tensor out, torch::Tensor input,
   TORCH_CHECK(
       out.is_contiguous() && input.is_contiguous() && weight.is_contiguous(),
       "qwen38_shared_gate_exact_out: tensors must be contiguous");
-  TORCH_CHECK(out.sizes() == torch::IntArrayRef({1, 2560}) &&
-                  input.sizes() == torch::IntArrayRef({1, 2560}) &&
+  // M token rows (ShiXiang batch 2, design_4 [MR6]); the M == 1 call is the
+  // original contract and launch. The Python gate (SX_OPT_SHARED_GATE_ROWS)
+  // decides whether M > 1 is used.
+  TORCH_CHECK(input.dim() == 2 && input.size(0) >= 1 &&
+                  input.size(0) <= kQwen38SharedGateMaxRows &&
+                  input.size(1) == kQwen38SharedGateHidden &&
+                  out.sizes() == input.sizes() &&
                   weight.sizes() == torch::IntArrayRef({1, 2560}),
-              "qwen38_shared_gate_exact_out: expected M1/N1/K2560 tensors");
+              "qwen38_shared_gate_exact_out: expected (M, 2560) input/out "
+              "with 1 <= M <= 65535 and a (1, 2560) weight");
   TORCH_CHECK(out.get_device() == input.get_device() &&
                   out.get_device() == weight.get_device(),
               "qwen38_shared_gate_exact_out: device mismatch");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  qwen38_shared_gate_exact_kernel<<<1, kQwen38SharedGateThreads, 0,
+  const unsigned int rows = static_cast<unsigned int>(input.size(0));
+  qwen38_shared_gate_exact_kernel<<<rows, kQwen38SharedGateThreads, 0,
                                     at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<half*>(out.data_ptr<at::Half>()),
       reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
