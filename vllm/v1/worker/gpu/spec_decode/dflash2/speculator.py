@@ -526,7 +526,7 @@ class DFlash2Speculator(DFlashSpeculator):
             )
 
         self._lookup_enabled = bool(
-            ngram_assist and self.draft_block < self.num_speculative_steps
+            ngram_assist and self.num_speculative_steps > 2
         )
         self._req_states = None
         self._lookup_current_req_key: tuple[int, ...] = ()

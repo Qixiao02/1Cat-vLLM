@@ -4858,6 +4858,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.use_dflash2_grouped_verify
             and envs.VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY
         )
+        # opt27-port v2: most requests per request-major grouped-verify call;
+        # 1 keeps the v1 per-request loop as the A/B baseline.
+        self.dflash2_grouped_verify_chunk = int(
+            os.getenv("VLLM_DFLASH2_VERIFY_CHUNK", "8")
+        )
+        if self.dflash2_grouped_verify_chunk < 1:
+            raise ValueError("VLLM_DFLASH2_VERIFY_CHUNK must be positive")
         self.dflash2_grouped_verify_min_model_len = (
             envs.VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN
         )
@@ -5666,9 +5673,26 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and max_query_len == 8
             and num_query_tokens == num_reqs * 8
         )
+        # opt27-port v2: any uniform batch whose per-request span fits the
+        # op contract (q2..q8 or q16) enters the grouped verifier. Uniformity
+        # must come from max_query_len: divisibility alone admits mixed spans
+        # such as [8, 8, 8, 4] (28 / 4 = 7) and mis-slices every request.
+        _uniform_q_per_req = (
+            max_query_len
+            if num_reqs >= 1 and max_query_len * num_reqs == num_query_tokens
+            else 0
+        )
+        per_request_shape = bool(
+            (2 <= _uniform_q_per_req <= 8 or _uniform_q_per_req == 16)
+            and _uniform_q_per_req <= self.dflash2_grouped_verify_max_query_tokens
+        )
         allowed = bool(
             self.use_dflash2_grouped_verify
-            and (single_request_shape or batched_request_shape)
+            and (
+                single_request_shape
+                or batched_request_shape
+                or per_request_shape
+            )
             and self.flash_attn_grouped_verify_paged is not None
             and getattr(attn_metadata, "is_dflash_selector_target", False)
             and getattr(attn_metadata, "max_model_len", 0)
@@ -5758,28 +5782,55 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     ) -> None:
         global _logged_prefill_smallq_grouped_verify
         num_reqs = int(attn_metadata.block_table.shape[0])
+        q_per = int(query.shape[0]) // num_reqs
+        # opt27-port v2: the native op takes request-major q8 batches of any
+        # size, but only B1/B2/B4/B8 carry bitwise parity evidence against the
+        # single-request op. Run cap-sized chunks plus a power-of-two tail so
+        # every call keeps a validated shape (cap 8: B24 -> 8+8+8, B7 ->
+        # 4+2+1). Other uniform spans are single-request only in the op.
+        chunk_cap = (
+            self.dflash2_grouped_verify_chunk
+            if q_per == 8
+            and self.dflash2_grouped_verify_request_major_abi_version >= 1
+            else 1
+        )
         if not _logged_prefill_smallq_grouped_verify:
             logger.info(
                 "FLASH_ATTN_V100 DFlash2 exact grouped verifier active "
-                "(request-major B%d/q%d/H6/Hkv1/D256, %s KV, one-pass).",
+                "(%s: %d reqs x q%d/H6/Hkv1/D256, %s KV, one-pass).",
+                f"request-major chunks<={chunk_cap}"
+                if chunk_cap > 1
+                else "per-request loop",
                 num_reqs,
-                query.shape[0] // num_reqs,
+                q_per,
                 self.kv_cache_dtype,
             )
             _logged_prefill_smallq_grouped_verify = True
-        self.flash_attn_grouped_verify_paged(
-            query,
-            key_cache,
-            value_cache,
-            attn_metadata.block_table[:num_reqs],
-            attn_metadata.seq_lens[:num_reqs],
-            softmax_scale=self.scale,
-            out=out,
-            kv_cache_dtype=self.kv_cache_dtype,
-            k_scale=float(layer._k_scale_float),
-            v_scale=float(layer._v_scale_float),
-            one_pass=True,
-        )
+        k_scale = float(layer._k_scale_float)
+        v_scale = float(layer._v_scale_float)
+        r0 = 0
+        while r0 < num_reqs:
+            remaining = num_reqs - r0
+            chunk = (
+                chunk_cap
+                if remaining >= chunk_cap
+                else 1 << (remaining.bit_length() - 1)
+            )
+            r1 = r0 + chunk
+            self.flash_attn_grouped_verify_paged(
+                query[r0 * q_per : r1 * q_per],
+                key_cache,
+                value_cache,
+                attn_metadata.block_table[r0:r1],
+                attn_metadata.seq_lens[r0:r1],
+                softmax_scale=self.scale,
+                out=out[r0 * q_per : r1 * q_per],
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                one_pass=True,
+            )
+            r0 = r1
         _log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "dflash2_grouped_verify")
         _record_route("prefill_smallq_dflash2_grouped_verify")
 
