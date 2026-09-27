@@ -3,7 +3,7 @@
 import itertools
 import os
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
@@ -99,6 +99,38 @@ def _ddtree_debug_log(message: str, *args: object) -> None:
 #       KV prefix hit is longer than its usable recurrent-state hit (the state
 #       at that boundary was never checkpointed), end a chunk there so later
 #       requests sharing the prefix can restore state at that boundary.
+#   SX_OPT_ALIGN_MULTIBLOCK_SPEC   default "1" (design_1 [MTP-5] / design_2
+#       [PF1] / design_3 [C7]). Also admit multi-block chunks in the SM70
+#       Qwen3.8 native-MTP lane (speculative_config.method == "mtp", Qwen4Exp
+#       MTP head, 1 <= k <= 7, same model/TP4/SM70 shape contract). The align
+#       allocator keeps the running state plus the k speculative state columns
+#       at the tail of the block table whatever the chunk length (interior
+#       columns are null, spec columns are moved or reused in place), and the
+#       Eagle/MTP rules stay: the tail checkpoint sits one block earlier and a
+#       prefix hit is searched one block earlier. Every other speculative lane
+#       (DFlash, EAGLE3, draft models, other MTP heads) keeps per-block chunks.
+#   SX_OPT_ALIGN_TAIL_MIN_TOKENS   default "3136" (design_2 [PF4]). Skip the
+#       tail-checkpoint stop when the whole remaining prefill fits this chunk
+#       and is at most this many tokens: short multi-block prompts then prefill
+#       in one step instead of paying an extra step only to checkpoint the
+#       tail. "0" = always take the tail stop (dev2 behaviour). A skipped tail
+#       only loses the prefix hit of an identical/extended resend of that
+#       prompt (it restarts at its deepest remaining checkpoint instead).
+#       An identical resend of a prompt whose tail PF4 skipped (remembered in
+#       a bounded per-scheduler memo) also skips the shared-prefix stop at
+#       that tail, so it replays the first run's chunks (miss == hit). Other
+#       requests keep their shared-prefix stops: a shared system prompt with
+#       a short suffix is still checkpointed by its second sharer.
+#   SX_OPT_PREFILL_CAP_WITH_DECODES default "0" (opt-in, design_2 [PF3]). While
+#       any running request is decoding, cap a multi-block prefill chunk at
+#       SX_OPT_PREFILL_CAP_BLOCKS state blocks (default 3) and, if
+#       SX_OPT_PREFILL_CAP_TOKENS > 0, the prefill tokens of the whole step at
+#       that many tokens (chunks stay block multiples; a request whose
+#       remaining prefill is at most one block is never held back; a token
+#       cap below one state block is raised to one block, otherwise a long
+#       prompt, and FCFS every request queued behind it, would wait for as
+#       long as any decode runs). Idle engines (no decode) keep the full
+#       budget. Trades long-prompt TTFT under load for shorter decode stalls.
 # Every added stop is a block multiple above the chunk start, so a stop can only
 # create checkpoints; it can never register a state that was not materialized.
 # ---------------------------------------------------------------------------
@@ -111,6 +143,31 @@ def _sx_env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, str(default)).strip())
     except ValueError:
         return default
+
+
+# SX_OPT_ALIGN_TAIL_MIN_TOKENS resend memo: identities of the last prompts
+# whose tail checkpoint PF4 skipped (bounded, least recently used dropped).
+_SX_TAIL_SKIP_MEMO_MAX = 4096
+
+
+def _sx_prompt_identity(request: Request, hash_block_size: int) -> tuple | None:
+    """Cheap identity of a request's current token sequence.
+
+    Its length, the chained hash of its last full hash block (which covers
+    every earlier token plus LoRA / cache-salt extra keys) and the tokens after
+    that block. None without block hashes (prefix caching off, test shims).
+    Only steers where a chunk may end, so a collision can cost a checkpoint
+    but can never register a wrong state.
+    """
+    hashes = getattr(request, "block_hashes", None)
+    tokens = getattr(request, "all_token_ids", None)
+    if not hashes or tokens is None or hash_block_size <= 0:
+        return None
+    num_tokens = request.num_tokens
+    covered = len(hashes) * hash_block_size
+    if covered > num_tokens:
+        return None
+    return (num_tokens, hashes[-1], tuple(tokens[covered:num_tokens]))
 
 
 def _sx_is_sm70_qwen38_align_contract(vllm_config: VllmConfig) -> bool:
@@ -132,6 +189,57 @@ def _sx_is_sm70_qwen38_align_contract(vllm_config: VllmConfig) -> bool:
     except Exception:  # pragma: no cover - defensive: never block startup
         logger.warning(
             "SX align multi-block: contract check failed; keeping per-block "
+            "chunking.",
+            exc_info=True,
+        )
+        return False
+
+
+_SX_ALIGN_MTP_MAX_K = 7
+
+
+def _sx_is_sm70_qwen38_mtp_align_contract(vllm_config: VllmConfig) -> bool:
+    """SM70 Qwen3.8 native-MTP lane: the no-MTP model/TP4 shape contract plus
+    ``speculative_config.method == "mtp"`` with the Qwen4Exp MTP head, a plain
+    chain of 1 <= k <= 7 drafts (k speculative state columns, no parallel
+    drafting). DFlash, EAGLE3, draft-model and other MTP lanes are excluded.
+    """
+    spec = getattr(vllm_config, "speculative_config", None)
+    if spec is None:
+        return False
+    try:
+        if getattr(spec, "method", None) != "mtp":
+            return False
+        num_spec = int(getattr(spec, "num_speculative_tokens", 0) or 0)
+        if not 1 <= num_spec <= _SX_ALIGN_MTP_MAX_K:
+            return False
+        state_tokens = getattr(spec, "num_speculative_state_tokens", None)
+        if callable(state_tokens) and int(state_tokens()) != num_spec:
+            return False
+        if getattr(spec, "parallel_drafting", False):
+            return False
+        use_qwen4_exp_mtp = getattr(spec, "use_qwen4_exp_mtp", None)
+        if not callable(use_qwen4_exp_mtp) or not use_qwen4_exp_mtp():
+            return False
+        from vllm.config.vllm import (
+            _any_participating_device_is_capability,
+            _is_sm70_qwen38_nomtp_dual_compile_contract,
+        )
+
+        # The shape contract proper (architecture, FP16, hidden 2560, 48
+        # layers, E512/K10, HC 4x320, QSA dims, TP4/PP1); the helper rejects
+        # any speculative config by design, so check the model shape alone.
+        return bool(
+            _is_sm70_qwen38_nomtp_dual_compile_contract(
+                vllm_config.model_config,
+                None,
+                vllm_config.parallel_config,
+            )
+            and _any_participating_device_is_capability(vllm_config, (7, 0))
+        )
+    except Exception:  # pragma: no cover - defensive: never block startup
+        logger.warning(
+            "SX align multi-block: MTP contract check failed; keeping per-block "
             "chunking.",
             exc_info=True,
         )
@@ -367,7 +475,7 @@ class Scheduler(SchedulerInterface):
         self.mamba_state_block_size = (
             next(iter(mamba_state_block_sizes)) if mamba_state_block_sizes else None
         )
-        self._sx_init_mamba_align_policy(vllm_config)
+        self._sx_init_mamba_align_policy(vllm_config, hash_block_size)
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
@@ -477,27 +585,56 @@ class Scheduler(SchedulerInterface):
             - request.num_output_placeholders,
         )
 
-    def _sx_init_mamba_align_policy(self, vllm_config: VllmConfig) -> None:
+    def _sx_init_mamba_align_policy(
+        self, vllm_config: VllmConfig, hash_block_size: int | None = None
+    ) -> None:
         """Resolve the SX_OPT align multi-block policy once (see module top)."""
         self._sx_align_multiblock = False
         self._sx_align_tail = True
         self._sx_align_max_blocks = 0
         self._sx_align_shared = False
+        self._sx_align_lane = None
+        self._sx_align_tail_min = 0
+        self._sx_prefill_cap = False
+        self._sx_prefill_cap_blocks = 0
+        self._sx_prefill_cap_tokens = 0
+        # Per-step values of the decode-aware cap (SX_OPT_PREFILL_CAP_*); with
+        # the cap off they stay at the static policy for every step.
+        self._sx_step_max_blocks = 0
+        self._sx_step_prefill_left = None
+        # PF4 resend memo (see _mamba_block_aligned_split); None = unused.
+        self._sx_tail_skipped: OrderedDict | None = None
+        self._sx_hash_block_size = int(
+            hash_block_size or getattr(self, "block_size", 0) or 0
+        )
         if not self.need_mamba_block_aligned_split:
             return
         mode = os.environ.get("SX_OPT_ALIGN_MULTIBLOCK", "1").strip().lower()
-        reason = None
-        if mode == "0":
-            reason = "SX_OPT_ALIGN_MULTIBLOCK=0"
-        elif (
+        spec_lane = bool(
             vllm_config.speculative_config is not None
             or self.use_eagle
             or self.num_spec_tokens
-        ):
-            reason = "speculative decoding keeps per-block checkpoints"
+        )
+        reason = None
+        if mode == "0":
+            reason = "SX_OPT_ALIGN_MULTIBLOCK=0"
+        elif spec_lane and not _sx_env_enabled("SX_OPT_ALIGN_MULTIBLOCK_SPEC"):
+            reason = (
+                "speculative decoding keeps per-block checkpoints "
+                "(SX_OPT_ALIGN_MULTIBLOCK_SPEC=0)"
+            )
+        elif spec_lane and not _sx_is_sm70_qwen38_mtp_align_contract(vllm_config):
+            reason = (
+                "speculative decoding keeps per-block checkpoints outside the "
+                "SM70 Qwen3.8 native-MTP contract"
+            )
         elif self.connector is not None:
             reason = "KV connector keeps per-block checkpoints"
-        elif mode != "force" and not _sx_is_sm70_qwen38_align_contract(vllm_config):
+        elif (
+            not spec_lane
+            and mode != "force"
+            and not _sx_is_sm70_qwen38_align_contract(vllm_config)
+        ):
             reason = "outside the SM70 Qwen3.8 no-MTP contract"
         if reason is not None:
             logger.info(
@@ -507,21 +644,68 @@ class Scheduler(SchedulerInterface):
             )
             return
         self._sx_align_multiblock = True
+        self._sx_align_lane = "mtp" if spec_lane else "no-mtp"
         self._sx_align_tail = _sx_env_enabled("SX_OPT_ALIGN_TAIL_CHECKPOINT")
         self._sx_align_max_blocks = max(
             0, _sx_env_int("SX_OPT_ALIGN_MAX_CHUNK_BLOCKS", 0)
         )
+        self._sx_step_max_blocks = self._sx_align_max_blocks
         self._sx_align_shared = bool(
             self.cache_config.enable_prefix_caching
             and _sx_env_enabled("SX_OPT_ALIGN_SHARED_CHECKPOINT")
         )
+        self._sx_align_tail_min = max(
+            0, _sx_env_int("SX_OPT_ALIGN_TAIL_MIN_TOKENS", 3136)
+        )
+        self._sx_prefill_cap = _sx_env_enabled(
+            "SX_OPT_PREFILL_CAP_WITH_DECODES", "0"
+        )
+        if self._sx_prefill_cap:
+            self._sx_prefill_cap_blocks = max(
+                0, _sx_env_int("SX_OPT_PREFILL_CAP_BLOCKS", 3)
+            )
+            self._sx_prefill_cap_tokens = max(
+                0, _sx_env_int("SX_OPT_PREFILL_CAP_TOKENS", 0)
+            )
+            state_block = (
+                self.mamba_state_block_size
+                if self.mamba_state_block_size is not None
+                else self.cache_config.block_size
+            )
+            if 0 < self._sx_prefill_cap_tokens < state_block:
+                # A request with more than one block to go is held whenever
+                # less than one block of the step budget is left, so a budget
+                # below one block would hold it (and, FCFS, every waiting
+                # request behind it) for as long as any decode runs.
+                logger.warning(
+                    "SX_OPT_PREFILL_CAP_TOKENS=%d is below one state block; "
+                    "using %d.",
+                    self._sx_prefill_cap_tokens,
+                    state_block,
+                )
+                self._sx_prefill_cap_tokens = state_block
+            self._sx_prefill_cap = bool(
+                self._sx_prefill_cap_blocks or self._sx_prefill_cap_tokens
+            )
+        if self._sx_align_shared and self._sx_align_tail and self._sx_align_tail_min:
+            self._sx_tail_skipped = OrderedDict()
         logger.info(
-            "SX align multi-block prefill chunking enabled: state block %s, "
-            "tail_checkpoint=%s, max_chunk_blocks=%s, shared_checkpoint=%s.",
+            "SX align multi-block prefill chunking enabled (%s lane%s): state "
+            "block %s, tail_checkpoint=%s (min remaining %s), "
+            "max_chunk_blocks=%s, shared_checkpoint=%s, decode-aware cap=%s.",
+            self._sx_align_lane,
+            f", k={self.num_spec_tokens}, eagle tail" if spec_lane else "",
             self.mamba_state_block_size,
             self._sx_align_tail,
+            self._sx_align_tail_min or "off",
             self._sx_align_max_blocks or "budget",
             self._sx_align_shared,
+            (
+                f"{self._sx_prefill_cap_blocks or 'budget'} blocks/"
+                f"{self._sx_prefill_cap_tokens or 'budget'} tokens"
+                if self._sx_prefill_cap
+                else "off"
+            ),
         )
 
     def _sx_attention_prefix_hit_tokens(self, request: Request) -> int:
@@ -530,6 +714,12 @@ class Scheduler(SchedulerInterface):
         Mirrors the full-attention step of
         HybridKVCacheCoordinator.find_longest_cache_hit (read-only lookups, no
         block is touched). Returns 0 when the layout has no such group.
+
+        With Eagle/MTP the coordinator drops the last matched attention block
+        of every Eagle group (and searches the recurrent state one block
+        earlier), so the boundary a later request can restore is the
+        Eagle-pruned attention hit; mirror that drop here. Without Eagle this
+        is the plain lookup (unchanged).
         """
         from vllm.v1.core.kv_cache_utils import BlockHashListWithBlockSize
         from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -539,9 +729,15 @@ class Scheduler(SchedulerInterface):
         if not attention_groups:
             return 0
         hash_block_size = coordinator.hash_block_size
-        hit_length = request.num_tokens - 1
+        max_hit_length = request.num_tokens - 1
+        hit_length = max_hit_length
+        eagle_groups = (
+            getattr(coordinator, "eagle_attn_group_indices", None)
+            if self.use_eagle
+            else ()
+        )
         found = False
-        for spec, group_ids, manager_cls in attention_groups:
+        for idx, (spec, group_ids, manager_cls) in enumerate(attention_groups):
             if not isinstance(spec, FullAttentionSpec):
                 continue
             block_hashes = request.block_hashes
@@ -549,13 +745,20 @@ class Scheduler(SchedulerInterface):
                 block_hashes = BlockHashListWithBlockSize(
                     block_hashes, hash_block_size, spec.block_size
                 )
+            use_eagle = bool(self.use_eagle) and (
+                eagle_groups is None or idx in eagle_groups
+            )
+            max_length = hit_length
+            if use_eagle:
+                # Match one more block, then pop it (coordinator semantics).
+                max_length = min(hit_length + spec.block_size, max_hit_length)
             hit_blocks = manager_cls.find_longest_cache_hit(
                 block_hashes=block_hashes,
-                max_length=hit_length,
+                max_length=max_length,
                 kv_cache_group_ids=group_ids,
                 block_pool=coordinator.block_pool,
                 kv_cache_spec=spec,
-                use_eagle=False,
+                use_eagle=use_eagle,
                 alignment_tokens=coordinator.lcm_block_size,
             )
             hit_length = min(hit_length, len(hit_blocks[0]) * spec.block_size)
@@ -589,7 +792,16 @@ class Scheduler(SchedulerInterface):
             if self.mamba_state_block_size is not None
             else self.cache_config.block_size
         )
-        stop = attention_hit // block_size * block_size
+        if self.use_eagle and attention_hit > 0:
+            # Eagle/MTP: the recurrent-state lookup matches up to one block
+            # past the Eagle-pruned attention hit and then drops a block
+            # (MambaManager.find_longest_cache_hit), so a later request can
+            # restore at most this boundary (== attention_hit when the
+            # attention block is the state block).
+            reachable = min(attention_hit + block_size, request.num_tokens - 1)
+            stop = max(reachable // block_size - 1, 0) * block_size
+        else:
+            stop = attention_hit // block_size * block_size
         if stop > num_hit_tokens:
             request._sx_align_shared_stop = stop  # type: ignore[attr-defined]
 
@@ -639,6 +851,10 @@ class Scheduler(SchedulerInterface):
             if aligned_end > start:
                 end = aligned_end
 
+        # SX_OPT_PREFILL_CAP_TOKENS: prefill tokens left in this step while
+        # decodes run (None = no step budget; always None with the cap off).
+        prefill_left = getattr(self, "_sx_step_prefill_left", None)
+
         if getattr(self, "_sx_align_multiblock", False) and start % block_size == 0:
             # SX_OPT_ALIGN_MULTIBLOCK: a chunk that starts on a state-block
             # boundary may span several blocks. Its end is a block multiple
@@ -647,32 +863,117 @@ class Scheduler(SchedulerInterface):
             # a real state that caching can register. Extra stops below are
             # block multiples, i.e. extra checkpoints only.
             stops = []
-            if getattr(self, "_sx_align_tail", True):
+            # SX_OPT_ALIGN_TAIL_MIN_TOKENS: when the whole remaining prefill
+            # fits this chunk and is short, do not end a chunk at the tail
+            # checkpoint only to register it (one step saved per prompt).
+            tail_min = getattr(self, "_sx_align_tail_min", 0)
+            skip_tail = (
+                tail_min > 0 and end >= prefill_end and prefill_end - start <= tail_min
+            )
+            if getattr(self, "_sx_align_tail", True) and not skip_tail:
                 stops.append(last_cache_position)
-            max_blocks = getattr(self, "_sx_align_max_blocks", 0)
+            # The static SX_OPT_ALIGN_MAX_CHUNK_BLOCKS, or the per-step
+            # decode-aware cap (SX_OPT_PREFILL_CAP_WITH_DECODES) when set.
+            max_blocks = getattr(self, "_sx_step_max_blocks", None)
+            if max_blocks is None:
+                max_blocks = getattr(self, "_sx_align_max_blocks", 0)
             if max_blocks > 0:
                 stops.append(start + max_blocks * block_size)
+            if prefill_left is not None and prefill_end - start > max(
+                prefill_left, block_size
+            ):
+                # Budget exhausted for a request with more than one block to
+                # go: hold it this step rather than cutting an unaligned
+                # sub-block chunk (which would force per-block chunks later).
+                if prefill_left < block_size:
+                    return 0
+                stops.append(start + prefill_left // block_size * block_size)
             shared_stop = getattr(request, "_sx_align_shared_stop", 0)
+            memo = getattr(self, "_sx_tail_skipped", None)
+            if (
+                shared_stop
+                and skip_tail
+                and shared_stop >= last_cache_position
+                and memo
+            ):
+                # A shared-prefix stop at the tail position of an identical
+                # resend of a prompt whose tail PF4 skipped is that very tail
+                # checkpoint re-requested. Skip it under the same rule, so the
+                # resend computes the chunks of the first run (miss == hit).
+                # Any other request (a shared system prompt with a different,
+                # short suffix) keeps the stop and checkpoints the prefix.
+                ident = _sx_prompt_identity(
+                    request, getattr(self, "_sx_hash_block_size", 0)
+                )
+                if ident is not None and ident in memo:
+                    memo.move_to_end(ident)
+                    shared_stop = 0
             if shared_stop:
                 stops.append(shared_stop)
             end = min((stop for stop in stops if start < stop < end), default=end)
-            return max(end - start, 0)
+            if (
+                skip_tail
+                and memo is not None
+                and getattr(self, "_sx_align_tail", True)
+                and start < last_cache_position < end
+            ):
+                # PF4 skipped the tail checkpoint of this prompt: remember it
+                # so that an identical resend skips the same stop.
+                ident = _sx_prompt_identity(
+                    request, getattr(self, "_sx_hash_block_size", 0)
+                )
+                if ident is not None:
+                    memo[ident] = None
+                    memo.move_to_end(ident)
+                    while len(memo) > _SX_TAIL_SKIP_MEMO_MAX:
+                        memo.popitem(last=False)
+        else:
+            # The align allocator materializes one recurrent-state column per
+            # scheduler step. A step spanning multiple state blocks leaves the
+            # interior slots null, so every crossed boundary must end a chunk.
+            # (Per-block policy; with SX_OPT_ALIGN_MULTIBLOCK it still applies
+            # to chunks starting mid-block, whose start block is filled in
+            # place.)
+            next_block_boundary = (start // block_size + 1) * block_size
+            end = min(
+                (
+                    stop
+                    for stop in (next_block_boundary, last_cache_position)
+                    if start < stop < end
+                ),
+                default=end,
+            )
+        num_new_tokens = max(end - start, 0)
+        if prefill_left is not None:
+            self._sx_step_prefill_left = max(0, prefill_left - num_new_tokens)
+        return num_new_tokens
 
-        # The align allocator materializes one recurrent-state column per
-        # scheduler step. A step spanning multiple state blocks leaves the
-        # interior slots null, so every crossed boundary must end a chunk.
-        # (Per-block policy; with SX_OPT_ALIGN_MULTIBLOCK it still applies to
-        # chunks starting mid-block, whose start block is filled in place.)
-        next_block_boundary = (start // block_size + 1) * block_size
-        end = min(
-            (
-                stop
-                for stop in (next_block_boundary, last_cache_position)
-                if start < stop < end
-            ),
-            default=end,
+    def _sx_begin_prefill_cap_step(self) -> None:
+        """SX_OPT_PREFILL_CAP_WITH_DECODES (design_2 [PF3]): per-step cap.
+
+        While any running request is decoding (its computed tokens reached
+        its prefill end), multi-block prefill chunks are capped at
+        SX_OPT_PREFILL_CAP_BLOCKS state blocks and, when
+        SX_OPT_PREFILL_CAP_TOKENS > 0, the prefill tokens of the step at that
+        budget. With no decode running the static policy applies unchanged.
+        """
+        self._sx_step_max_blocks = self._sx_align_max_blocks
+        self._sx_step_prefill_left = None
+        decoding = any(
+            request.num_computed_tokens
+            >= max(request.num_prompt_tokens, request.num_tokens - 1)
+            for request in self.running
         )
-        return max(end - start, 0)
+        if not decoding:
+            return
+        if self._sx_prefill_cap_blocks > 0:
+            self._sx_step_max_blocks = (
+                min(self._sx_align_max_blocks, self._sx_prefill_cap_blocks)
+                if self._sx_align_max_blocks > 0
+                else self._sx_prefill_cap_blocks
+            )
+        if self._sx_prefill_cap_tokens > 0:
+            self._sx_step_prefill_left = self._sx_prefill_cap_tokens
 
     def schedule(self) -> SchedulerOutput:
         self.current_step += 1
@@ -698,6 +999,9 @@ class Scheduler(SchedulerInterface):
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
+        if getattr(self, "_sx_prefill_cap", False):
+            # SX_OPT_PREFILL_CAP_WITH_DECODES: decode-aware prefill cap.
+            self._sx_begin_prefill_cap_step()
 
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}

@@ -95,7 +95,19 @@ _SM70_FUSED_SHARED_GATE_MAX_TOKENS = 16
 #                            construction and keeps the M == 1 gate.
 #                            Speculative decoding (MTP/EAGLE/...) is outside
 #                            the SX_OPT_* contract and keeps the M == 1 gate
-#                            (its M > 1 numerics stay unchanged).
+#                            (its M > 1 numerics stay unchanged), except the
+#                            batch-3a SM70 Qwen3.8 TP4 native-MTP lane
+#                            (SX_OPT_MTP_MOE_ROUTES, design_1 [MTP-3]; lane
+#                            contract: sx_sm70_qwen38_mtp_verify_q in
+#                            fused_moe/router/fused_topk_router.py): the
+#                            target's verify rows (W = B * (k + 1) <= 32) and
+#                            the MTP draft's shared expert (draft step 0 at
+#                            B * (k + 1) rows, later steps at B rows) use the
+#                            rows gate too. Each row is bitwise equal to the
+#                            M == 1 gate on that row (so to the no-MTP lane's
+#                            gate on the same row); versus the previous
+#                            unfused M > 1 gate of the MTP lane it is an FP16
+#                            ULP change.
 # ---------------------------------------------------------------------------
 _SX_OPT_SHARED_GATE_ROWS = os.environ.get("SX_OPT_SHARED_GATE_ROWS", "1") != "0"
 # Covers every decode CUDA-graph width (captures up to 24) and the 32-row
@@ -113,6 +125,23 @@ def _sx_speculative_decoding_configured() -> bool:
     """
     config = get_current_vllm_config_or_none()
     return getattr(config, "speculative_config", None) is not None
+
+
+def _sx_shared_gate_rows_spec_excluded() -> bool:
+    """Speculative decoding outside the batch-3a SM70 Qwen3.8 MTP lane.
+
+    Evaluated at model construction. Without a speculative config this is
+    exactly _sx_speculative_decoding_configured() (False); in the MTP lane
+    (target model and MTP draft, SX_OPT_MTP_MOE_ROUTES) the rows gate is
+    admitted; every other speculative configuration keeps the M == 1 gate.
+    """
+    if not _sx_speculative_decoding_configured():
+        return False
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+        sx_sm70_qwen38_mtp_verify_q,
+    )
+
+    return sx_sm70_qwen38_mtp_verify_q(get_current_vllm_config_or_none()) == 0
 
 
 def _sx_probe_shared_gate_rows() -> bool:
@@ -271,7 +300,7 @@ class Qwen2MoeMLP(nn.Module):
         sx_rows_requested = bool(
             self._sm70_exact_shared_expert_gate and _SX_OPT_SHARED_GATE_ROWS
         )
-        sx_rows_spec = sx_rows_requested and _sx_speculative_decoding_configured()
+        sx_rows_spec = sx_rows_requested and _sx_shared_gate_rows_spec_excluded()
         self._sx_shared_gate_rows = bool(
             sx_rows_requested and not sx_rows_spec and _sx_shared_gate_rows_capable()
         )
@@ -282,6 +311,13 @@ class Qwen2MoeMLP(nn.Module):
                     "for 1 <= M <= %d (SX_OPT_SHARED_GATE_ROWS).",
                     _SX_SHARED_GATE_ROWS_MAX_TOKENS,
                 )
+                if _sx_speculative_decoding_configured():
+                    logger.info_once(
+                        "SX_OPT_MTP_MOE_ROUTES: SM70 Qwen3.8 MTP lane admits "
+                        "the multi-row shared-expert gate for verify and "
+                        "draft rows (M <= %d).",
+                        _SX_SHARED_GATE_ROWS_MAX_TOKENS,
+                    )
             elif sx_rows_spec:
                 logger.info_once(
                     "SX_OPT_SHARED_GATE_ROWS: speculative decoding is "

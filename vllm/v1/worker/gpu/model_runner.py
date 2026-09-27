@@ -1474,6 +1474,44 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # A short prompt/chunk must initialize GDN state rather than
                 # replay a graph captured for an already initialized decode.
                 uniform_tok_count = None
+        if (
+            not dummy_run
+            and uniform_tok_count is not None
+            and (
+                (
+                    self.speculative_config is not None
+                    and os.environ.get("SX_OPT_SPEC_PREFILL_NO_FULL", "1").strip()
+                    != "0"
+                )
+                or (
+                    self.speculative_config is None
+                    and uniform_tok_count == 1
+                    and os.environ.get("SX_OPT_PREFILL1_NO_FULL", "1").strip() != "0"
+                )
+            )
+        ):
+            # SX b3a (validation): a prefill chunk of exactly k+1 tokens (1
+            # token without speculative decoding), alone or batched with
+            # (k+1)-token verifies / decodes, looks like a uniform decode batch
+            # and would replay the FULL decode/verify graph. That graph assumes
+            # initialized recurrent state, and the GDN/mamba builders only
+            # refresh its persistent state-index buffers for batches without
+            # prefills, so the prefilling request read a stale/uninitialized
+            # state slot (measured: out-of-vocabulary tokens for a 5-token
+            # prompt at k=4, garbage first token for a 1-token prompt without
+            # MTP). Run such steps eager/PIECEWISE instead.
+            # SX_OPT_SPEC_PREFILL_NO_FULL=0 / SX_OPT_PREFILL1_NO_FULL=0 restore
+            # the previous dispatch (speculative / no-speculative lanes).
+            idx = np.fromiter(
+                (
+                    self.req_states.req_id_to_index[req_id]
+                    for req_id in scheduler_output.num_scheduled_tokens
+                ),
+                dtype=np.int64,
+                count=num_reqs,
+            )
+            if self.req_states.is_prefilling(idx).any():
+                uniform_tok_count = None
 
         skip_compiled = False
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:

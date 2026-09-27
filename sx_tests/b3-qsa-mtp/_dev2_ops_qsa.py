@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import math
 import os
-from typing import NamedTuple
 
 import regex as re
 import torch
@@ -99,24 +98,6 @@ _SM70_QSA_GROUPED_PAGE4_WORKSPACES: dict[
     ],
 ] = {}
 _SM70_QSA_GROUPED_PAGE4_ABI_CACHE: tuple[object, int] | None = None
-# SX_OPT_QSA_MTP_PAGE4_CAPTURE state (see the batch 3a switch block below).
-# Read-only XQA partition-count constants, one per (device, partitions).
-_SM70_QSA_XQA_PAGE4_PARTITION_COUNTS: dict[tuple[int, int], torch.Tensor] = {}
-# Workspaces used while a CUDA graph is being captured. Like the old
-# capture-stream entries they are shared by every captured graph (graphs
-# replay one at a time on the model stream), but they are never freed: a
-# replaced entry moves to _SM70_QSA_PAGE4_GRAPH_RETIRED because an earlier
-# graph still holds its addresses.
-_SM70_QSA_XQA_PAGE4_GRAPH_WORKSPACES: dict[
-    tuple[int, int, int, int],
-    tuple[int, torch.Tensor, torch.Tensor, torch.Tensor],
-] = {}
-_SM70_QSA_GROUPED_PAGE4_GRAPH_WORKSPACES: dict[
-    tuple[int, int],
-    tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-] = {}
-_SM70_QSA_PAGE4_GRAPH_RETIRED: list[object] = []
-_SM70_QSA_PAGE4_GRAPH_RESERVED: set[tuple] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -179,11 +160,9 @@ _SM70_QSA_PAGE4_GRAPH_RESERVED: set[tuple] = set()
 #                              without the op the old launch runs.
 #
 # The host metadata these paths need (query_start_loc / seq_lens CPU copies)
-# is attached by Qwen4ExpQSAMetadataBuilder in ../qsa.py when no speculative
-# decoding is configured, and (batch 3a, SX_OPT_QSA_MTP_HOST_METADATA) in the
-# admitted MTP lane, where every sequence length that may be an optimistic
-# upper bound is replaced by -1 (which every planner below rejects); without
-# it every path falls back to the baseline behaviour.
+# is attached by Qwen4ExpQSAMetadataBuilder in ../qsa.py only when no
+# speculative decoding is configured; without it every path falls back to the
+# baseline behaviour.
 # ---------------------------------------------------------------------------
 def _sx_opt_enabled(name: str) -> bool:
     return os.environ.get(f"SX_OPT_{name}", "1") != "0"
@@ -219,118 +198,6 @@ try:
     )
 except ValueError:
     _SX_QSA_MIXED_MIN_GROUP_REQUESTS = 3
-
-
-# ---------------------------------------------------------------------------
-# ShiXiang batch 3a (group "qsa-mtp"): the speculative MTP lane, i.e.
-# speculative_config.method == "mtp" on the admitted Qwen3.8 SM70 TP4
-# topology (../qsa.py _sx_qsa_mtp_lane_contract). Every switch defaults to ON
-# and "0" restores the 1.8.0-dev2 behaviour. The MTP-lane options reach the
-# ops as an explicit ``sx_mtp_lane`` argument built once per layer; without it
-# (every other configuration, including the no-MTP production lane) the
-# decode-row gates below are the 1.8.0-dev2 ones.
-#
-#   SX_OPT_QSA_MTP_PAGE4_CAPTURE   Page4 workspaces under CUDA-graph capture.
-#                                  The XQA partition count is a cached,
-#                                  read-only device constant (the old
-#                                  torch.tensor() host copy aborted FULL
-#                                  capture: "operation not permitted when
-#                                  stream is capturing" at k4 verify widths
-#                                  >= 64 with an XQA remainder, e.g. 23 x 5).
-#                                  Captured graphs use their own workspaces,
-#                                  which are never freed (a graph keeps their
-#                                  addresses) and, in the MTP lane, are
-#                                  reserved outside capture by the first eager
-#                                  page4 call. Addresses only: bitwise.
-#   SX_OPT_QSA_MTP_PAGE4_GRAPH_ROWS  Optional int (read in ../qsa.py): the
-#                                  widest FULL graph the reserve covers
-#                                  (default derived from the config; 0 = no
-#                                  reserve, capture then allocates from the
-#                                  graph pool without host copies).
-#   SX_OPT_QSA_MTP_DECODE_ROWS     Decode-row kernels (two-warp split-K
-#                                  partial, resolved physical rows, decode
-#                                  top-k rows) for verify widths up to
-#                                  SX_OPT_QSA_MTP_DECODE_MAX_ROWS (default 63,
-#                                  clamped to [16, 63]; XQA page4 serves >= 64
-#                                  rows). Each verify row carries its own
-#                                  request and causal query position, so the
-#                                  per-row kernels need no change. Bitwise:
-#                                  M33..63 compile to the M32 constexpr set
-#                                  (BLOCK_N 16, 8 splits) and the rows top-k
-#                                  is the per-row decode selector
-#                                  (design_1 [MTP-9]).
-#   SX_OPT_QSA_MTP_{TWO_WARP,RESOLVED,TOPK}_MAX_ROWS
-#                                  Optional per-kernel caps (default the
-#                                  decode max, clamped to [16, 63]) so a
-#                                  measured crossover can be admitted without
-#                                  a code change.
-#   SX_OPT_QSA_MTP_HOST_METADATA   (../qsa.py) host query starts and exact
-#                                  prefill sequence lengths in the MTP lane,
-#                                  restoring QSA_HOST_BOUND / MIXED_CUBLAS /
-#                                  MIXED_GROUPS there (design_1 [MTP-4]).
-# ---------------------------------------------------------------------------
-_SX_OPT_QSA_MTP_PAGE4_CAPTURE = _sx_opt_enabled("QSA_MTP_PAGE4_CAPTURE")
-# XQA page4 takes over at _SM70_QSA_XQA_PAGE4_MIN_ROWS (64) rows.
-_SX_QSA_MTP_DECODE_ROWS_LIMIT = 63
-_SX_QSA_MTP_DECODE_ROWS_FLOOR = 16
-
-
-def _sx_env_int(name: str, default: int, low: int, high: int) -> int:
-    raw = os.environ.get(name, "").strip()
-    value = default
-    if raw:
-        try:
-            value = int(raw)
-        except ValueError:
-            logger.warning("Ignoring non-integer %s=%r; using %d.", name, raw, default)
-    return max(low, min(high, value))
-
-
-class SxQsaMtpLane(NamedTuple):
-    """QSA options of a layer whose config satisfies the MTP-lane contract.
-
-    Built once per layer by ../qsa.py (sx_qsa_mtp_lane_options); passed to
-    the ops as ``sx_mtp_lane``. ``None`` keeps the 1.8.0-dev2 gates.
-    """
-
-    two_warp_max_rows: int
-    resolved_max_rows: int
-    topk_max_rows: int
-    # Widest FULL CUDA graph whose page4 workspaces are reserved outside
-    # capture (0 = no reserve).
-    page4_graph_rows: int
-
-
-def sx_qsa_mtp_lane_options(page4_graph_rows: int) -> SxQsaMtpLane:
-    """MTP-lane QSA options from the SX_OPT_QSA_MTP_* switches."""
-
-    if _sx_opt_enabled("QSA_MTP_DECODE_ROWS"):
-        decode_max = _sx_env_int(
-            "SX_OPT_QSA_MTP_DECODE_MAX_ROWS",
-            _SX_QSA_MTP_DECODE_ROWS_LIMIT,
-            _SX_QSA_MTP_DECODE_ROWS_FLOOR,
-            _SX_QSA_MTP_DECODE_ROWS_LIMIT,
-        )
-
-        def cap(kind: str) -> int:
-            return _sx_env_int(
-                f"SX_OPT_QSA_MTP_{kind}_MAX_ROWS",
-                decode_max,
-                _SX_QSA_MTP_DECODE_ROWS_FLOOR,
-                _SX_QSA_MTP_DECODE_ROWS_LIMIT,
-            )
-
-        two_warp, resolved, topk = cap("TWO_WARP"), cap("RESOLVED"), cap("TOPK")
-    else:
-        two_warp = resolved = topk = _SX_QSA_DECODE_MAX_ROWS
-    graph_rows = max(0, int(page4_graph_rows)) if _SX_OPT_QSA_MTP_PAGE4_CAPTURE else 0
-    return SxQsaMtpLane(two_warp, resolved, topk, graph_rows)
-
-
-def _sx_decode_rows_cap(sx_mtp_lane: SxQsaMtpLane | None, field: str) -> int:
-    if sx_mtp_lane is None:
-        return _SX_QSA_DECODE_MAX_ROWS
-    return int(getattr(sx_mtp_lane, field))
 
 
 def _host_int_list(tensor: torch.Tensor | None, length: int | None = None):
@@ -1667,17 +1534,14 @@ def _sm70_qsa_lexicographic_topk_rows_op():
     return getattr(torch.ops._C, "qsa_lexicographic_topk_decode_rows", None)
 
 
-def _sx_qsa_topk_rows_op(rows: int, max_rows: int | None = None):
+def _sx_qsa_topk_rows_op(rows: int):
     """SX_OPT_QSA_TOPK_ROWS admission: 2 <= rows <= 32 and the op is built.
 
     M == 1 keeps the existing launch (already the decode kernel); larger row
-    counts (prefill chunks) keep the generic kernel. ``max_rows`` (MTP lane,
-    SX_OPT_QSA_MTP_DECODE_ROWS) raises the 32-row limit for verify widths;
-    the op has no row limit (grid = rows, one CTA per row).
+    counts (prefill chunks) keep the generic kernel.
     """
 
-    limit = _SX_QSA_DECODE_MAX_ROWS if max_rows is None else max_rows
-    if not _SX_OPT_QSA_TOPK_ROWS or not 2 <= rows <= limit:
+    if not _SX_OPT_QSA_TOPK_ROWS or not 2 <= rows <= _SX_QSA_DECODE_MAX_ROWS:
         return None
     return _sm70_qsa_lexicographic_topk_rows_op()
 
@@ -1965,13 +1829,8 @@ def _qsa_select_rows(
     key_valid: torch.Tensor | None,
     all_visible: torch.Tensor | None,
     launch_rows: int | None = None,
-    topk_max_rows: int | None = None,
 ) -> None:
-    """Chunked score -> top-k -> expand loop (verbatim baseline body).
-
-    ``topk_max_rows`` (MTP lane) is the SX_OPT_QSA_TOPK_ROWS admission limit;
-    None keeps the 32-row limit.
-    """
+    """Chunked score -> top-k -> expand loop (verbatim baseline body)."""
 
     rows = q.shape[0]
     block_topk = token_topk // compress_ratio
@@ -2017,7 +1876,7 @@ def _qsa_select_rows(
                 "Using exact SM70 QSA lexicographic top-k "
                 "(score descending, block index ascending)."
             )
-            rows_topk_op = _sx_qsa_topk_rows_op(blocks.shape[0], topk_max_rows)
+            rows_topk_op = _sx_qsa_topk_rows_op(blocks.shape[0])
             if rows_topk_op is not None:
                 logger.info_once(
                     "Using exact SM70 QSA decode-specialised lexicographic "
@@ -2025,13 +1884,6 @@ def _qsa_select_rows(
                     "(SX_OPT_QSA_TOPK_ROWS).",
                     _SX_QSA_DECODE_MAX_ROWS,
                 )
-                if blocks.shape[0] > _SX_QSA_DECODE_MAX_ROWS:
-                    logger.info_once(
-                        "Using exact SM70 QSA decode-specialised lexicographic "
-                        "top-k for MTP verify widths up to %d rows "
-                        "(SX_OPT_QSA_MTP_DECODE_ROWS).",
-                        topk_max_rows,
-                    )
                 rows_topk_op(
                     logits,
                     visible_blocks,
@@ -2081,7 +1933,6 @@ def _qsa_select_mixed_batch(
     token_topk: int,
     compress_ratio: int,
     out: torch.Tensor,
-    topk_max_rows: int | None = None,
 ) -> None:
     rows = q.shape[0]
     capacity_columns = page_table.shape[1] * k_cache.shape[1]
@@ -2105,7 +1956,6 @@ def _qsa_select_mixed_batch(
                 None,
                 None,
                 launch_rows=rows,
-                topk_max_rows=topk_max_rows,
             )
             continue
         # No per-call arguments: info_once de-duplicates on them, and every
@@ -2156,7 +2006,6 @@ def _qsa_select_mixed_batch(
             contiguous_keys,
             key_valid,
             all_visible,
-            topk_max_rows=topk_max_rows,
         )
 
 
@@ -2173,7 +2022,6 @@ def qsa_select_paged_tokens(
     *,
     query_start_loc_cpu: torch.Tensor | None = None,
     seq_lens_cpu: torch.Tensor | None = None,
-    sx_mtp_lane: SxQsaMtpLane | None = None,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization.
 
@@ -2181,12 +2029,7 @@ def qsa_select_paged_tokens(
     batch's query starts and sequence lengths. With them the single-request
     cuBLAS path needs no device->host sync, and large prefill requests inside
     a mixed batch can use the cuBLAS scorer too. Without them the baseline
-    behaviour is kept. A negative host sequence length means "unknown" (MTP
-    lane: a request whose host length may be an optimistic upper bound) and
-    keeps the device-side path for that request.
-
-    ``sx_mtp_lane`` (MTP lane only) widens the decode top-k rows admission to
-    the verify widths; None keeps the 1.8.0-dev2 limit.
+    behaviour is kept.
     """
 
     rows = q.shape[0]
@@ -2212,9 +2055,6 @@ def qsa_select_paged_tokens(
         block_topk,
         compress_ratio,
     )
-    topk_max_rows = (
-        None if sx_mtp_lane is None else _sx_decode_rows_cap(sx_mtp_lane, "topk_max_rows")
-    )
     if mixed_segments is not None:
         _qsa_select_mixed_batch(
             mixed_segments,
@@ -2227,7 +2067,6 @@ def qsa_select_paged_tokens(
             token_topk,
             compress_ratio,
             out,
-            topk_max_rows=topk_max_rows,
         )
         return out
 
@@ -2302,7 +2141,6 @@ def qsa_select_paged_tokens(
         contiguous_keys,
         key_valid,
         all_visible,
-        topk_max_rows=topk_max_rows,
     )
     return out
 
@@ -2443,94 +2281,10 @@ def _qsa_xqa_page4_block_table(
     return physical_pages, xqa_sequence_lengths
 
 
-def _qsa_device_index(device: torch.device) -> int:
-    return device.index if device.index is not None else -1
-
-
-def _qsa_xqa_page4_partition_count(
-    device: torch.device,
-    num_partitions: int,
-) -> torch.Tensor:
-    """Device int32 [1] partition count read (never written) by the XQA kernel.
-
-    Created once per (device, partitions) outside CUDA-graph capture: the old
-    per-workspace torch.tensor() is a synchronous host copy, which is not
-    permitted while a stream is being captured. If a capture reaches this
-    before any eager call created the constant, a fill kernel recorded into
-    that graph writes the value on every replay; that tensor is private to
-    the call (another graph must not read it before this one replays) and is
-    kept alive for the graph.
-    """
-
-    key = (_qsa_device_index(device), num_partitions)
-    constant = _SM70_QSA_XQA_PAGE4_PARTITION_COUNTS.get(key)
-    if constant is not None:
-        return constant
-    if torch.cuda.is_current_stream_capturing():
-        logger.warning_once(
-            "SM70 QSA page4 XQA partition count created during CUDA graph "
-            "capture; recording a device fill instead of a host copy "
-            "(SX_OPT_QSA_MTP_PAGE4_CAPTURE)."
-        )
-        constant = torch.full((1,), num_partitions, dtype=torch.int32, device=device)
-        _SM70_QSA_PAGE4_GRAPH_RETIRED.append(constant)
-        return constant
-    constant = torch.tensor([num_partitions], dtype=torch.int32, device=device)
-    _SM70_QSA_XQA_PAGE4_PARTITION_COUNTS[key] = constant
-    return constant
-
-
-def _qsa_xqa_page4_alloc(
-    q: torch.Tensor,
-    capacity: int,
-    num_partitions: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    temporary_output = torch.empty(
-        (capacity, q.shape[1], num_partitions, q.shape[2]),
-        dtype=torch.float16,
-        device=q.device,
-    )
-    max_logits = torch.empty(
-        (capacity, q.shape[1], num_partitions),
-        dtype=torch.float32,
-        device=q.device,
-    )
-    exp_sums = torch.empty_like(max_logits)
-    return temporary_output, max_logits, exp_sums
-
-
-def _qsa_xqa_page4_graph_workspace(
-    q: torch.Tensor,
-    num_partitions: int,
-    rows: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Scratch of captured XQA launches: shared by all graphs, never freed."""
-
-    key = (_qsa_device_index(q.device), q.shape[1], q.shape[2], num_partitions)
-    workspace = _SM70_QSA_XQA_PAGE4_GRAPH_WORKSPACES.get(key)
-    if workspace is None or workspace[0] < rows:
-        if torch.cuda.is_current_stream_capturing():
-            logger.warning_once(
-                "SM70 QSA page4 XQA graph workspace allocated during CUDA graph "
-                "capture (not reserved beforehand); it comes from the graph "
-                "pool without host copies and is never freed "
-                "(SX_OPT_QSA_MTP_PAGE4_CAPTURE)."
-            )
-        if workspace is not None:
-            # A graph captured earlier still addresses the smaller buffers.
-            _SM70_QSA_PAGE4_GRAPH_RETIRED.append(workspace)
-        capacity = 1 << (rows - 1).bit_length()
-        workspace = (capacity, *_qsa_xqa_page4_alloc(q, capacity, num_partitions))
-        _SM70_QSA_XQA_PAGE4_GRAPH_WORKSPACES[key] = workspace
-    _, temporary_output, max_logits, exp_sums = workspace
-    return temporary_output[:rows], max_logits[:rows], exp_sums[:rows]
-
-
-def _qsa_xqa_page4_workspace_dev2(
+def _qsa_xqa_page4_workspace(
     q: torch.Tensor,
     num_partitions: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """1.8.0-dev2 workspace (SX_OPT_QSA_MTP_PAGE4_CAPTURE=0), verbatim."""
     device_index = q.device.index if q.device.index is not None else -1
     stream_id = int(torch.cuda.current_stream(q.device).cuda_stream)
     key = (device_index, stream_id, q.shape[1], q.shape[2], num_partitions)
@@ -2569,116 +2323,10 @@ def _qsa_xqa_page4_workspace_dev2(
     )
 
 
-def _qsa_xqa_page4_workspace(
-    q: torch.Tensor,
-    num_partitions: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Scratch + partition count for one row-wise XQA page4 launch.
-
-    Eager launches keep the per-stream workspace (it may grow and free the
-    smaller one: no graph holds it). Captured launches use the graph
-    workspace. The partition count is the cached device constant in both.
-    The kernel writes every scratch element it later reads, so buffer
-    addresses never change results.
-    """
-
-    if not _SX_OPT_QSA_MTP_PAGE4_CAPTURE:
-        return _qsa_xqa_page4_workspace_dev2(q, num_partitions)
-    rows = q.shape[0]
-    if torch.cuda.is_current_stream_capturing():
-        temporary_output, max_logits, exp_sums = _qsa_xqa_page4_graph_workspace(
-            q, num_partitions, rows
-        )
-        return (
-            temporary_output,
-            max_logits,
-            exp_sums,
-            _qsa_xqa_page4_partition_count(q.device, num_partitions),
-        )
-    device_index = _qsa_device_index(q.device)
-    stream_id = int(torch.cuda.current_stream(q.device).cuda_stream)
-    key = (device_index, stream_id, q.shape[1], q.shape[2], num_partitions)
-    workspace = _SM70_QSA_XQA_PAGE4_WORKSPACES.get(key)
-    if workspace is None or workspace[0] < rows:
-        capacity = 1 << (rows - 1).bit_length()
-        workspace = (
-            capacity,
-            *_qsa_xqa_page4_alloc(q, capacity, num_partitions),
-            _qsa_xqa_page4_partition_count(q.device, num_partitions),
-        )
-        _SM70_QSA_XQA_PAGE4_WORKSPACES[key] = workspace
-    _, temporary_output, max_logits, exp_sums, active_num_partitions = workspace
-    return (
-        temporary_output[:rows],
-        max_logits[:rows],
-        exp_sums[:rows],
-        active_num_partitions,
-    )
-
-
-def _qsa_grouped_page4_alloc(
-    q: torch.Tensor,
-    capacity: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    grouped_pages = torch.empty(
-        (capacity, _SM70_QSA_GROUPED_PAGE4_OUTPUT_PAGES),
-        dtype=torch.int32,
-        device=q.device,
-    )
-    token_masks = torch.empty(
-        (capacity, _SM70_QSA_GROUPED_PAGE4_OUTPUT_PAGES),
-        dtype=torch.uint32,
-        device=q.device,
-    )
-    grouped_sequence_lengths = torch.empty(
-        (capacity,), dtype=torch.int32, device=q.device
-    )
-    lse = torch.empty(
-        (capacity * _SM70_QSA_GROUPED_PAGE4_QUERIES, q.shape[1]),
-        dtype=torch.float32,
-        device=q.device,
-    )
-    return grouped_pages, token_masks, grouped_sequence_lengths, lse
-
-
-def _qsa_grouped_page4_graph_workspace(
-    q: torch.Tensor,
-    groups: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Grouped planner/forward scratch of captured launches (never freed)."""
-
-    key = (_qsa_device_index(q.device), q.shape[1])
-    workspace = _SM70_QSA_GROUPED_PAGE4_GRAPH_WORKSPACES.get(key)
-    if workspace is None or workspace[0] < groups:
-        if torch.cuda.is_current_stream_capturing():
-            logger.warning_once(
-                "SM70 QSA grouped page4 graph workspace allocated during CUDA "
-                "graph capture (not reserved beforehand); it comes from the "
-                "graph pool and is never freed (SX_OPT_QSA_MTP_PAGE4_CAPTURE)."
-            )
-        if workspace is not None:
-            _SM70_QSA_PAGE4_GRAPH_RETIRED.append(workspace)
-        capacity = 1 << (groups - 1).bit_length()
-        workspace = (capacity, *_qsa_grouped_page4_alloc(q, capacity))
-        _SM70_QSA_GROUPED_PAGE4_GRAPH_WORKSPACES[key] = workspace
-    _, grouped_pages, token_masks, grouped_sequence_lengths, lse = workspace
-    return (
-        grouped_pages[:groups],
-        token_masks[:groups],
-        grouped_sequence_lengths[:groups],
-        lse[: groups * _SM70_QSA_GROUPED_PAGE4_QUERIES],
-    )
-
-
 def _qsa_grouped_page4_workspace(
     q: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     groups = q.shape[0] // _SM70_QSA_GROUPED_PAGE4_QUERIES
-    if _SX_OPT_QSA_MTP_PAGE4_CAPTURE and torch.cuda.is_current_stream_capturing():
-        grouped_pages, token_masks, grouped_sequence_lengths, lse = (
-            _qsa_grouped_page4_graph_workspace(q, groups)
-        )
-        return grouped_pages, token_masks, grouped_sequence_lengths, lse[: q.shape[0]]
     device_index = q.device.index if q.device.index is not None else -1
     stream_id = int(torch.cuda.current_stream(q.device).cuda_stream)
     key = (device_index, stream_id)
@@ -2717,66 +2365,6 @@ def _qsa_grouped_page4_workspace(
         token_masks[:groups],
         grouped_sequence_lengths[:groups],
         lse[: q.shape[0]],
-    )
-
-
-def _qsa_page4_reserve_graph_workspaces(
-    q: torch.Tensor,
-    kv_cache_dtype: str,
-    selection_width: int,
-    grouped_enabled: bool,
-    graph_rows: int,
-) -> None:
-    """Allocate, outside capture, what the MTP lane's FULL graphs will use.
-
-    Mirrors the capture-time routing of _qsa_sparse_paged_attention_sm70_xqa_page4
-    (mixed-groups routing never runs under capture): with the grouped kernel
-    a captured launch hands at most 7 remainder rows to XQA and at most
-    graph_rows // 8 groups to the grouped kernel; the E4M3 fallback slices
-    XQA into 16-row launches; otherwise XQA takes every row. Runs on the
-    first eager page4 call of the lane (the startup profile run, and the
-    eager warmup that precedes every capture), so captures do not allocate.
-    Idempotent.
-    """
-
-    key = (
-        _qsa_device_index(q.device),
-        q.shape[1],
-        q.shape[2],
-        kv_cache_dtype,
-        selection_width,
-        bool(grouped_enabled),
-        graph_rows,
-    )
-    if key in _SM70_QSA_PAGE4_GRAPH_RESERVED:
-        return
-    partition_size = (
-        256 if kv_cache_dtype == "fp8_e4m3" else _SM70_QSA_XQA_PAGE4_PARTITION
-    )
-    num_partitions = math.ceil(selection_width / partition_size)
-    group = _SM70_QSA_GROUPED_PAGE4_QUERIES
-    if grouped_enabled:
-        xqa_rows = min(graph_rows, group - 1)
-        groups = graph_rows // group
-    elif kv_cache_dtype == "fp8_e4m3":
-        xqa_rows = min(graph_rows, 16)
-        groups = 0
-    else:
-        xqa_rows = graph_rows
-        groups = 0
-    if xqa_rows > 0:
-        _qsa_xqa_page4_partition_count(q.device, num_partitions)
-        _qsa_xqa_page4_graph_workspace(q, num_partitions, xqa_rows)
-    if groups > 0:
-        _qsa_grouped_page4_graph_workspace(q, groups)
-    _SM70_QSA_PAGE4_GRAPH_RESERVED.add(key)
-    logger.info_once(
-        "Reserved SM70 QSA page4 CUDA-graph workspaces outside capture "
-        "(graph_rows=%d, xqa_rows=%d, grouped_groups=%d; "
-        "SX_OPT_QSA_MTP_PAGE4_CAPTURE).",
-        graph_rows,
-        xqa_rows,
-        groups,
     )
 
 
@@ -3163,7 +2751,6 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
     k_scale: float,
     v_scale: float,
     query_start_loc_cpu: torch.Tensor | None = None,
-    sx_page4_graph_rows: int = 0,
 ) -> torch.Tensor | None:
     try:
         from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
@@ -3183,20 +2770,6 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
     grouped_enabled = _SM70_QSA_GROUPED_PAGE4 and _qsa_grouped_page4_supported(
         flash_attn_v100_cuda, kv_cache_dtype
     )
-    if (
-        sx_page4_graph_rows > 0
-        and _SX_OPT_QSA_MTP_PAGE4_CAPTURE
-        and not torch.cuda.is_current_stream_capturing()
-    ):
-        # MTP lane: FULL verify graphs reach page4 at >= 64 rows. Reserve
-        # their workspaces now so capture neither allocates nor copies.
-        _qsa_page4_reserve_graph_workspaces(
-            q,
-            kv_cache_dtype,
-            logical_indices.shape[1],
-            grouped_enabled,
-            sx_page4_graph_rows,
-        )
     if (
         grouped_enabled
         and _SX_OPT_QSA_MIXED_GROUPS
@@ -3329,9 +2902,7 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
     )
 
 
-def _use_sm70_qsa_resolved_indices(
-    q, k_cache, indices, kv_cache_dtype, *, max_rows: int | None = None
-):
+def _use_sm70_qsa_resolved_indices(q, k_cache, indices, kv_cache_dtype):
     """Admit only the measured checkpoint-FP16 TP4 decode cache geometry.
 
     Baseline: M == 1 with 400-token pages. With SX_OPT_QSA_RESOLVED_ROWS the
@@ -3340,17 +2911,14 @@ def _use_sm70_qsa_resolved_indices(
     pages of the mamba-align deployment). The resolver only replaces the
     partial kernel's dependent page-table load with a precomputed physical
     slot: logical order, duplicates and invalid slots are preserved, so the
-    attention arithmetic and its output are bitwise unchanged. ``max_rows``
-    (MTP lane, SX_OPT_QSA_MTP_DECODE_ROWS) widens the 32-row limit to the
-    verify widths; the resolver is per row (its own request's page table).
+    attention arithmetic and its output are bitwise unchanged.
     """
     if _SX_OPT_QSA_RESOLVED_ROWS:
         rows = q.shape[0] if len(q.shape) == 3 else 0
         page_size = k_cache.shape[1] if len(k_cache.shape) == 4 else 0
-        limit = _SX_QSA_DECODE_MAX_ROWS if max_rows is None else max_rows
         return bool(
             current_platform.is_device_capability(70)
-            and 1 <= rows <= limit
+            and 1 <= rows <= _SX_QSA_DECODE_MAX_ROWS
             and q.shape[1:] == (6, 256)
             and q.dtype == k_cache.dtype == torch.float16
             and page_size > 0
@@ -3388,17 +2956,12 @@ def qsa_sparse_paged_attention(
     v_scale: float = 1.0,
     *,
     query_start_loc_cpu: torch.Tensor | None = None,
-    sx_mtp_lane: SxQsaMtpLane | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA over paged FP16/BF16 or calibrated E4M3 K/V.
 
     ``query_start_loc_cpu`` (optional host copy of the batch's query starts)
     lets the SM70 grouped page4 prefill route keep every 8-row group inside a
     single request; without it the baseline grouping is used.
-
-    ``sx_mtp_lane`` (MTP lane only) widens the decode-row gates (two-warp
-    partial, resolved rows) to the verify widths and reserves the page4 CUDA
-    graph workspaces; None keeps the 1.8.0-dev2 gates.
     """
 
     if not q.is_cuda or not HAS_TRITON:
@@ -3480,9 +3043,6 @@ def qsa_sparse_paged_attention(
             k_scale,
             v_scale,
             query_start_loc_cpu=query_start_loc_cpu,
-            sx_page4_graph_rows=(
-                0 if sx_mtp_lane is None else int(sx_mtp_lane.page4_graph_rows)
-            ),
         )
         if xqa_output is not None:
             if output_gate_view is not None:
@@ -3490,15 +3050,7 @@ def qsa_sparse_paged_attention(
             return xqa_output
 
     resolved_indices = _use_sm70_qsa_resolved_indices(
-        q,
-        k_cache,
-        logical_indices,
-        kv_cache_dtype,
-        max_rows=(
-            None
-            if sx_mtp_lane is None
-            else _sx_decode_rows_cap(sx_mtp_lane, "resolved_max_rows")
-        ),
+        q, k_cache, logical_indices, kv_cache_dtype
     )
     if resolved_indices and _SX_OPT_QSA_RESOLVED_ROWS:
         resolved_rows, resolved_topk = logical_indices.shape
@@ -3555,25 +3107,10 @@ def qsa_sparse_paged_attention(
         not current_platform.has_device_capability(80),
     )
 
-    if _use_sm70_qsa_two_warp_partial(
-        q.shape[0],
-        group_size,
-        head_dim,
-        max_rows=(
-            None
-            if sx_mtp_lane is None
-            else _sx_decode_rows_cap(sx_mtp_lane, "two_warp_max_rows")
-        ),
-    ):
+    if _use_sm70_qsa_two_warp_partial(q.shape[0], group_size, head_dim):
         # Exact Qwen4Exp TP4 decode family. Two warps preserve the existing
         # split/merge arithmetic and cut the partial-kernel time on V100.
         partial_warps = 2
-        if q.shape[0] > _SX_QSA_DECODE_MAX_ROWS:
-            logger.info_once(
-                "Using SM70 QSA two-warp sparse partial for MTP verify widths "
-                "up to %d rows (SX_OPT_QSA_MTP_DECODE_ROWS).",
-                _sx_decode_rows_cap(sx_mtp_lane, "two_warp_max_rows"),
-            )
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
@@ -3704,8 +3241,6 @@ def _use_sm70_qsa_two_warp_partial(
     num_query_tokens: int,
     group_size: int,
     head_dim: int,
-    *,
-    max_rows: int | None = None,
 ) -> bool:
     """Gate the bitwise small-batch SM70 sparse-QSA launch policy.
 
@@ -3713,14 +3248,8 @@ def _use_sm70_qsa_two_warp_partial(
     M17..31 compile to the same constexpr set as M16 (BLOCK_N 16, 32 splits);
     M32 is the 8-split variant. The per-tile code is identical for every trip
     count, so the two-warp result equals the four-warp one bitwise.
-    ``max_rows`` (MTP lane, SX_OPT_QSA_MTP_DECODE_ROWS) replaces the 32-row
-    limit for verify widths: M33..63 use the M32 constexpr set (8 splits),
-    only the grid grows.
     """
-    if _SX_OPT_QSA_TWO_WARP32:
-        max_query_tokens = _SX_QSA_DECODE_MAX_ROWS if max_rows is None else max_rows
-    else:
-        max_query_tokens = 16
+    max_query_tokens = _SX_QSA_DECODE_MAX_ROWS if _SX_OPT_QSA_TWO_WARP32 else 16
     return bool(
         0 < num_query_tokens <= max_query_tokens
         and group_size == 6

@@ -68,6 +68,50 @@ SX_OPT_MOE_GROUPED_MASK (default "1"), design_1 [C5]:
     If the metadata does not expose exactly one such view, masking is skipped
     for that call (logged once). "0" restores the old op at M8/M16 and runs
     17..32 unmasked.
+
+Batch 3a (group "moe-verify", design_4 [MTP-K4] phase A, design_1 [MTP-2] /
+[MTP-3]; Python only, no native rebuild). Everything below is admitted only
+for layers built in the SM70 Qwen3.8-Flash-Next TP4 native-MTP lane
+(``sx_sm70_qwen38_mtp_verify_q`` in fused_moe/router/fused_topk_router.py:
+speculative method "mtp" with the Qwen4Exp drafter, 1 <= k <= 7, the exact
+no-MTP Qwen3.8 TP4 target contract, no DBO, SM70). Layers built without a
+speculative config never carry the attributes, so the no-MTP lane is
+unchanged. q = k + 1 is the uniform verify width per request.
+
+SX_OPT_MTP_MOE_ROUTES (default "1"): master switch; "0" restores the
+    1.8.0-dev2 MTP lane (TurboMind generic MoE for every verify width that is
+    not 2/4/8/16, no grouped route, per-call aranges). The lane-wide master
+    SX_OPT_MTP_LANE=0 does the same.
+SX_OPT_MTP_MOE_GROUPED (default "1"), design_1 [MTP-2]: pure, uniform verify
+    steps (CPU metadata only: no prefill and no plain decode, every
+    attention max_query_len == q, GDN/PLE num_spec_decode_tokens ==
+    num_spec_decodes * q) with W = B * q tokens, W % q == 0 and
+    SX_OPT_MTP_MOE_GROUPED_MIN_TOKENS (default 8) <= W <= the layer's grouped
+    capacity (32 with the batch-2 v2 ops) use the native grouped decode
+    route with padded-row masking (the live-row count is the query_start_loc
+    tail of the verify metadata, whose persistent view has W / q + 1
+    entries in FULL graphs). W13 split: 8 -> 4 and 16 -> 8 (the admitted
+    legacy widths), 9..12 -> SX_OPT_MTP_MOE_GROUPED_SPLIT_SMALL (default 4,
+    M8's association), 13..15 -> 8 (M16's), 17..32 -> SX_OPT_MOE_GROUPED32_SPLIT
+    (default 8). Rows are independent, so every verify row is bitwise equal to
+    the same row in the no-MTP grouped decode at the same split (M8 / M16 /
+    M17..32, and the whole output at a no-MTP width that uses the same split
+    such as 16, 20, 24, 32). Versus the TurboMind route used before it is an
+    FP32 association change of the admitted M16-grouped class.
+SX_OPT_MTP_MOE_DIRECT (default "1"), design_4 [MTP-K4] phase A: 1Cat's direct
+    QPN routes at uniform verify widths below the grouped minimum, admitted
+    in the verify context only (prefill/mixed steps keep their routes):
+    * k = 4, W5: the QPN-MTP5 op (W13 split 4) as if
+      VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE=1 were set;
+    * W in the dynamic-QPN split table (2..16, W % q == 0) as if
+      VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE=1 were set (so W5 also
+      takes the fused fixed-order W2 reduce, and W3/W6/W7 their table split).
+    An explicitly set VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE /
+    ..._DYNAMIC_DECODE keeps its global meaning (the lane default only applies
+    when the variable is absent). Widths 2/4/8/16 keep the static table.
+SX_OPT_MOE_EAGER_IOTA is also admitted in the lane (bitwise; 320 KiB).
+SX_OPT_MOE_PERSIST32 stays off in the lane (design_1 / design_4 rejected:
+    ~79 MB/rank of KV for no FULL-graph gain).
 """
 
 from __future__ import annotations
@@ -91,6 +135,9 @@ from vllm.model_executor.layers.fused_moe import (
     MoEActivation,
     RoutedExperts,
     SharedExperts,
+)
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+    sx_sm70_qwen38_mtp_verify_q,
 )
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4Config,
@@ -150,6 +197,56 @@ def _grouped32_split_from_env() -> int:
 
 # W13 split for 17..32 grouped decode rows (8 = M16's association).
 _SX_MOE_GROUPED32_SPLIT: Final = _grouped32_split_from_env()
+
+# Batch 3a MTP-lane switches (see the docstring; the master switch
+# SX_OPT_MTP_MOE_ROUTES lives in sx_sm70_qwen38_mtp_verify_q).
+_SX_OPT_MTP_MOE_GROUPED: Final = os.environ.get("SX_OPT_MTP_MOE_GROUPED", "1") != "0"
+_SX_OPT_MTP_MOE_DIRECT: Final = os.environ.get("SX_OPT_MTP_MOE_DIRECT", "1") != "0"
+# W13 splits the native grouped kernels are instantiated for.
+_GROUPED_NATIVE_SPLITS: Final = (1, 2, 4, 5, 8)
+_MTP_GROUPED_DEFAULT_MIN_TOKENS: Final = 8
+_MTP_GROUPED_DEFAULT_SPLIT_SMALL: Final = 4
+
+
+def _mtp_grouped_min_tokens_from_env() -> int:
+    raw = os.environ.get(
+        "SX_OPT_MTP_MOE_GROUPED_MIN_TOKENS", str(_MTP_GROUPED_DEFAULT_MIN_TOKENS)
+    ).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if 2 <= value <= 32:
+        return value
+    logger.warning(
+        "Ignoring SX_OPT_MTP_MOE_GROUPED_MIN_TOKENS=%r (allowed: 2..32); using %d.",
+        raw,
+        _MTP_GROUPED_DEFAULT_MIN_TOKENS,
+    )
+    return _MTP_GROUPED_DEFAULT_MIN_TOKENS
+
+
+def _mtp_grouped_split_small_from_env() -> int:
+    raw = os.environ.get(
+        "SX_OPT_MTP_MOE_GROUPED_SPLIT_SMALL", str(_MTP_GROUPED_DEFAULT_SPLIT_SMALL)
+    ).strip()
+    if raw in tuple(str(s) for s in _GROUPED_NATIVE_SPLITS):
+        return int(raw)
+    logger.warning(
+        "Ignoring SX_OPT_MTP_MOE_GROUPED_SPLIT_SMALL=%r (allowed: %s); using %d.",
+        raw,
+        ", ".join(str(s) for s in _GROUPED_NATIVE_SPLITS),
+        _MTP_GROUPED_DEFAULT_SPLIT_SMALL,
+    )
+    return _MTP_GROUPED_DEFAULT_SPLIT_SMALL
+
+
+# Smallest uniform verify width that takes the grouped route (below it the
+# direct QPN / MTP5 routes, which skip the planner, are kept).
+_SX_MTP_MOE_GROUPED_MIN_TOKENS: Final = _mtp_grouped_min_tokens_from_env()
+# W13 split of grouped verify widths up to 12 (except the legacy 8).
+_SX_MTP_MOE_GROUPED_SPLIT_SMALL: Final = _mtp_grouped_split_small_from_env()
+_GROUPED_VERIFY_CONTEXT_KEY: Final = "sx_mtp_moe_verify_context"
 # Admitted legacy widths and their W13 splits (unchanged).
 _GROUPED_DECODE_LEGACY_SPLIT: Final = {8: 4, 16: 8}
 _QWEN38_GROUPED32_MAX_TOKENS: Final = 32
@@ -227,12 +324,33 @@ def _ubatching_configured() -> bool:
 
 
 def _speculative_decoding_configured() -> bool:
-    """MTP/EAGLE/DFlash/... deployments are outside the SX_OPT_* contract."""
+    """MTP/EAGLE/DFlash/... deployments are outside the SX_OPT_* contract
+    (except the batch-3a MTP lane, see _sx_mtp_moe_verify_q)."""
     config = get_current_vllm_config_or_none()
     return bool(
         config is not None
         and getattr(config, "speculative_config", None) is not None
     )
+
+
+def _sx_mtp_moe_verify_q(layer: RoutedExperts) -> int:
+    """q = 1 + k when this layer is built in the SM70 Qwen3.8 TP4 MTP lane.
+
+    Load-time only (the vLLM config is current). 0 without a speculative
+    config, outside the exact Qwen3.8 TP4 expert contract, with DBO, or when
+    SX_OPT_MTP_MOE_ROUTES=0.
+    """
+    if not _is_qwen38_tp4_contract(layer) or _ubatching_configured():
+        return 0
+    config = get_current_vllm_config_or_none()
+    if config is None or getattr(config, "speculative_config", None) is None:
+        return 0
+    return int(sx_sm70_qwen38_mtp_verify_q(config))
+
+
+def _layer_mtp_verify_q(layer) -> int:
+    """Uniform verify rows per request stamped at load time (0 = not lane)."""
+    return int(getattr(layer, "sx_mtp_verify_q", 0) or 0)
 
 
 def _persistent_max_tokens_for(layer: RoutedExperts) -> int:
@@ -259,13 +377,17 @@ def _get_qwen38_eager_iota(
     """Per-device read-only arange for eager buffers (SX_OPT_MOE_EAGER_IOTA).
 
     Created at load time, never inside CUDA graph capture. Returns None (old
-    per-call torch.arange path) when disabled, outside the no-spec contract or
-    the token budget is unknown.
+    per-call torch.arange path) when disabled, outside the no-spec contract
+    (and outside the batch-3a MTP lane, design_1 [MTP-3]) or the token budget
+    is unknown.
     """
     if not (
         _SX_OPT_MOE_EAGER_IOTA
         and _is_qwen38_tp4_contract(layer)
-        and not _speculative_decoding_configured()
+        and (
+            not _speculative_decoding_configured()
+            or _sx_mtp_moe_verify_q(layer) > 0
+        )
     ):
         return None
     config = get_current_vllm_config_or_none()
@@ -296,11 +418,15 @@ def _moe_permute_sort_workspace_size(slots: int, experts: int) -> int:
 
 
 def _grouped_v2_contract(layer: RoutedExperts) -> bool:
-    """Batch-2 grouped decode contract (same gates as SX_OPT_MOE_PERSIST32)."""
+    """Batch-2 grouped decode contract (same gates as SX_OPT_MOE_PERSIST32),
+    plus the batch-3a MTP lane when SX_OPT_MTP_MOE_GROUPED is on."""
     return bool(
         _is_qwen38_tp4_contract(layer)
         and not _ubatching_configured()
-        and not _speculative_decoding_configured()
+        and (
+            not _speculative_decoding_configured()
+            or (_SX_OPT_MTP_MOE_GROUPED and _sx_mtp_moe_verify_q(layer) > 0)
+        )
     )
 
 
@@ -406,7 +532,10 @@ def _load_grouped_v2_ops() -> tuple | None:
 
 
 def _find_live_rows_view(
-    metadata: object, num_tokens: int, device: torch.device
+    metadata: object,
+    num_tokens: int,
+    device: torch.device,
+    rows_per_request: int = 1,
 ) -> torch.Tensor | None:
     """The query_start_loc tail shared by every pure-decode metadata object.
 
@@ -417,10 +546,19 @@ def _find_live_rows_view(
     holds a view of the persistent buffer, so the tail is a pointer-stable,
     per-step live-row count. Fails closed (None) unless every metadata
     object exposing ``query_start_loc`` agrees on one int32 view of
-    ``num_tokens + 1`` entries on ``device``.
+    ``num_tokens / rows_per_request + 1`` entries on ``device``.
+
+    ``rows_per_request`` > 1 is the batch-3a uniform MTP verify step (q rows
+    per request): the live requests' tokens are packed first, the padded
+    requests follow, and the V2 runner's FULL-graph view spans
+    ``num_tokens / q`` requests, so its last entry is again the live token
+    count (the first ``query_start_loc[-1]`` rows are the live rows).
     """
     if not isinstance(metadata, dict):
         return None
+    if rows_per_request < 1 or num_tokens % rows_per_request:
+        return None
+    entries = num_tokens // rows_per_request + 1
     view = None
     seen: set[int] = set()
     for meta in metadata.values():
@@ -435,10 +573,10 @@ def _find_live_rows_view(
             and qsl.device == device
             and qsl.dtype == torch.int32
             and qsl.ndim == 1
-            and qsl.numel() == num_tokens + 1
+            and qsl.numel() == entries
         ):
             return None
-        tail = qsl[num_tokens:]
+        tail = qsl[entries - 1 :]
         if view is None:
             view = tail
         elif tail.data_ptr() != view.data_ptr():
@@ -446,22 +584,149 @@ def _find_live_rows_view(
     return view
 
 
-def _grouped_decode_live_rows(x: torch.Tensor) -> torch.Tensor | None:
+def _grouped_decode_live_rows(
+    x: torch.Tensor, rows_per_request: int = 1
+) -> torch.Tensor | None:
     """Device scalar with the live decode-row count, cached per forward."""
     context = get_forward_context()
     num_tokens = int(x.shape[0])
     cached = context.additional_kwargs.get(_GROUPED_LIVE_ROWS_KEY)
-    if cached is not None and cached[0] == num_tokens:
+    if (
+        cached is not None
+        and cached[0] == num_tokens
+        and cached[2] == rows_per_request
+    ):
         return cached[1]
-    live = _find_live_rows_view(context.attn_metadata, num_tokens, x.device)
-    context.additional_kwargs[_GROUPED_LIVE_ROWS_KEY] = (num_tokens, live)
+    live = _find_live_rows_view(
+        context.attn_metadata, num_tokens, x.device, rows_per_request
+    )
+    context.additional_kwargs[_GROUPED_LIVE_ROWS_KEY] = (
+        num_tokens,
+        live,
+        rows_per_request,
+    )
     if live is None:
         logger.info_once(
             "SX_OPT_MOE_GROUPED_MASK: no unique query_start_loc view in the "
-            "decode metadata (tokens=%d); padded rows are computed.",
+            "decode metadata (tokens=%d, rows/request=%d); padded rows are "
+            "computed.",
             num_tokens,
+            rows_per_request,
         )
     return live
+
+
+def _verify_counter_is_int(meta: object, name: str, value: object) -> bool:
+    """A metadata counter the verify classification reads must be a host int.
+
+    Device tensors are never read back (no sync); any other type rejects the
+    step, and is logged once because it means a backend's metadata contract
+    changed and every uniform verify silently keeps its previous MoE route.
+    """
+    if isinstance(value, int):
+        return True
+    logger.warning_once(
+        "SX_OPT_MTP_MOE_ROUTES: %s.%s is %s, not a host int; uniform MTP "
+        "verify steps keep their previous MoE routes.",
+        type(meta).__name__,
+        name,
+        type(value).__name__,
+    )
+    return False
+
+
+def _uniform_verify_metadata(metadata: dict, verify_q: int) -> bool:
+    """CPU metadata of a pure, uniform MTP verify step with q rows/request.
+
+    Every metadata object must describe no prefill; attention metadata must
+    report max_query_len == q; Mamba-family metadata with speculative fields
+    (GDN, PLE short-conv) must have no plain (q == 1) decodes and
+    num_spec_decode_tokens == num_spec_decodes * q with num_spec_decodes > 0;
+    metadata that counts verify requests as decodes (decode threshold q)
+    must have num_decode_tokens == num_decodes * q. Anything unexpected
+    (non-int fields, mixed decode + verify, non-uniform drafts) rejects;
+    a non-int counter is also logged once (_verify_counter_is_int).
+    """
+    seen_verify = False
+    seen: set[int] = set()
+    for meta in metadata.values():
+        if id(meta) in seen:
+            continue
+        seen.add(id(meta))
+        prefills = getattr(meta, "num_prefills", 0)
+        prefill_tokens = getattr(meta, "num_prefill_tokens", 0)
+        if (
+            not _verify_counter_is_int(meta, "num_prefills", prefills)
+            or not _verify_counter_is_int(meta, "num_prefill_tokens", prefill_tokens)
+            or prefills != 0
+            or prefill_tokens != 0
+        ):
+            return False
+        max_query = getattr(meta, "max_query_len", None)
+        if max_query is not None:
+            if (
+                not _verify_counter_is_int(meta, "max_query_len", max_query)
+                or max_query != verify_q
+            ):
+                return False
+            seen_verify = True
+        num_spec = getattr(meta, "num_spec_decodes", None)
+        num_decodes = getattr(meta, "num_decodes", None)
+        if num_spec is not None:
+            spec_tokens = getattr(meta, "num_spec_decode_tokens", None)
+            decode_tokens = getattr(meta, "num_decode_tokens", 0)
+            if (
+                not _verify_counter_is_int(meta, "num_spec_decodes", num_spec)
+                or not _verify_counter_is_int(
+                    meta, "num_spec_decode_tokens", spec_tokens
+                )
+                or num_spec <= 0
+                or spec_tokens != num_spec * verify_q
+                or (
+                    num_decodes is not None
+                    and not _verify_counter_is_int(meta, "num_decodes", num_decodes)
+                )
+                or num_decodes not in (None, 0)
+                or not _verify_counter_is_int(
+                    meta, "num_decode_tokens", decode_tokens
+                )
+                or decode_tokens != 0
+            ):
+                return False
+            seen_verify = True
+        elif num_decodes is not None:
+            decode_tokens = getattr(meta, "num_decode_tokens", None)
+            if (
+                not _verify_counter_is_int(meta, "num_decodes", num_decodes)
+                or not _verify_counter_is_int(
+                    meta, "num_decode_tokens", decode_tokens
+                )
+                or num_decodes <= 0
+                or decode_tokens != num_decodes * verify_q
+            ):
+                return False
+            seen_verify = True
+    return seen_verify
+
+
+def _grouped_verify_context_ok(verify_q: int) -> bool:
+    """Use CPU metadata only: is this forward a uniform q-row MTP verify?
+
+    Cached per forward context. Graph capture sees the exact FULL verify
+    metadata (build_for_cudagraph_capture), so the decision baked into a
+    captured graph is the one its uniform replays need.
+    """
+    if verify_q <= 1 or not is_forward_context_available():
+        return False
+    context = get_forward_context()
+    metadata = context.attn_metadata
+    if not isinstance(metadata, dict) or not metadata:
+        return False
+    cached = context.additional_kwargs.get(_GROUPED_VERIFY_CONTEXT_KEY)
+    if cached is None or cached[0] != verify_q:
+        cached = (verify_q, _uniform_verify_metadata(metadata, verify_q))
+        context.additional_kwargs[_GROUPED_VERIFY_CONTEXT_KEY] = cached
+    return bool(cached[1])
 
 
 def _raw_scales_match_prepared(
@@ -584,21 +849,45 @@ def _use_qwen38_indexed_prefill(
     )
 
 
-def _use_qwen38_qpn_batch_decode(
-    layer: RoutedExperts,
-    x: torch.Tensor,
-    topk_ids: torch.Tensor,
-) -> bool:
-    """Admit the screened Qwen3.8 TP4 no-MTP CUDA Graph batch widths."""
-    tokens = x.shape[0]
+def _qwen38_qpn_batch_split(layer, tokens: int) -> int | None:
+    """W13 split of the direct batch QPN route at this width, else None.
+
+    The global tables are unchanged (static, or dynamic with
+    VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE=1). Batch-3a MTP-lane
+    layers (SX_OPT_MTP_MOE_DIRECT) also take the dynamic table at uniform
+    verify widths (tokens % q == 0), in a uniform verify forward only.
+    """
     split_table = (
         _QWEN38_DYNAMIC_QPN_BATCH_W13_SPLIT_K
         if envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE
         else _QWEN38_QPN_BATCH_W13_SPLIT_K
     )
+    split = split_table.get(tokens)
+    if split is not None or not getattr(layer, "sx_mtp_qpn_dynamic", False):
+        return split
+    verify_q = _layer_mtp_verify_q(layer)
+    split = _QWEN38_DYNAMIC_QPN_BATCH_W13_SPLIT_K.get(tokens)
+    if (
+        split is not None
+        and verify_q > 1
+        and tokens % verify_q == 0
+        and _grouped_verify_context_ok(verify_q)
+    ):
+        return split
+    return None
+
+
+def _use_qwen38_qpn_batch_decode(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> bool:
+    """Admit the screened Qwen3.8 TP4 no-MTP CUDA Graph batch widths (and the
+    batch-3a MTP-lane uniform verify widths, see _qwen38_qpn_batch_split)."""
+    tokens = x.shape[0]
     return bool(
         envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE
-        and tokens in split_table
+        and _qwen38_qpn_batch_split(layer, tokens) is not None
         and x.shape == (tokens, 2560)
         and x.dtype == torch.float16
         and x.is_contiguous()
@@ -681,32 +970,142 @@ def _grouped_decode_width_ok(layer, tokens: int) -> bool:
     )
 
 
-def _use_grouped_decode(layer, x: torch.Tensor, topk_ids: torch.Tensor) -> bool:
-    """Local operator contract only; no TP/KV/scheduler/model-name binding."""
-    return bool(
-        getattr(layer, "sm70_nvfp4_grouped_decode", False)
-        and x.ndim == 2
-        and _grouped_decode_width_ok(layer, x.shape[0])
-        and x.shape[1] == 2560
+def _mtp_verify_grouped_q(layer, tokens: int) -> int:
+    """q when ``tokens`` is an admitted uniform-verify grouped width of this
+    batch-3a MTP-lane layer (SX_OPT_MTP_MOE_GROUPED), else 0. Width only; the
+    verify metadata is checked separately. Widths other than the legacy 8/16
+    need the v2 ops (their planner takes any 1..32 rows)."""
+    if not getattr(layer, "sx_mtp_grouped", False):
+        return 0
+    verify_q = _layer_mtp_verify_q(layer)
+    if verify_q <= 1 or tokens % verify_q:
+        return 0
+    low = int(
+        getattr(layer, "sx_mtp_grouped_min_tokens", _SX_MTP_MOE_GROUPED_MIN_TOKENS)
+    )
+    high = int(getattr(layer, "sm70_nvfp4_grouped_max_tokens", 16))
+    if not low <= tokens <= high:
+        return 0
+    if (
+        tokens not in _GROUPED_DECODE_LEGACY_SPLIT
+        and getattr(layer, "_nvfp4_grouped_v2_ops", None) is None
+    ):
+        return 0
+    return verify_q
+
+
+def _grouped_decode_width_split(layer, tokens: int) -> int:
+    """W13 split of an admitted grouped width (decode or uniform verify).
+
+    8 -> 4 and 16 -> 8 (legacy), 17..32 -> the layer's SX_OPT_MOE_GROUPED32
+    split (unchanged no-MTP semantics). Verify-only widths below 16 reuse the
+    two admitted associations: <= 12 -> SX_OPT_MTP_MOE_GROUPED_SPLIT_SMALL
+    (default 4, M8's), 13..15 -> 8 (M16's).
+    """
+    legacy = _GROUPED_DECODE_LEGACY_SPLIT.get(tokens)
+    if legacy is not None:
+        return legacy
+    if tokens > 16:
+        return int(
+            getattr(layer, "sm70_nvfp4_grouped32_split", _SX_MOE_GROUPED32_SPLIT)
+        )
+    if tokens <= 12:
+        return int(
+            getattr(
+                layer, "sx_mtp_grouped_split_small", _SX_MTP_MOE_GROUPED_SPLIT_SMALL
+            )
+        )
+    return _GROUPED_DECODE_LEGACY_SPLIT[16]
+
+
+def _grouped_decode_route(
+    layer, x: torch.Tensor, topk_ids: torch.Tensor
+) -> tuple[int, int] | None:
+    """(W13 split, rows per request) of an admitted grouped call, else None.
+
+    Rows per request is 1 for pure decode (the unchanged no-MTP admission)
+    and q for a batch-3a uniform MTP verify step. Local operator contract
+    plus CPU metadata only; no TP/KV/scheduler/model-name binding.
+    """
+    if not (getattr(layer, "sm70_nvfp4_grouped_decode", False) and x.ndim == 2):
+        return None
+    tokens = int(x.shape[0])
+    decode_width = _grouped_decode_width_ok(layer, tokens)
+    verify_q = _mtp_verify_grouped_q(layer, tokens)
+    if not (decode_width or verify_q):
+        return None
+    if not (
+        x.shape[1] == 2560
         and x.dtype == torch.float16
         and x.is_contiguous()
         and topk_ids.shape == (x.shape[0], 10)
         and topk_ids.dtype == torch.int32
         and topk_ids.is_contiguous()
-        and _grouped_decode_context_ok()
-    )
+    ):
+        return None
+    if decode_width and _grouped_decode_context_ok():
+        return _grouped_decode_width_split(layer, tokens), 1
+    if verify_q and _grouped_verify_context_ok(verify_q):
+        return _grouped_decode_width_split(layer, tokens), verify_q
+    return None
+
+
+def _use_grouped_decode(layer, x: torch.Tensor, topk_ids: torch.Tensor) -> bool:
+    """Local operator contract only; no TP/KV/scheduler/model-name binding."""
+    return _grouped_decode_route(layer, x, topk_ids) is not None
 
 
 def _grouped_decode_split(
     layer, x: torch.Tensor, topk_ids: torch.Tensor
 ) -> int | None:
     """W13 split of an admitted grouped-decode call, else None."""
-    if not _use_grouped_decode(layer, x, topk_ids):
-        return None
-    legacy = _GROUPED_DECODE_LEGACY_SPLIT.get(int(x.shape[0]))
-    if legacy is not None:
-        return legacy
-    return int(getattr(layer, "sm70_nvfp4_grouped32_split", _SX_MOE_GROUPED32_SPLIT))
+    route = _grouped_decode_route(layer, x, topk_ids)
+    return None if route is None else route[0]
+
+
+def _mtp_verify_route_table(layer, max_width: int = 40) -> dict[int, str]:
+    """Route of every uniform verify width W = B * q <= max_width of a
+    batch-3a MTP-lane layer, assuming a uniform verify forward (log/tests)."""
+    verify_q = _layer_mtp_verify_q(layer)
+    table: dict[int, str] = {}
+    if verify_q <= 1:
+        return table
+    for width in range(verify_q, max_width + 1, verify_q):
+        if getattr(layer, "sm70_nvfp4_grouped_decode", False) and (
+            _mtp_verify_grouped_q(layer, width)
+        ):
+            table[width] = f"grouped-split{_grouped_decode_width_split(layer, width)}"
+            continue
+        mtp5 = width == 5 and bool(
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE
+            or (getattr(layer, "sx_mtp_qpn_mtp5", False) and verify_q == 5)
+        )
+        split = None
+        if envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE:
+            split = (
+                _QWEN38_DYNAMIC_QPN_BATCH_W13_SPLIT_K
+                if envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE
+                else _QWEN38_QPN_BATCH_W13_SPLIT_K
+            ).get(width)
+            if split is None and getattr(layer, "sx_mtp_qpn_dynamic", False):
+                split = _QWEN38_DYNAMIC_QPN_BATCH_W13_SPLIT_K.get(width)
+        if mtp5:
+            # W13 through the MTP5 op at split 4 (the dynamic table's W5
+            # split too). W2 through the fused fixed-order batch reduce only
+            # when W5 is batch-admitted and that op is on (the same gates as
+            # _use_qwen38_qpn_batch_fused_w2); otherwise through the MTP5 op
+            # plus the Triton weighted reduce, i.e. 1Cat's MTP5 route.
+            fused_w2 = bool(
+                split is not None
+                and envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2
+                and sm70_ops.has_nvfp4_qpn_w2_reduce_dispatch()
+            )
+            table[width] = "qpn-mtp5-split4" + ("+batch-w2" if fused_w2 else "")
+        elif split is not None:
+            table[width] = f"qpn-split{split}"
+        else:
+            table[width] = "turbomind"
+    return table
 
 
 def _use_qwen38_qpn_batch_fused_w2(
@@ -727,9 +1126,20 @@ def _use_qwen38_qpn_mtp5_decode(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
 ) -> bool:
-    """Admit only the exact Qwen3.8 TP4 MTP4 verifier route."""
+    """Admit only the exact Qwen3.8 TP4 MTP4 verifier route.
+
+    Globally with VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE=1 (shape only,
+    as before); batch-3a MTP-lane layers with k = 4 (SX_OPT_MTP_MOE_DIRECT,
+    variable absent) in a uniform verify forward only.
+    """
+    enabled = envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE
+    lane = bool(
+        not enabled
+        and getattr(layer, "sx_mtp_qpn_mtp5", False)
+        and _layer_mtp_verify_q(layer) == 5
+    )
     return bool(
-        envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE
+        (enabled or lane)
         and x.shape == (5, 2560)
         and x.dtype == torch.float16
         and x.is_contiguous()
@@ -741,6 +1151,7 @@ def _use_qwen38_qpn_mtp5_decode(
         and int(layer.sm70_nvfp4_hidden_size) == 2560
         and int(layer.sm70_nvfp4_intermediate_size) == 160
         and int(layer.sm70_nvfp4_top_k) == 10
+        and (not lane or _grouped_verify_context_ok(5))
     )
 
 
@@ -1568,6 +1979,33 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             layer, layer.w13_tm_weight.device
         )
         layer.sm70_nvfp4_compact_grouped_max_slots = _COMPACT_GROUPED_MAX_SLOTS
+        # SX_OPT_MTP_MOE_ROUTES (batch 3a): verify-width routes of the SM70
+        # Qwen3.8 TP4 native-MTP lane. q = 1 + k, 0 outside the lane (then
+        # every attribute below is inert and the routes are unchanged).
+        mtp_verify_q = _sx_mtp_moe_verify_q(layer)
+        layer.sx_mtp_verify_q = mtp_verify_q
+        layer.sx_mtp_grouped = False  # set after the grouped admission below
+        layer.sx_mtp_grouped_min_tokens = _SX_MTP_MOE_GROUPED_MIN_TOKENS
+        layer.sx_mtp_grouped_split_small = _SX_MTP_MOE_GROUPED_SPLIT_SMALL
+        mtp_direct = bool(mtp_verify_q and _SX_OPT_MTP_MOE_DIRECT and not raw_scale)
+        mtp5_op = bool(mtp_direct and sm70_ops.has_nvfp4_qpn_mtp5_dispatch())
+        layer.sx_mtp_qpn_mtp5 = bool(
+            mtp5_op
+            and mtp_verify_q == 5
+            and "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE" not in os.environ
+        )
+        layer.sx_mtp_qpn_dynamic = bool(
+            mtp_direct
+            and "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE" not in os.environ
+            and envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE
+            and sm70_ops.has_nvfp4_qpn_m1_dispatch()
+        )
+        if mtp_direct and mtp_verify_q == 5 and not mtp5_op:
+            logger.warning_once(
+                "SX_OPT_MTP_MOE_DIRECT: the SM70 Qwen3.8 QPN-MTP5 op "
+                "(nvfp4_moe_qpn_mtp5_sm70_out) is absent; the W5 verify keeps "
+                "its previous route."
+            )
         grouped_requested = bool(
             envs.VLLM_SM70_NVFP4_MOE_GROUPED_DECODE
             and (num_experts, hidden, intermediate, layer.sm70_nvfp4_top_k)
@@ -1640,6 +2078,14 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             layer._nvfp4_grouped_total = torch.empty(
                 1, dtype=torch.int32, device=device
             )
+        # SX_OPT_MTP_MOE_GROUPED: uniform verify widths through the grouped
+        # route (non-legacy widths additionally need the v2 ops, checked per
+        # width in _mtp_verify_grouped_q).
+        layer.sx_mtp_grouped = bool(
+            mtp_verify_q and _SX_OPT_MTP_MOE_GROUPED and grouped_requested
+        )
+        if mtp_verify_q:
+            self._log_mtp_verify_routes(layer)
         self._allocate_graph_safe_decode_buffers(layer)
 
         del layer.w13_weight
@@ -1704,6 +2150,23 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 "SM70 GLM-5.3 exact fused q8 MoE permute enabled "
                 "(M8/K8/E288 stable sort and materialized expert rows)."
             )
+
+    @staticmethod
+    def _log_mtp_verify_routes(layer: RoutedExperts) -> None:
+        verify_q = _layer_mtp_verify_q(layer)
+        table = _mtp_verify_route_table(layer)
+        logger.info_once(
+            "SX_OPT_MTP_MOE_ROUTES: SM70 Qwen3.8 TP4 MTP lane (k=%d): uniform "
+            "verify MoE routes %s (wider: TurboMind); grouped %s, padded-row "
+            "masking %s, min width %d; eager iota %s.",
+            verify_q - 1,
+            ", ".join(f"W{w}={r}" for w, r in table.items()),
+            "on" if getattr(layer, "sx_mtp_grouped", False) else "off",
+            "on" if getattr(layer, "sm70_nvfp4_grouped_mask", False) else "off",
+            int(getattr(layer, "sx_mtp_grouped_min_tokens", 0)),
+            "on" if getattr(layer, "_nvfp4_sm70_eager_iota", None) is not None
+            else "off",
+        )
 
     def _allocate_graph_safe_decode_buffers(self, layer: RoutedExperts) -> None:
         device = layer.w13_tm_weight.device
@@ -1992,19 +2455,35 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         buffers = self._get_buffers(layer, num_tokens, indexed_w13)
         output = buffers["output"]
         slots = num_tokens * top_k
-        grouped_split = _grouped_decode_split(layer, x, topk_ids)
-        if grouped_split is not None:
+        grouped_route = _grouped_decode_route(layer, x, topk_ids)
+        if grouped_route is not None:
+            # rows_per_request: 1 = pure decode; q = batch-3a uniform verify.
+            grouped_split, rows_per_request = grouped_route
             grouped_v2_ops = getattr(layer, "_nvfp4_grouped_v2_ops", None)
             # SX_OPT_MOE_GROUPED_MASK: device view of the live decode-row
             # count (query_start_loc tail); None computes every row.
             live_rows = (
-                _grouped_decode_live_rows(x)
+                _grouped_decode_live_rows(x, rows_per_request)
                 if grouped_v2_ops is not None
                 and getattr(layer, "sm70_nvfp4_grouped_mask", False)
                 else None
             )
+            if rows_per_request > 1:
+                logger.info_once(
+                    "SX_OPT_MTP_MOE_GROUPED: SM70 grouped native-NVFP4 MoE for "
+                    "a uniform MTP verify step (tokens=%d, %d rows/request, "
+                    "W13 split%d, padded-row masking %s).",
+                    num_tokens,
+                    rows_per_request,
+                    grouped_split,
+                    "on" if live_rows is not None else "off",
+                )
+            # The legacy op only serves the 1Cat-admitted widths 8/16; every
+            # other admitted width (17..32, and verify widths below 16) is
+            # admitted only with the v2 ops present.
             if grouped_v2_ops is not None and (
-                num_tokens > 16 or live_rows is not None
+                num_tokens not in _GROUPED_DECODE_LEGACY_SPLIT
+                or live_rows is not None
             ):
                 w13_v2, w2_v2 = grouped_v2_ops
                 w13_v2(
@@ -2042,9 +2521,12 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                     "on" if live_rows is not None else "off",
                 )
                 return output
-            if num_tokens > 16:  # load time admits 17+ only with the v2 ops
+            if num_tokens not in _GROUPED_DECODE_LEGACY_SPLIT:
+                # Load time admits 17+ (and verify widths other than 8/16)
+                # only with the v2 ops.
                 raise RuntimeError(
-                    "SM70 grouped NVFP4 decode above 16 tokens needs the v2 ops."
+                    "SM70 grouped NVFP4 decode at widths other than 8/16 needs "
+                    "the v2 ops."
                 )
             sm70_ops.nvfp4_grouped_w13_sm70_out(
                 buffers["intermediate"],
@@ -2113,12 +2595,11 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             if direct_qpn_m1:
                 w13_split_k = _QWEN38_QPN_M1_W13_SPLIT_K
             elif direct_qpn_batch:
-                split_table = (
-                    _QWEN38_DYNAMIC_QPN_BATCH_W13_SPLIT_K
-                    if envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE
-                    else _QWEN38_QPN_BATCH_W13_SPLIT_K
-                )
-                w13_split_k = split_table[num_tokens]
+                # Same lookup as the admission (global table, or the dynamic
+                # table at batch-3a MTP-lane verify widths).
+                batch_split = _qwen38_qpn_batch_split(layer, num_tokens)
+                assert batch_split is not None
+                w13_split_k = batch_split
             else:
                 w13_split_k = _QWEN38_QPN_MTP5_W13_SPLIT_K
             logger.info_once(

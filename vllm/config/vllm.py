@@ -220,6 +220,113 @@ def _is_sm70_qwen38_nomtp_dual_compile_contract(
     )
 
 
+# SX batch 3a (lane-core; design_1 MTP-0/MTP-1/MTP-6, design_2 PF2, design_4
+# MTP-K5): the SM70 Qwen3.8-Flash-Next TP4 native-MTP lane. Speculative method
+# "mtp" with the Qwen4Exp MTP drafter on the exact Qwen3.8 TP4 *target* of the
+# no-MTP dual-compile contract gets that lane's auto defaults (FP16 M=1 GEMV,
+# fused GDN input, fused HC, shared-expert overlap, MoE add-allreduce/sum2),
+# the dual-compile lane (FULL uniform verify graphs are traced by the decode
+# compiler, so the batch-invariant SX_OPT_ROWS kernels and the M=1 kernels run
+# inside them; eager/mixed/PIECEWISE steps keep the main compile), split
+# verify/draft CUDA graphs, verify graphs for 17..24 requests and PW-1
+# PIECEWISE graphs for mixed/prefill steps (target and draft prefill).
+# Switches (read from os.environ; default on, "0" = 1.8.0-dev2 behaviour):
+#   SX_OPT_MTP_LANE=0            master: none of the above in the MTP lane
+#   SX_OPT_MTP_ROWS=0            no multi-row GEMV/GDN-input/HC kernels in the
+#                                MTP verify graphs (M=1 routes stay)
+#   SX_OPT_MTP_PW=0              no PW-1 PIECEWISE sizes in the MTP lane
+#   SX_OPT_MTP_PW_DRAFT=0        target PW-1 only (draft prefill stays eager)
+#   SX_OPT_MTP_GRAPH_MAX_REQS=N  largest verify-graph request count (default
+#                                24; 16 = the previous cap)
+#   SX_OPT_MTP_GRAPH_REQS=a,b,.. verify-graph request counts (default
+#                                1,2,3,4,6,8,12,16,20,24)
+# The no-MTP lane never reaches any of this (speculative_config is None).
+_SX_MTP_LANE_MAX_K = 7
+_SX_MTP_LANE_GRAPH_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16, 20, 24)
+_SX_MTP_LANE_GRAPH_MAX_REQS = 24
+_SX_MTP_LANE_GRAPH_MAX_REQS_LIMIT = 64
+
+
+def _sx_env_on(name: str) -> bool:
+    return os.environ.get(name, "1").strip() != "0"
+
+
+def _sx_mtp_lane_enabled() -> bool:
+    return _sx_env_on("SX_OPT_MTP_LANE")
+
+
+def _sx_mtp_pw_enabled() -> bool:
+    return _sx_mtp_lane_enabled() and _sx_env_on("SX_OPT_MTP_PW")
+
+
+def _sx_mtp_pw_draft_enabled() -> bool:
+    return _sx_mtp_pw_enabled() and _sx_env_on("SX_OPT_MTP_PW_DRAFT")
+
+
+def _is_sm70_qwen38_mtp_lane_contract(
+    model_config: Any,
+    speculative_config: Any,
+    parallel_config: Any,
+) -> bool:
+    """Admit the SM70 Qwen3.8 TP4 native-MTP lane (SX_OPT_MTP_LANE).
+
+    Method "mtp" with the Qwen4Exp MTP drafter, 1 <= k <= 7 uniform verify
+    rows (no tree / parallel drafting), standard (lossless) rejection
+    sampling, and the exact Qwen3.8 TP4 topology of the no-MTP dual-compile
+    contract on the target model. Callers that hold the draft model config
+    are resolved through ``speculative_config.target_model_config``.
+    Malformed or partial configs fail closed.
+    """
+    if (
+        not _sx_mtp_lane_enabled()
+        or speculative_config is None
+        or parallel_config is None
+        or getattr(speculative_config, "method", None) != "mtp"
+    ):
+        return False
+    try:
+        use_qwen4_exp_mtp = getattr(speculative_config, "use_qwen4_exp_mtp", None)
+        if not callable(use_qwen4_exp_mtp) or not use_qwen4_exp_mtp():
+            return False
+        num_spec = int(getattr(speculative_config, "num_speculative_tokens", 0) or 0)
+        state_tokens_fn = getattr(
+            speculative_config, "num_speculative_state_tokens", None
+        )
+        state_tokens = int(state_tokens_fn()) if callable(state_tokens_fn) else num_spec
+    except Exception:  # noqa: BLE001 - partial configs fail closed
+        return False
+    if not 1 <= num_spec <= _SX_MTP_LANE_MAX_K or state_tokens != num_spec:
+        return False
+    if getattr(speculative_config, "parallel_drafting", False):
+        return False
+    if getattr(speculative_config, "rejection_sample_method", "standard") != (
+        "standard"
+    ):
+        return False
+    for candidate in (
+        model_config,
+        getattr(speculative_config, "target_model_config", None),
+    ):
+        if candidate is not None and _is_sm70_qwen38_nomtp_dual_compile_contract(
+            candidate, None, parallel_config
+        ):
+            return True
+    return False
+
+
+def _is_sm70_qwen38_lane_contract(
+    model_config: Any,
+    speculative_config: Any,
+    parallel_config: Any,
+) -> bool:
+    """The no-MTP dual-compile contract or the native-MTP lane contract."""
+    return _is_sm70_qwen38_nomtp_dual_compile_contract(
+        model_config, speculative_config, parallel_config
+    ) or _is_sm70_qwen38_mtp_lane_contract(
+        model_config, speculative_config, parallel_config
+    )
+
+
 def _participating_cuda_device_ids(cfg: "VllmConfig") -> tuple[int, ...]:
     """Local device assignment used by UniProc/Multiproc and GPUWorker.
 
@@ -252,16 +359,18 @@ def _participating_cuda_device_ids(cfg: "VllmConfig") -> tuple[int, ...]:
     return tuple(range(start, start + parallel.local_world_size))
 
 
-def _apply_sm70_qwen38_nomtp_defaults(
-    cfg: "VllmConfig", *, is_sm70: bool
-) -> tuple[str, ...]:
-    """Complete the admitted NVFP4 baseline without global experimental defaults."""
-    if not is_sm70 or not _is_sm70_qwen38_nomtp_dual_compile_contract(
+def _sm70_qwen38_lane_qualified(cfg: "VllmConfig", *, is_sm70: bool) -> bool:
+    """The admitted NVFP4 serving contract of the SM70 Qwen3.8 TP4 lanes.
+
+    No-MTP dual-compile lane, or (SX batch 3a) the native-MTP lane of
+    _is_sm70_qwen38_mtp_lane_contract; both share the same deployment checks.
+    """
+    if not is_sm70 or not _is_sm70_qwen38_lane_contract(
         cfg.model_config, cfg.speculative_config, cfg.parallel_config
     ):
-        return ()
+        return False
     parallel = cfg.parallel_config
-    if (
+    return not (
         cfg.model_config.quantization != "modelopt_fp4"
         or cfg.lora_config is not None
         or parallel.enable_expert_parallel
@@ -270,7 +379,20 @@ def _apply_sm70_qwen38_nomtp_defaults(
         or parallel.nnodes_within_dp != 1
         or cfg.cache_config.cache_dtype not in ("auto", "float16")
         or cfg.cache_config.mamba_ssm_cache_dtype not in ("auto", "float32")
-    ):
+    )
+
+
+def _apply_sm70_qwen38_nomtp_defaults(
+    cfg: "VllmConfig", *, is_sm70: bool
+) -> tuple[str, ...]:
+    """Complete the admitted NVFP4 baseline without global experimental defaults.
+
+    SX batch 3a (MTP-0/MTP-1): the native-MTP lane receives the same defaults
+    (they were skipped whenever a speculative config was set) plus split
+    verify/draft CUDA graphs. SX_OPT_MTP_LANE=0 restores the previous MTP
+    behaviour (no defaults). Explicit environment overrides always win.
+    """
+    if not _sm70_qwen38_lane_qualified(cfg, is_sm70=is_sm70):
         return ()
 
     defaults = {
@@ -280,6 +402,10 @@ def _apply_sm70_qwen38_nomtp_defaults(
         "VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP": "1",
         "VLLM_SM70_MOE_ADD_ALLREDUCE": "1",
     }
+    if cfg.speculative_config is not None:
+        # MTP lane only (the lane contract admitted it): exact verify widths
+        # for the target and exact request counts for the draft decode.
+        defaults["VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS"] = "1"
     applied = []
     for name, value in defaults.items():
         if name not in os.environ:
@@ -500,6 +626,11 @@ def _sm70_qwen38_mixed_piecewise_sizes(
 
     Returns [] (previous behaviour) unless every contract below holds; the
     caller must still restrict the result to PIECEWISE descriptors.
+
+    SX batch 3a (MTP-6 / PF2): the native-MTP lane is admitted as well
+    (SX_OPT_MTP_PW); its mixed/prefill steps are the same prefill chunk plus
+    k+1 verify rows per decoding request, run by the same main compile. The
+    grid starts above the largest FULL verify size.
     """
     if not _sx_piecewise_mixed_enabled():
         return []
@@ -510,12 +641,19 @@ def _sm70_qwen38_mixed_piecewise_sizes(
     parallel_config = getattr(vllm_config, "parallel_config", None)
     scheduler_config = getattr(vllm_config, "scheduler_config", None)
     compilation_config = getattr(vllm_config, "compilation_config", None)
+    speculative_config = getattr(vllm_config, "speculative_config", None)
     if scheduler_config is None or compilation_config is None:
         return []
-    if not _is_sm70_qwen38_nomtp_dual_compile_contract(
-        model_config,
-        getattr(vllm_config, "speculative_config", None),
-        parallel_config,
+    if not (
+        _is_sm70_qwen38_nomtp_dual_compile_contract(
+            model_config, speculative_config, parallel_config
+        )
+        or (
+            _sx_mtp_pw_enabled()
+            and _is_sm70_qwen38_mtp_lane_contract(
+                model_config, speculative_config, parallel_config
+            )
+        )
     ):
         return []
     # Same lane as the FULL decode graphs: dual compile (the main backbone is
@@ -576,6 +714,136 @@ def _sm70_mtp_cudagraph_capture_sizes(
     }
     request_sizes.add(max_graph_reqs)
     return [decode_query_len * size for size in sorted(request_sizes)]
+
+
+def _sx_mtp_graph_max_reqs() -> int:
+    raw = os.environ.get("SX_OPT_MTP_GRAPH_MAX_REQS", "").strip()
+    if not raw:
+        return _SX_MTP_LANE_GRAPH_MAX_REQS
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning_once(
+            "Ignoring invalid SX_OPT_MTP_GRAPH_MAX_REQS=%r; using %d.",
+            raw,
+            _SX_MTP_LANE_GRAPH_MAX_REQS,
+        )
+        return _SX_MTP_LANE_GRAPH_MAX_REQS
+    return max(1, min(value, _SX_MTP_LANE_GRAPH_MAX_REQS_LIMIT))
+
+
+def _sx_mtp_graph_request_sizes() -> tuple[int, ...]:
+    raw = os.environ.get("SX_OPT_MTP_GRAPH_REQS", "").strip()
+    if not raw:
+        return _SX_MTP_LANE_GRAPH_REQUEST_SIZES
+    sizes: set[int] = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            value = int(item)
+        except ValueError:
+            logger.warning_once(
+                "Ignoring invalid SX_OPT_MTP_GRAPH_REQS entry %r.", item
+            )
+            continue
+        if 1 <= value <= _SX_MTP_LANE_GRAPH_MAX_REQS_LIMIT:
+            sizes.add(value)
+    return tuple(sorted(sizes)) or _SX_MTP_LANE_GRAPH_REQUEST_SIZES
+
+
+def _sm70_qwen38_mtp_lane_capture_sizes(
+    max_num_seqs: int,
+    decode_query_len: int,
+    max_num_batched_tokens: int | None = None,
+) -> list[int]:
+    """SX MTP-K5: FULL verify widths B*(k+1) of the Qwen3.8 native-MTP lane.
+
+    B runs over SX_OPT_MTP_GRAPH_REQS (default 1,2,3,4,6,8,12,16,20,24) up to
+    min(max_num_seqs, SX_OPT_MTP_GRAPH_MAX_REQS=24), always including B=1 and
+    the cap itself, so 17..24 running requests replay a FULL verify graph
+    instead of running eager (the previous cap was 16). The split draft
+    decode manager derives its exact request counts from the same list.
+
+    With max_num_batched_tokens the cap is also limited to the largest verify
+    batch the scheduler can form (max_num_batched_tokens // (k+1)): wider
+    widths could never be scheduled, and _set_cudagraph_sizes rejects a
+    maximum above max_num_batched_tokens. [] when not even B=1 fits.
+    """
+    query_len = max(int(decode_query_len), 1)
+    max_graph_reqs = min(max(int(max_num_seqs), 1), _sx_mtp_graph_max_reqs())
+    if max_num_batched_tokens is not None and int(max_num_batched_tokens) > 0:
+        max_graph_reqs = min(max_graph_reqs, int(max_num_batched_tokens) // query_len)
+        if max_graph_reqs < 1:
+            return []
+    request_sizes = {
+        size for size in _sx_mtp_graph_request_sizes() if size <= max_graph_reqs
+    }
+    request_sizes.update((1, max_graph_reqs))
+    return [query_len * size for size in sorted(request_sizes)]
+
+
+def _sx_mtp_lane_capture_sizes_override(
+    vllm_config: Any,
+    lane_admitted: bool,
+) -> list[int] | None:
+    """New auto capture sizes for the MTP lane, or None to keep the current.
+
+    Only an auto-derived list is replaced (the split or bounded speculative
+    default computed by arg_utils or by VllmConfig for this max_num_seqs and
+    query length); an operator-provided list or maximum is kept as is.
+    """
+    if not lane_admitted or vllm_config is None:
+        return None
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    if speculative_config is None or compilation_config is None:
+        return None
+    if scheduler_config is None:
+        return None
+    try:
+        decode_query_len = int(speculative_config.num_speculative_state_tokens()) + 1
+    except Exception:  # noqa: BLE001 - partial configs keep the current list
+        return None
+    max_num_seqs = int(getattr(scheduler_config, "max_num_seqs", 0) or 0)
+    if decode_query_len <= 1 or max_num_seqs <= 0:
+        return None
+    current = compilation_config.cudagraph_capture_sizes
+    current_max = compilation_config.max_cudagraph_capture_size
+    if current is None:
+        if current_max is not None:
+            return None
+    else:
+        current_sorted = sorted({int(size) for size in current})
+        auto_lists = (
+            _sm70_mtp_cudagraph_capture_sizes(max_num_seqs, decode_query_len),
+            _sm70_speculative_cudagraph_capture_sizes(max_num_seqs, decode_query_len),
+        )
+        if not any(current_sorted == sorted(set(auto)) for auto in auto_lists):
+            return None
+        if current_max is not None and int(current_max) != current_sorted[-1]:
+            return None
+    max_num_batched_tokens = int(
+        getattr(scheduler_config, "max_num_batched_tokens", 0) or 0
+    )
+    verifier_sizes = _sm70_qwen38_mtp_lane_capture_sizes(
+        max_num_seqs, decode_query_len, max_num_batched_tokens or None
+    )
+    if not verifier_sizes:
+        return None
+    if envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS:
+        return verifier_sizes
+    # Bounded shared list: the auxiliary sizes too must fit the token budget.
+    return sorted(
+        {
+            size
+            for size in _SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES
+            if not max_num_batched_tokens or size <= max_num_batched_tokens
+        }
+        | set(verifier_sizes)
+    )
 
 
 def _configure_sm70_glm5_dflash_tp4_push_allreduce(
@@ -2102,6 +2370,9 @@ class VllmConfig:
             and envs.VLLM_SM70_FLASH_ATTN_V100
             and sm70_flash_v100_backend
         )
+        # SX batch 3a: set when the SM70 Qwen3.8 native-MTP lane receives its
+        # defaults below; gates the MTP-K5 capture-size list further down.
+        sx_mtp_lane_admitted = False
         if sm70_flash_v100_baseline:
             if (
                 self.model_config is not None
@@ -2202,20 +2473,34 @@ class VllmConfig:
                 and not sm70_no_compile_decode_graph_requested
                 and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
             ):
+                sm70_participating = all(
+                    current_platform.is_device_capability((7, 0), device_id=i)
+                    for i in _participating_cuda_device_ids(self)
+                )
                 for env_name in _apply_sm70_qwen38_nomtp_defaults(
                     self,
-                    is_sm70=all(
-                        current_platform.is_device_capability((7, 0), device_id=i)
-                        for i in _participating_cuda_device_ids(self)
-                    ),
+                    is_sm70=sm70_participating,
                 ):
-                    logger.info_once(
-                        "Auto-setting %s=1 for the quality-qualified SM70 "
-                        "Qwen3.8 NVFP4 TP4 no-MTP path. Set it explicitly to override.",
-                        env_name,
-                    )
+                    if self.speculative_config is None:
+                        logger.info_once(
+                            "Auto-setting %s=1 for the quality-qualified SM70 "
+                            "Qwen3.8 NVFP4 TP4 no-MTP path. Set it explicitly "
+                            "to override.",
+                            env_name,
+                        )
+                    else:
+                        logger.info_once(
+                            "Auto-setting %s=1 for the SM70 Qwen3.8 NVFP4 TP4 "
+                            "native-MTP lane (SX_OPT_MTP_LANE). Set it "
+                            "explicitly to override.",
+                            env_name,
+                        )
+                sx_mtp_lane_admitted = (
+                    self.speculative_config is not None
+                    and _sm70_qwen38_lane_qualified(self, is_sm70=sm70_participating)
+                )
             if (
-                _is_sm70_qwen38_nomtp_dual_compile_contract(
+                _is_sm70_qwen38_lane_contract(
                     self.model_config,
                     self.speculative_config,
                     self.parallel_config,
@@ -2229,10 +2514,20 @@ class VllmConfig:
                 and "VLLM_SM70_QWEN38_DUAL_COMPILE" not in os.environ
             ):
                 os.environ["VLLM_SM70_QWEN38_DUAL_COMPILE"] = "1"
-                logger.info_once(
-                    "Auto-enabling the SM70 Qwen3.8 dual-compile lane: "
-                    "large prefill and FULL decode graphs share one model."
-                )
+                if self.speculative_config is None:
+                    logger.info_once(
+                        "Auto-enabling the SM70 Qwen3.8 dual-compile lane: "
+                        "large prefill and FULL decode graphs share one model."
+                    )
+                else:
+                    logger.info_once(
+                        "Auto-enabling the SM70 Qwen3.8 dual-compile lane for "
+                        "native MTP (SX_OPT_MTP_LANE): FULL uniform verify "
+                        "graphs use the decode compiler (M=1 and exact "
+                        "multi-row routes); prefill/mixed steps use the no-MTP "
+                        "main-compile semantics; the drafter keeps its "
+                        "single-compile decode semantics."
+                    )
             if (
                 _is_sm70_qwen38_nomtp_dual_compile_contract(
                     self.model_config,
@@ -2293,6 +2588,14 @@ class VllmConfig:
                 self.compilation_config.cudagraph_mode = (
                     CUDAGraphMode.FULL_AND_PIECEWISE
                 )
+                # SX batch 3a: an operator --max-cudagraph-capture-size given
+                # without a list (arg_utils then leaves both to this block) is
+                # an operator maximum; the MTP-K5 override below keeps it.
+                sx_operator_max_only = (
+                    self.compilation_config.cudagraph_capture_sizes is None
+                    and self.compilation_config.max_cudagraph_capture_size
+                    is not None
+                )
                 if self.compilation_config.cudagraph_capture_sizes is None:
                     cudagraph_capture_sizes = _sm70_nomtp_cudagraph_capture_sizes(
                         self.scheduler_config.max_num_seqs
@@ -2350,6 +2653,26 @@ class VllmConfig:
                         )
                     self.compilation_config.cudagraph_capture_sizes = (
                         cudagraph_capture_sizes
+                    )
+                # SX batch 3a (MTP-K5): the native-MTP lane replaces an
+                # auto-derived list with verify widths B*(k+1) up to 24
+                # requests (operator lists and maxima are kept).
+                sx_mtp_capture_sizes = _sx_mtp_lane_capture_sizes_override(
+                    self, sx_mtp_lane_admitted and not sx_operator_max_only
+                )
+                if sx_mtp_capture_sizes is not None:
+                    self.compilation_config.cudagraph_capture_sizes = (
+                        sx_mtp_capture_sizes
+                    )
+                    self.compilation_config.max_cudagraph_capture_size = max(
+                        sx_mtp_capture_sizes
+                    )
+                    logger.info_once(
+                        "Using SM70 Qwen3.8 native-MTP lane verify cudagraph "
+                        "token shapes %s (SX_OPT_MTP_GRAPH_MAX_REQS / "
+                        "SX_OPT_MTP_GRAPH_REQS; SX_OPT_MTP_LANE=0 restores the "
+                        "previous list).",
+                        tuple(sx_mtp_capture_sizes),
                     )
                 if self.compilation_config.max_cudagraph_capture_size is None:
                     self.compilation_config.max_cudagraph_capture_size = max(

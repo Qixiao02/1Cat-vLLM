@@ -1216,6 +1216,308 @@ def should_moe_wna16_use_cuda(
     )
 
 
+# ---------------------------------------------------------------------------
+# SX batch-3 "draft" group (design_4 MTP-K1 / design_1 MTP-7): exact-shape SM70
+# Triton tile table for the Qwen3.8 Flash-Next TP4 MTP draft experts.
+#
+# The MTP draft keeps 512 BF16 (FP16 at runtime) routed experts; TP4 shards
+# the checkpoint-global I640 to I160 per rank, so every draft MoE call has the
+# local shape (E, N, K, topk) = (512, 160, 2560, 10).  1Cat tuned only M in
+# {1, 5} (BM2/BN128/BK64/G1, 4 warps, 3 stages).  Every other draft width
+# (draft decode M = B, draft prefill M = B*(k+1), mixed steps) fell back to
+# the 0.0.3 tile BM16/BN32/BK64, which 1Cat measured 5.26x slower at M5 and
+# which took 1.15 / 3.3 / 11.5 ms per draft step at C1 / C4 / C8.
+#
+# Switches (os.environ; the parsed table is cached, see
+# sx_mtp_draft_tiles_cache_clear()):
+#   SX_OPT_MTP_DRAFT_TILES=1      "0" = previous behaviour (1Cat tile at M1/M5,
+#                                  0.0.3 tile elsewhere).
+#   SX_OPT_MTP_DRAFT_TILES_TABLE  inline table, e.g.
+#                                  "1-32:2x128x64x4x3,33-128:4x128x64x4x3"
+#                                  (M range : BMxBNxBKxWARPSxSTAGES[xGROUP_M]).
+#   SX_OPT_MTP_DRAFT_TILES_FILE   JSON table (sx_tests/b3-draft/
+#                                  sweep_mtp_draft_tiles.py --emit-table).
+# Precedence: TABLE > FILE > configs/<_SX_MTP_DRAFT_TABLE_FILE> > built-in.
+# A width that no entry covers keeps the previous behaviour, and
+# VLLM_SM70_MTP_MOE_TUNED_CONFIG=0 / force_sm70_mtp_moe_legacy_config() still
+# restore the 0.0.3 tile for every width.
+#
+# Scope: the table is consulted only after arm_sm70_mtp_draft_moe_tiles() ran,
+# which Qwen4ExpMTP does under the exact SM70 TP4 FP16 Qwen3.8 MTP contract
+# (speculative method "mtp").  Processes without an MTP drafter (the no-MTP
+# production lane) never arm it.  The target experts are NVFP4 (TurboMind),
+# so only draft proposals can change; rejection sampling is untouched, which
+# keeps speculative decoding lossless.
+#
+# Numerics: SPLIT_K is forced to 1 and every built-in entry keeps
+# BLOCK_SIZE_K = 64, the legacy K-chunk order.  1Cat observed bitwise-equal
+# rows for BM2/BN128 vs BM16/BN32 at M1/M5 (docs/design/
+# sm70_qwen38_flash_next_nvfp4.md); the SX tests report it per width.  M1 and
+# M5 keep exactly 1Cat's tile, so the C1 k=4 draft is unchanged.
+# ---------------------------------------------------------------------------
+_SX_MTP_DRAFT_SHAPE = (512, 160, 2560, 10)
+_SX_MTP_DRAFT_TABLE_FILE = "sx_sm70_mtp_draft_tiles_E512_N160_K2560_topk10.json"
+_SX_MTP_DRAFT_1CAT_TILE: dict[str, int] = {
+    "BLOCK_SIZE_M": 2,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 64,
+    "GROUP_SIZE_M": 1,
+    "SPLIT_K": 1,
+    "num_warps": 4,
+    "num_stages": 3,
+}
+# V100 sweep (b3a validation, 2026-09-27; sx_tests/b3-draft/
+# sweep_mtp_draft_tiles.py on the real Swift 1.5 MTP experts, TP rank 0, cold
+# weights, CUDA graphs of 8 routings; M 1..2048):
+# - M1..224: 1Cat's tile BM2/BN128/BK64/w4/s3 is best or within 2% at every
+#   swept width (3.2-5.0x faster than the 0.0.3 tile at M2..128; 2.4-2.8x at
+#   M160/192).  The previous BM4 guess for M33..128 was 1.13-1.56x slower.
+#   M1 keeps exactly 1Cat's tile (BN64/s2 was 6% faster there, 8 us/step,
+#   not worth a separate Triton variant and a draft numerics change).
+# - M225..448 (draft prefill of short prompts / mixed steps): BM4/BN64/BK64/
+#   w4/s2, 6-10% faster than BM2 at M256/384 (2.1x / 1.5x the 0.0.3 tile).
+# - M449..2048: BM16/BN64/BK64/w4/s3, 1.1-2.3x the 0.0.3 tile (M > 512 used
+#   BM64/BN64/BK32/G8).  Wider draft prefill chunks keep the previous tile.
+# One tile per range keeps the Triton variant count small; the draft FULL /
+# PIECEWISE captures (verify widths, B, and PW sizes 128..1024) warm them.
+_SX_MTP_DRAFT_BUILTIN_TABLE: tuple[tuple[int, int, dict[str, int]], ...] = (
+    (1, 224, dict(_SX_MTP_DRAFT_1CAT_TILE)),
+    (
+        225,
+        448,
+        {
+            **_SX_MTP_DRAFT_1CAT_TILE,
+            "BLOCK_SIZE_M": 4,
+            "BLOCK_SIZE_N": 64,
+            "num_stages": 2,
+        },
+    ),
+    (449, 2048, {**_SX_MTP_DRAFT_1CAT_TILE, "BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64}),
+)
+_SX_MTP_DRAFT_TILE_ALLOWED: dict[str, tuple[int, ...]] = {
+    "BLOCK_SIZE_M": (2, 4, 8, 16, 32, 64, 128),
+    "BLOCK_SIZE_N": (16, 32, 64, 128, 256),
+    "BLOCK_SIZE_K": (16, 32, 64, 128, 256),
+    "num_warps": (1, 2, 4, 8),
+}
+_SX_MTP_DRAFT_TABLE_META_KEYS = frozenset(
+    ("shape", "device", "source", "triton_version", "table", "notes")
+)
+_sx_mtp_draft_tiles_armed = False
+
+
+def sx_mtp_draft_tiles_enabled() -> bool:
+    return os.environ.get("SX_OPT_MTP_DRAFT_TILES", "1").strip() != "0"
+
+
+def _sx_tile_str(tile: dict[str, int]) -> str:
+    return (
+        f"BM{tile['BLOCK_SIZE_M']}/BN{tile['BLOCK_SIZE_N']}"
+        f"/BK{tile['BLOCK_SIZE_K']}/G{tile['GROUP_SIZE_M']}"
+        f"/w{tile['num_warps']}/s{tile['num_stages']}"
+    )
+
+
+def _sx_normalize_mtp_draft_tile(raw: Any) -> dict[str, int] | None:
+    """Validate one table entry; SPLIT_K is always 1 (K order per row)."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        tile = {
+            "BLOCK_SIZE_M": int(raw["BLOCK_SIZE_M"]),
+            "BLOCK_SIZE_N": int(raw["BLOCK_SIZE_N"]),
+            "BLOCK_SIZE_K": int(raw.get("BLOCK_SIZE_K", 64)),
+            "GROUP_SIZE_M": int(raw.get("GROUP_SIZE_M", 1)),
+            "SPLIT_K": 1,
+            "num_warps": int(raw.get("num_warps", 4)),
+            "num_stages": int(raw.get("num_stages", 3)),
+        }
+        split_k = int(raw.get("SPLIT_K", 1))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if split_k != 1:
+        return None
+    for key, allowed in _SX_MTP_DRAFT_TILE_ALLOWED.items():
+        if tile[key] not in allowed:
+            return None
+    if not (1 <= tile["GROUP_SIZE_M"] <= 64 and 1 <= tile["num_stages"] <= 8):
+        return None
+    return tile
+
+
+def _sx_parse_m_range(spec: Any) -> tuple[int, int] | None:
+    try:
+        if isinstance(spec, bool):
+            return None
+        if isinstance(spec, int):
+            lo = hi = spec
+        elif isinstance(spec, (list, tuple)) and len(spec) == 2:
+            lo, hi = int(spec[0]), int(spec[1])
+        elif isinstance(spec, str):
+            first, sep, last = spec.strip().partition("-")
+            lo = int(first)
+            hi = int(last) if sep else lo
+        else:
+            return None
+    except (TypeError, ValueError):
+        return None
+    if lo < 1 or hi < lo:
+        return None
+    return lo, hi
+
+
+def _sx_build_mtp_draft_table(
+    entries: list[tuple[Any, Any]], source: str
+) -> tuple[tuple[int, int, dict[str, int]], ...]:
+    table: list[tuple[int, int, dict[str, int]]] = []
+    for spec, raw in entries:
+        m_range = _sx_parse_m_range(spec)
+        tile = _sx_normalize_mtp_draft_tile(raw)
+        if m_range is None or tile is None:
+            logger.warning(
+                "Ignoring invalid SX MTP draft MoE tile entry %r: %r (%s).",
+                spec,
+                raw,
+                source,
+            )
+            continue
+        table.append((m_range[0], m_range[1], tile))
+    table.sort(key=_sx_mtp_draft_entry_order)
+    return tuple(table)
+
+
+def _sx_mtp_draft_entry_order(entry: tuple[int, int, dict[str, int]]) -> tuple:
+    # The narrowest matching entry wins (exact widths before ranges).
+    return (entry[1] - entry[0], entry[0])
+
+
+def _sx_parse_inline_mtp_draft_table(
+    text: str,
+) -> tuple[tuple[int, int, dict[str, int]], ...]:
+    entries: list[tuple[Any, Any]] = []
+    for item in text.replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        spec, sep, dims = item.partition(":")
+        values = dims.lower().split("x") if sep else []
+        raw: Any = None
+        if len(values) in (5, 6):
+            keys = ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K")
+            keys += ("num_warps", "num_stages", "GROUP_SIZE_M")
+            raw = dict(zip(keys, values))
+        entries.append((spec, raw))
+    return _sx_build_mtp_draft_table(entries, "SX_OPT_MTP_DRAFT_TILES_TABLE")
+
+
+def _sx_load_mtp_draft_table_file(
+    path: str,
+) -> tuple[tuple[int, int, dict[str, int]], ...]:
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as err:
+        logger.warning("Cannot read SX MTP draft MoE tile table %s: %s", path, err)
+        return ()
+    if not isinstance(data, dict):
+        logger.warning("SX MTP draft MoE tile table %s is not an object.", path)
+        return ()
+    shape = data.get("shape")
+    if shape is not None:
+        try:
+            shape_ok = tuple(int(v) for v in shape) == _SX_MTP_DRAFT_SHAPE
+        except (TypeError, ValueError):
+            shape_ok = False
+        if not shape_ok:
+            logger.warning(
+                "SX MTP draft MoE tile table %s is for shape %r, not %r; ignored.",
+                path,
+                shape,
+                _SX_MTP_DRAFT_SHAPE,
+            )
+            return ()
+    rows = data.get("table")
+    if isinstance(rows, list):
+        entries = [
+            (row.get("m"), row.get("config")) if isinstance(row, dict) else (row, None)
+            for row in rows
+        ]
+    else:
+        # vLLM-style {"<M>" | "<lo>-<hi>": config} mapping.
+        entries = [
+            (key, value)
+            for key, value in data.items()
+            if key not in _SX_MTP_DRAFT_TABLE_META_KEYS and not key.startswith("_")
+        ]
+    return _sx_build_mtp_draft_table(entries, path)
+
+
+def _sx_default_mtp_draft_table_path() -> str:
+    return os.path.join(
+        os.path.dirname(os.path.realpath(__file__)),
+        "configs",
+        _SX_MTP_DRAFT_TABLE_FILE,
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def sx_mtp_draft_tile_table() -> tuple[
+    str, tuple[tuple[int, int, dict[str, int]], ...]
+]:
+    """Return (source, ((m_lo, m_hi, tile), ...)) with the narrowest first."""
+    inline = os.environ.get("SX_OPT_MTP_DRAFT_TILES_TABLE", "").strip()
+    if inline:
+        table = _sx_parse_inline_mtp_draft_table(inline)
+        if table:
+            return "SX_OPT_MTP_DRAFT_TILES_TABLE", table
+        logger.warning("SX_OPT_MTP_DRAFT_TILES_TABLE has no valid entry; ignored.")
+    paths = []
+    override = os.environ.get("SX_OPT_MTP_DRAFT_TILES_FILE", "").strip()
+    if override:
+        if os.path.exists(override):
+            paths.append(override)
+        else:
+            logger.warning("SX_OPT_MTP_DRAFT_TILES_FILE=%s does not exist.", override)
+    paths.append(_sx_default_mtp_draft_table_path())
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        table = _sx_load_mtp_draft_table_file(path)
+        if table:
+            return path, table
+    return "built-in", tuple(
+        sorted(_SX_MTP_DRAFT_BUILTIN_TABLE, key=_sx_mtp_draft_entry_order)
+    )
+
+
+def sx_mtp_draft_tiles_cache_clear() -> None:
+    sx_mtp_draft_tile_table.cache_clear()
+
+
+def arm_sm70_mtp_draft_moe_tiles(armed: bool = True) -> bool:
+    """Admit the draft tile table in this process (Qwen4ExpMTP contract)."""
+    global _sx_mtp_draft_tiles_armed
+    _sx_mtp_draft_tiles_armed = bool(armed)
+    if _sx_mtp_draft_tiles_armed and sx_mtp_draft_tiles_enabled():
+        source, table = sx_mtp_draft_tile_table()
+        logger.info_once(
+            "SX MTP draft MoE tile table armed (SX_OPT_MTP_DRAFT_TILES, %s): %s",
+            source,
+            "; ".join(f"M{lo}-{hi} {_sx_tile_str(tile)}" for lo, hi, tile in table),
+        )
+    return _sx_mtp_draft_tiles_armed
+
+
+def _sx_mtp_draft_tile(M: int) -> dict[str, int] | None:
+    if not _sx_mtp_draft_tiles_armed or not sx_mtp_draft_tiles_enabled():
+        return None
+    _, table = sx_mtp_draft_tile_table()
+    for lo, hi, tile in table:
+        if lo <= M <= hi:
+            return dict(tile)
+    return None
+
+
 def _get_sm70_mtp_moe_decode_config(
     M: int,
     E: int,
@@ -1226,6 +1528,10 @@ def _get_sm70_mtp_moe_decode_config(
     """Return graph-tuned exact-shape SM70 MTP tiles."""
     if _force_sm70_mtp_moe_legacy_config or not envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG:
         return None
+    if (E, N, K, topk) == _SX_MTP_DRAFT_SHAPE:
+        sx_tile = _sx_mtp_draft_tile(M)
+        if sx_tile is not None:
+            return sx_tile
     if (E, N, K, topk) == (256, 128, 2048, 8) and 2 <= M <= 16:
         # Qwen3.6 TP4 shards the checkpoint-global I512 expert width to I128
         # per rank. M2-M16 all select this tile in the exact local-shape graph

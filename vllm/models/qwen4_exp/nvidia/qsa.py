@@ -15,6 +15,7 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
 )
@@ -60,14 +61,172 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa_cache import QSAForwardMetadata
 from .indexer_qsa import QSAIndexer
 
+logger = init_logger(__name__)
+
 # SX_OPT_QSA_HOST_METADATA (default "1"; "0" = baseline): attach host copies of
 # query_start_loc and seq_lens to the QSA main-attention metadata so the QSA
 # ops can size launches without a device->host sync (see the SX_OPT_QSA_*
-# switches in ops/qsa.py). Only attached without speculative decoding, where
-# seq_lens_cpu_upper_bound is exact for every row.
+# switches in ops/qsa.py). Attached without speculative decoding, where
+# seq_lens_cpu_upper_bound is exact for every row, and (batch 3a,
+# SX_OPT_QSA_MTP_HOST_METADATA, default "1") in the admitted MTP lane, where
+# only the requests that may carry optimistic lengths are masked (see
+# _sx_qsa_exact_prefill_seq_lens).
 _SX_OPT_QSA_HOST_METADATA = os.environ.get("SX_OPT_QSA_HOST_METADATA", "1") != "0"
+_SX_OPT_QSA_MTP_HOST_METADATA = (
+    os.environ.get("SX_OPT_QSA_MTP_HOST_METADATA", "1") != "0"
+)
 _SX_QSA_QUERY_START_LOC_CPU = "sx_qsa_query_start_loc_cpu"
 _SX_QSA_SEQ_LENS_CPU = "sx_qsa_seq_lens_cpu"
+# The Qwen4Exp MTP proposer runs 1..7 sequential draft steps.
+_SX_QSA_MTP_MAX_K = 7
+
+
+def _sx_qsa_local_mtp_lane_contract(vllm_config: object) -> bool:
+    """Fallback MTP-lane contract when vllm/config/vllm.py lacks the shared one.
+
+    The same checks as _is_sm70_qwen38_mtp_lane_contract: the SX_OPT_MTP_LANE
+    master switch, the Qwen4Exp MTP proposer with 1 <= k <= 7 sequential
+    drafts (as many state tokens as drafts, i.e. no tree verify), standard
+    rejection sampling, and the no-MTP dual-compile topology (Qwen3.8 FP16
+    TP4) on the target model config. Malformed configs fail closed.
+    """
+
+    # Same master switch as vllm/config/vllm.py::_sx_mtp_lane_enabled, so
+    # SX_OPT_MTP_LANE=0 also disables the QSA MTP-lane items when only the
+    # QSA files are overlaid on an image without the shared contract.
+    if os.environ.get("SX_OPT_MTP_LANE", "1").strip() == "0":
+        return False
+    spec = getattr(vllm_config, "speculative_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    if spec is None or parallel_config is None:
+        return False
+    try:
+        use_qwen4_exp_mtp = getattr(spec, "use_qwen4_exp_mtp", None)
+        if not callable(use_qwen4_exp_mtp) or not use_qwen4_exp_mtp():
+            return False
+        num_spec = int(getattr(spec, "num_speculative_tokens", 0) or 0)
+        state_tokens_fn = getattr(spec, "num_speculative_state_tokens", None)
+        state_tokens = int(state_tokens_fn()) if callable(state_tokens_fn) else num_spec
+    except Exception:  # noqa: BLE001 - partial configs fail closed
+        return False
+    if (
+        getattr(spec, "method", None) != "mtp"
+        or not 1 <= num_spec <= _SX_QSA_MTP_MAX_K
+        or state_tokens != num_spec
+        or getattr(spec, "parallel_drafting", False)
+        or getattr(spec, "rejection_sample_method", "standard") != "standard"
+    ):
+        return False
+    from vllm.config.vllm import _is_sm70_qwen38_nomtp_dual_compile_contract
+
+    return any(
+        candidate is not None
+        and _is_sm70_qwen38_nomtp_dual_compile_contract(
+            candidate, None, parallel_config
+        )
+        for candidate in (
+            getattr(vllm_config, "model_config", None),
+            getattr(spec, "target_model_config", None),
+        )
+    )
+
+
+def _sx_qsa_mtp_lane_contract(vllm_config: object) -> bool:
+    """Whether the QSA MTP-lane fast paths apply to this configuration.
+
+    speculative_config.method == "mtp" with the Qwen4Exp MTP drafter on the
+    admitted Qwen3.8 TP4 topology, on SM70: the shared
+    _is_sm70_qwen38_mtp_lane_contract (which also honours SX_OPT_MTP_LANE)
+    when vllm/config/vllm.py provides it, otherwise the same local checks.
+    """
+
+    spec = getattr(vllm_config, "speculative_config", None)
+    if spec is None or getattr(spec, "method", None) != "mtp":
+        return False
+    try:
+        from vllm.config.vllm import _is_sm70_qwen38_mtp_lane_contract
+    except ImportError:
+        admitted = _sx_qsa_local_mtp_lane_contract(vllm_config)
+    else:
+        admitted = _is_sm70_qwen38_mtp_lane_contract(
+            getattr(vllm_config, "model_config", None),
+            spec,
+            getattr(vllm_config, "parallel_config", None),
+        )
+    return bool(admitted) and current_platform.is_device_capability(70)
+
+
+def _sx_qsa_mtp_verify_rows(vllm_config: object) -> int:
+    """Query rows of one MTP verify request: 1 + num_speculative_tokens."""
+
+    spec = getattr(vllm_config, "speculative_config", None)
+    return 1 + int(getattr(spec, "num_speculative_tokens", 0) or 0)
+
+
+def _sx_qsa_mtp_page4_graph_rows(vllm_config: object) -> int:
+    """Widest FULL CUDA graph of the MTP lane (target verify / draft prefill).
+
+    SX_OPT_QSA_MTP_PAGE4_GRAPH_ROWS overrides it (0 = no pre-capture reserve).
+    Otherwise the upper bound of every capture-size rewrite: the configured
+    maximum, the listed sizes and max_num_seqs * (1 + k), capped by
+    max_num_batched_tokens. 0 without CUDA graphs.
+    """
+
+    override = os.environ.get("SX_OPT_QSA_MTP_PAGE4_GRAPH_ROWS", "").strip()
+    if override:
+        try:
+            return max(0, int(override))
+        except ValueError:
+            pass
+    model_config = getattr(vllm_config, "model_config", None)
+    if getattr(model_config, "enforce_eager", False):
+        return 0
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    mode = getattr(compilation_config, "cudagraph_mode", None)
+    has_full = getattr(mode, "has_full_cudagraphs", None)
+    if callable(has_full) and not has_full():
+        return 0
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    candidates = [
+        int(getattr(compilation_config, "max_cudagraph_capture_size", 0) or 0),
+        int(getattr(scheduler_config, "max_num_seqs", 0) or 0)
+        * _sx_qsa_mtp_verify_rows(vllm_config),
+    ]
+    candidates += [
+        int(size)
+        for size in (getattr(compilation_config, "cudagraph_capture_sizes", None) or ())
+    ]
+    rows = max(candidates)
+    max_tokens = int(getattr(scheduler_config, "max_num_batched_tokens", 0) or 0)
+    if max_tokens > 0:
+        rows = min(rows, max_tokens)
+    return max(0, rows)
+
+
+def _sx_qsa_exact_prefill_seq_lens(
+    query_start_loc_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    verify_rows: int,
+) -> torch.Tensor:
+    """Host sequence lengths with every possibly optimistic entry set to -1.
+
+    With speculative decoding the scheduler advances num_computed_tokens as if
+    every draft of the previous step had been accepted, so
+    seq_lens_cpu_upper_bound (num_computed + num_scheduled) is only an upper
+    bound for a request that carried drafts. Such a request schedules at most
+    1 + num_speculative_tokens query rows (its verify rows). A request with
+    more rows is a prompt or recompute chunk whose previous step, if any, was
+    a chunk without drafts, so its host length is exact; the QSA ops only
+    read host lengths of requests with >= 512 rows. -1 marks "unknown": the
+    width planners in ops/qsa.py reject seq_len < rows and keep the device
+    path for that request. Host arrays only (a few microseconds per step);
+    never touches the device and never modifies the runner's buffers.
+    """
+
+    starts = query_start_loc_cpu.numpy()
+    exact = seq_lens_cpu.numpy().copy()
+    exact[(starts[1:] - starts[:-1]) <= verify_rows] = -1
+    return torch.from_numpy(exact)
 
 
 def _sx_qsa_host_metadata(
@@ -107,22 +266,36 @@ class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
                 and seq_lens_cpu.shape[0] >= num_reqs
             ):
                 # Host tensors built for this step only; never read on device.
-                setattr(
-                    metadata,
-                    _SX_QSA_QUERY_START_LOC_CPU,
-                    query_start_loc_cpu[: num_reqs + 1],
-                )
-                setattr(metadata, _SX_QSA_SEQ_LENS_CPU, seq_lens_cpu[:num_reqs])
+                query_start_loc_cpu = query_start_loc_cpu[: num_reqs + 1]
+                seq_lens_cpu = seq_lens_cpu[:num_reqs]
+                verify_rows = getattr(self, "_sx_host_metadata_verify_rows", 0)
+                if verify_rows:
+                    # MTP lane: keep only the exact (prefill) lengths.
+                    seq_lens_cpu = _sx_qsa_exact_prefill_seq_lens(
+                        query_start_loc_cpu, seq_lens_cpu, verify_rows
+                    )
+                setattr(metadata, _SX_QSA_QUERY_START_LOC_CPU, query_start_loc_cpu)
+                setattr(metadata, _SX_QSA_SEQ_LENS_CPU, seq_lens_cpu)
         return metadata
 
     def _sx_host_metadata_allowed(self) -> bool:
         allowed = getattr(self, "_sx_host_metadata_allowed_cache", None)
         if allowed is None:
             vllm_config = getattr(self, "vllm_config", None)
-            allowed = bool(
-                vllm_config is not None
-                and getattr(vllm_config, "speculative_config", None) is None
-            )
+            spec = getattr(vllm_config, "speculative_config", None)
+            verify_rows = 0
+            if vllm_config is None:
+                allowed = False
+            elif spec is None:
+                allowed = True
+            else:
+                allowed = bool(
+                    _SX_OPT_QSA_MTP_HOST_METADATA
+                    and _sx_qsa_mtp_lane_contract(vllm_config)
+                )
+                if allowed:
+                    verify_rows = _sx_qsa_mtp_verify_rows(vllm_config)
+            self._sx_host_metadata_verify_rows = verify_rows
             self._sx_host_metadata_allowed_cache = allowed
         return allowed
 
@@ -211,6 +384,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
         query_start_loc_cpu: torch.Tensor | None = None,
+        sx_mtp_lane=None,
     ) -> torch.Tensor:
         del key, value
         if output_scale is not None or output_block_scale is not None:
@@ -264,6 +438,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             k_scale=layer._k_scale_float,
             v_scale=layer._v_scale_float,
             query_start_loc_cpu=query_start_loc_cpu,
+            sx_mtp_lane=sx_mtp_lane,
             **qsa_metadata,
         )
         return output
@@ -466,6 +641,31 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             max_tokens=max_tokens,
             topk_indices_buffer=topk_indices_buffer,
         )
+        # Batch 3a (SX_OPT_QSA_MTP_*): MTP-lane QSA options, None elsewhere
+        # (the no-MTP lane keeps the 1.8.0-dev2 gates exactly).
+        self._sx_qsa_mtp_lane = None
+        if _sx_qsa_mtp_lane_contract(vllm_config):
+            from .ops.qsa import sx_qsa_mtp_lane_options
+
+            self._sx_qsa_mtp_lane = sx_qsa_mtp_lane_options(
+                _sx_qsa_mtp_page4_graph_rows(vllm_config)
+            )
+            if self._sx_qsa_mtp_lane.two_warp_max_rows > 32 or (
+                self._sx_qsa_mtp_lane.topk_max_rows > 32
+            ):
+                # Rows 33..63 now run the decode-row kernels; also warm the
+                # 16-divisible Triton specialisation (48 rows).
+                self.kernel_warmup_prefill_token_counts = (33, 48)
+            logger.info_once(
+                "Qwen4Exp QSA MTP lane: decode-row caps two_warp=%d "
+                "resolved=%d topk=%d, page4 graph rows=%d, host metadata=%s "
+                "(SX_OPT_QSA_MTP_*).",
+                self._sx_qsa_mtp_lane.two_warp_max_rows,
+                self._sx_qsa_mtp_lane.resolved_max_rows,
+                self._sx_qsa_mtp_lane.topk_max_rows,
+                self._sx_qsa_mtp_lane.page4_graph_rows,
+                _SX_OPT_QSA_HOST_METADATA and _SX_OPT_QSA_MTP_HOST_METADATA,
+            )
 
         static_context = vllm_config.compilation_config.static_forward_context
         if self.layer_name in static_context:
@@ -622,15 +822,18 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 value[:num_tokens],
             )
         # Optional host copies attached by Qwen4ExpQSAMetadataBuilder. None
-        # (MTP/spec decode, other metadata builders, switch off) keeps the
-        # baseline paths; the ops ignore them while a CUDA graph is captured.
+        # (spec decode outside the MTP lane, other metadata builders, switch
+        # off) keeps the baseline paths; the ops ignore them while a CUDA
+        # graph is captured.
         query_start_loc_cpu, seq_lens_cpu = _sx_qsa_host_metadata(main_metadata)
+        sx_mtp_lane = getattr(self, "_sx_qsa_mtp_lane", None)
         selected = self.indexer(
             hidden_states,
             positions,
             self.topk_indices_buffer[:num_tokens],
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens_cpu=seq_lens_cpu,
+            sx_mtp_lane=sx_mtp_lane,
         )
         if selected.shape != (
             num_tokens,
@@ -664,6 +867,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             query_positions=side_metadata.logical_positions,
             sequence_lengths=side_metadata.seq_lens,
             query_start_loc_cpu=query_start_loc_cpu,
+            sx_mtp_lane=sx_mtp_lane,
         )
         _sm70_dump_qwen_layer_tensor(
             "qsa_core_out",

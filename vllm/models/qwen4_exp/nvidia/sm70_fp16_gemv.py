@@ -50,6 +50,16 @@ cache_clear()`` re-reads them):
     MR9a: when the HC rows route is admitted at width N, ``hc_combine_norm``
     uses the M=1 tile (BLOCK_SIZE 1024 + weight prefetch) so the normalized
     HC input is also batch invariant.  ``0`` keeps the generic 512 tile.
+
+SX batch 3a (lane-core, design_1 MTP-1)
+---------------------------------------
+The SM70 Qwen3.8 native-MTP lane (``SX_OPT_MTP_LANE``, contract in
+vllm/config/vllm.py) now admits these routes too when it runs the target in
+the dual-compile lane: FULL uniform verify graphs (W = B*(k+1) rows) are
+traced by the decode compiler, so W <= role maximum takes the rows kernels
+above (each row bitwise equal to the M=1 kernel on that row) and wider verify
+steps keep cuBLAS; prefill/mixed/eager steps never reach them.
+``SX_OPT_MTP_ROWS=0`` disables only the multi-row kernels in that lane.
 """
 
 from __future__ import annotations
@@ -64,6 +74,7 @@ from torch import nn
 import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import (
     is_sm70_decode_graph_compiling,
+    sm70_mtp_lane_installed,
     use_sm70_decode_graph_semantics,
 )
 from vllm.config import get_current_vllm_config
@@ -223,15 +234,27 @@ def _sx_split_rows(m: int, cap: int) -> int:
     return triton.cdiv(m, programs)
 
 
+def _sx_mtp_rows_allowed() -> bool:
+    # SX batch 3a: SX_OPT_MTP_ROWS=0 keeps the MTP verify graphs on cuBLAS for
+    # M > 1. Outside the native-MTP lane this is always True.
+    return (
+        not sm70_mtp_lane_installed()
+        or os.environ.get("SX_OPT_MTP_ROWS", "1").strip() != "0"
+    )
+
+
 def _sx_decode_graph_active() -> bool:
     # The model-side call sites already require decode-graph semantics. In
     # the legacy single-compile lane those semantics are always on, so also
     # require the dual-compile lane and an active FULL decode-graph capture:
-    # eager, mixed and prefill steps never reach the multi-row kernels.
+    # eager, mixed and prefill steps never reach the multi-row kernels. In the
+    # native-MTP lane the FULL decode-graph captures are the uniform verify
+    # graphs of the target (the drafter never captures under this context).
     return bool(
         envs.VLLM_SM70_QWEN38_DUAL_COMPILE
         and is_sm70_decode_graph_compiling()
         and current_platform.is_device_capability(70)
+        and _sx_mtp_rows_allowed()
     )
 
 
@@ -1089,6 +1112,25 @@ def _plan_for(prefix: str, shape: tuple[int, int]) -> _GemvPlan | None:
     return None
 
 
+def _sx_mtp_lane_speculation_ok(config) -> bool:
+    """SX batch 3a: the native-MTP lane with the dual-compile target.
+
+    The routes only pay off (and are only validated) when FULL verify graphs
+    are traced by the decode compiler; with VLLM_SM70_QWEN38_DUAL_COMPILE
+    disabled the MTP lane keeps the previous unquantized linears.
+    """
+    if not envs.VLLM_SM70_QWEN38_DUAL_COMPILE:
+        return False
+    try:
+        from vllm.config.vllm import _is_sm70_qwen38_mtp_lane_contract
+
+        return _is_sm70_qwen38_mtp_lane_contract(
+            config.model_config, config.speculative_config, config.parallel_config
+        )
+    except Exception:  # noqa: BLE001 - fail closed on partial configs
+        return False
+
+
 def _exact_runtime_contract(vllm_config=None) -> bool:
     try:
         config = vllm_config or get_current_vllm_config()
@@ -1099,7 +1141,10 @@ def _exact_runtime_contract(vllm_config=None) -> bool:
 
     return bool(
         tp_size == 4
-        and config.speculative_config is None
+        and (
+            config.speculative_config is None
+            or _sx_mtp_lane_speculation_ok(config)
+        )
         and int(getattr(text_config, "hidden_size", 0)) == 2560
         and int(getattr(text_config, "num_hidden_layers", 0)) == 48
         and int(getattr(text_config, "num_experts", 0)) == 512

@@ -1,0 +1,88 @@
+{
+  "_comment": [
+    "SX_OPT_MTP_DRAFT_TILES table for the Qwen3.8 Flash-Next TP4 MTP draft experts on SM70.",
+    "Local shape (E, N, K, topk) = (512, 160, 2560, 10), FP16 activations and weights.",
+    "Read by fused_moe._get_sm70_mtp_moe_decode_config only after Qwen4ExpMTP armed it.",
+    "m: exact width or [lo, hi] (inclusive); the narrowest matching entry wins; uncovered widths keep the 1Cat M1/M5 tile or the 0.0.3 tile.",
+    "SPLIT_K is always 1. Emitted from sx_tests/b3-draft/sweep_mtp_draft_tiles.py (merged M1..2048 sweep, b3a validation); M1 folded into the 1Cat range.",
+    "measured: us per draft MoE call (fused_experts, CUDA graph, 8 routings, cold weights) at the swept widths."
+  ],
+  "shape": [
+    512,
+    160,
+    2560,
+    10
+  ],
+  "device": "Tesla V100-SXM2-32GB",
+  "source": "sweep 2026-09-27 weights=/models/Swift-1.5-Qwen3.8-Flash-Next-NVFP4 tp_rank=0 routings=8 overlap=0.0 (4 GPUs, widths 1..128 + 160..2048)",
+  "triton_version": "3.6.0",
+  "table": [
+    {
+      "m": [
+        1,
+        224
+      ],
+      "config": {
+        "BLOCK_SIZE_M": 2,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 3
+      },
+      "measured": {
+        "1": 139.7,
+        "2": 159.87,
+        "4": 258.3,
+        "5": 278.4,
+        "8": 485.12,
+        "16": 765.82,
+        "20": 963.58,
+        "24": 1028.22,
+        "40": 1519.04,
+        "80": 2520.7,
+        "120": 3477.12,
+        "160": 4449.79,
+        "192": 5177.22
+      }
+    },
+    {
+      "m": [
+        225,
+        448
+      ],
+      "config": {
+        "BLOCK_SIZE_M": 4,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 2
+      },
+      "measured": {
+        "256": 6232.13,
+        "384": 8690.69
+      }
+    },
+    {
+      "m": [
+        449,
+        2048
+      ],
+      "config": {
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 3
+      },
+      "measured": {
+        "512": 9016.06,
+        "768": 11439.55,
+        "1024": 15092.61,
+        "2048": 24995.65
+      }
+    }
+  ]
+}

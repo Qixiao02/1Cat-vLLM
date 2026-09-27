@@ -19,7 +19,12 @@ from vllm.config.speculative import (
     get_dflash_model_draft_tokens,
     uses_adaptive_dflash_lookup,
 )
-from vllm.config.vllm import _sm70_qwen38_mixed_piecewise_sizes
+from vllm.config.vllm import (
+    _is_sm70_qwen38_mtp_lane_contract,
+    _sm70_qwen38_mixed_piecewise_sizes,
+    _sx_mtp_pw_draft_enabled,
+    _sx_mtp_pw_enabled,
+)
 from vllm.distributed.parallel_state import (
     get_pp_group,
     graph_capture,
@@ -86,6 +91,23 @@ def _split_sm70_mtp_manager_capture_sizes(
         if size % verifier_query_len == 0
         and size // verifier_query_len <= vllm_config.scheduler_config.max_num_seqs
     ]
+
+
+def _sx_mtp_lane_query_len(vllm_config: VllmConfig) -> int:
+    """SX batch 3a: rows per verify request (1 + k) of the SM70 Qwen3.8
+    native-MTP lane (contract in vllm.config.vllm), else 0."""
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if speculative_config is None or getattr(speculative_config, "method", None) != (
+        "mtp"
+    ):
+        return 0
+    if not _is_sm70_qwen38_mtp_lane_contract(
+        getattr(vllm_config, "model_config", None),
+        speculative_config,
+        getattr(vllm_config, "parallel_config", None),
+    ):
+        return 0
+    return int(speculative_config.num_speculative_state_tokens()) + 1
 
 
 class CapturedAttentionState(NamedTuple):
@@ -263,6 +285,36 @@ class CudaGraphManager:
                 self._sx_piecewise_only_sizes[-1],
             )
 
+    def _sx_mtp_pw_lane(self) -> bool:
+        """SX batch 3a (MTP-6 / PF2): uniform k+1 verify routine of the SM70
+        Qwen3.8 native-MTP lane (split or shared FULL sizes alike: split only
+        changes the FULL verify / draft-decode sizes, not mixed steps)."""
+        if not _sx_mtp_pw_enabled():
+            return False
+        query_len = _sx_mtp_lane_query_len(self.vllm_config)
+        return (
+            query_len > 1
+            and self.decode_query_len == query_len
+            and self.decode_query_lens == (query_len,)
+        )
+
+    def _sx_is_mixed_piecewise_owner(self) -> bool:
+        """Target-model manager; in the native-MTP lane also the Eagle
+        draft-prefill manager, which replays the draft at the target's padded
+        mixed-step size and must own identical PIECEWISE descriptors (its
+        capture looks up the target's captured PIECEWISE states)."""
+        if self._sx_mixed_piecewise_owner:
+            return True
+        if not _sx_mtp_pw_draft_enabled():
+            return False
+        try:
+            from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
+                PrefillEagleCudaGraphManager,
+            )
+        except Exception:  # noqa: BLE001 - fail closed
+            return False
+        return isinstance(self, PrefillEagleCudaGraphManager)
+
     def _sx_resolve_piecewise_only_sizes(self) -> tuple[int, ...]:
         """SX PW-1: PIECEWISE-only sizes for mixed/prefill steps.
 
@@ -270,19 +322,28 @@ class CudaGraphManager:
         TP4 dual-compile lane (contract in vllm.config.vllm) with
         FULL_AND_PIECEWISE, a q=1 decode routine and no DP. The FULL decode
         descriptors and self._capture_sizes are left untouched.
+
+        SX batch 3a (MTP-6 / PF2): also the native-MTP lane (SX_OPT_MTP_PW),
+        with its uniform k+1 verify routine, for the target manager and the
+        Eagle draft-prefill manager (SX_OPT_MTP_PW_DRAFT).
         """
         if not (
-            self._sx_mixed_piecewise_owner
-            and self.cudagraph_mode
+            self.cudagraph_mode
             and self._capture_sizes
             and self.cudagraph_mode.separate_routine()
             and self.cudagraph_mode.mixed_mode() == CUDAGraphMode.PIECEWISE
-            and self.decode_query_len == 1
-            and self.decode_query_lens == (1,)
             and not self._sm70_dflash2_tail_graphs
             and self.dp_size == 1
-            and not _use_split_sm70_mtp_cudagraphs(self.vllm_config)
+            and self._sx_is_mixed_piecewise_owner()
         ):
+            return ()
+        nomtp_lane = (
+            self._sx_mixed_piecewise_owner
+            and self.decode_query_len == 1
+            and self.decode_query_lens == (1,)
+            and not _use_split_sm70_mtp_cudagraphs(self.vllm_config)
+        )
+        if not (nomtp_lane or self._sx_mtp_pw_lane()):
             return ()
         sizes = tuple(
             _sm70_qwen38_mixed_piecewise_sizes(self.vllm_config, self._capture_sizes)

@@ -198,13 +198,15 @@ class QSAIndexer(nn.Module):
         *,
         query_start_loc_cpu: torch.Tensor | None = None,
         seq_lens_cpu: torch.Tensor | None = None,
+        sx_mtp_lane=None,
     ) -> torch.Tensor:
         """Return fixed-width request-relative token indices padded with ``-1``.
 
         ``query_start_loc_cpu`` / ``seq_lens_cpu`` are optional host copies of
         this step's query starts and sequence lengths (see SX_OPT_QSA_* in
         ops/qsa.py). They only size host-side launches; None keeps the
-        baseline behaviour.
+        baseline behaviour. ``sx_mtp_lane`` (ops.qsa.SxQsaMtpLane, MTP lane
+        only) widens the decode top-k rows admission to the verify widths.
         """
 
         metadata = self._metadata()
@@ -360,6 +362,7 @@ class QSAIndexer(nn.Module):
             out,
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens_cpu=seq_lens_cpu,
+            sx_mtp_lane=sx_mtp_lane,
         )
 
 

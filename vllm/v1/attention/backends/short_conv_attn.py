@@ -162,6 +162,19 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
             (self.decode_cudagraph_max_bs,), dtype=torch.bool, device=device
         )
 
+        # SX_OPT_SPEC_META_NOSYNC (MTP lane): no blocking host->device index
+        # copies / hidden syncs in the spec-decode builder. Shared helpers live
+        # in gdn_attn (imported here, not at module level, to keep the
+        # backends' import graph unchanged; never imported by the no-MTP lane).
+        self._sx_spec_meta_nosync: bool = False
+        if self.use_spec_decode:
+            from vllm.v1.attention.backends import gdn_attn as _gdn_attn
+
+            self._sx_h2d = _gdn_attn.sx_h2d_nosync
+            self._sx_spec_meta_nosync = bool(
+                _gdn_attn.sx_spec_meta_nosync_admitted(vllm_config)
+            )
+
     def _build_non_spec_metadata(
         self,
         common_prefix_len: int,
@@ -348,8 +361,42 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         decode_req_idx_cpu = decode_mask_cpu.nonzero(as_tuple=True)[0]
         prefill_req_idx_cpu = prefill_mask_cpu.nonzero(as_tuple=True)[0]
         non_spec_req_idx_cpu = torch.cat((decode_req_idx_cpu, prefill_req_idx_cpu))
-        spec_req_idx = spec_req_idx_cpu.to(query_start_loc.device)
-        non_spec_req_idx = non_spec_req_idx_cpu.to(query_start_loc.device)
+        # SX_OPT_SPEC_META_NOSYNC: the blocking ``cpu_idx.to(device)`` copies
+        # below synchronized the host with the stream on every verify step.
+        # Pure verify batches whose spec rows lead (live rows first, graph
+        # padding last) use slices; other batches send all row indices in one
+        # pinned non_blocking copy. Same gathers, same values.
+        sx_nosync = getattr(self, "_sx_spec_meta_nosync", False)
+        pure_spec_batch = num_decodes == 0 and num_prefills == 0
+        full_graph_spec = (
+            self.use_full_cuda_graph
+            and pure_spec_batch
+            and num_spec_decodes <= self.decode_cudagraph_max_bs
+            and num_spec_decode_tokens <= self.decode_cudagraph_max_tokens
+        )
+        spec_req_idx: torch.Tensor | None
+        non_spec_req_idx: torch.Tensor | None
+        decode_req_idx: torch.Tensor | None = None
+        if (
+            sx_nosync
+            and pure_spec_batch
+            and bool(spec_sequence_masks_cpu[:num_spec_decodes].all())
+        ):
+            spec_req_idx = None  # rows [0, num_spec_decodes)
+            non_spec_req_idx = None
+        elif sx_nosync:
+            staged_req_idx = self._sx_h2d(
+                torch.cat((spec_req_idx_cpu, non_spec_req_idx_cpu)),
+                query_start_loc.device,
+            )
+            spec_req_idx = staged_req_idx[:num_spec_decodes]
+            non_spec_req_idx = staged_req_idx[num_spec_decodes:]
+            decode_req_idx = staged_req_idx[
+                num_spec_decodes : num_spec_decodes + num_decodes
+            ]
+        else:
+            spec_req_idx = spec_req_idx_cpu.to(query_start_loc.device)
+            non_spec_req_idx = non_spec_req_idx_cpu.to(query_start_loc.device)
 
         if num_decodes == 0 and num_prefills == 0:
             # Pure speculative-decode batch: all real tokens are spec tokens.
@@ -361,7 +408,14 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
             non_spec_token_indx = torch.empty(
                 0, dtype=torch.int32, device=query_start_loc.device
             )
-            spec_state_indices_tensor = block_table_tensor[spec_req_idx, 0]
+            if spec_req_idx is None:
+                spec_state_indices_tensor = block_table_tensor[:num_spec_decodes, 0]
+                if not full_graph_spec:
+                    # Match the fresh contiguous tensor of the index gather;
+                    # the full-graph path copies into its persistent buffer.
+                    spec_state_indices_tensor = spec_state_indices_tensor.contiguous()
+            else:
+                spec_state_indices_tensor = block_table_tensor[spec_req_idx, 0]
             non_spec_state_indices_tensor = None
             spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
             non_spec_query_start_loc = None
@@ -378,9 +432,25 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
                 dtype=torch.int64,
                 device=query_start_loc.device,
             )
-            req_group[spec_req_idx] = 0
-            req_group[decode_req_idx_cpu.to(query_start_loc.device)] = 1
-            token_group = torch.repeat_interleave(req_group, query_lens)
+            assert spec_req_idx is not None and non_spec_req_idx is not None
+            if sx_nosync:
+                assert decode_req_idx is not None
+                # ``t[idx] = scalar`` is index_put_ with a CPU 0-dim value,
+                # which PyTorch moves to the device with a blocking copy;
+                # index_fill_ passes the scalar as a kernel argument.
+                req_group.index_fill_(0, spec_req_idx, 0)
+                req_group.index_fill_(0, decode_req_idx, 1)
+                # output_size from the host lengths: without it
+                # repeat_interleave reads the total back from the device.
+                token_group = torch.repeat_interleave(
+                    req_group,
+                    query_lens,
+                    output_size=int(query_lens_cpu.sum().item()),
+                )
+            else:
+                req_group[spec_req_idx] = 0
+                req_group[decode_req_idx_cpu.to(query_start_loc.device)] = 1
+                token_group = torch.repeat_interleave(req_group, query_lens)
             token_perm = torch.argsort(token_group, stable=True)
             spec_token_indx = token_perm[:num_spec_decode_tokens]
             non_spec_token_indx = token_perm[num_spec_decode_tokens:]
@@ -415,9 +485,18 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         assert num_accepted_tokens is not None
         # Accepted-token counts must follow the same request order as the
         # speculative state indices.
-        num_accepted_tokens = num_accepted_tokens[
-            spec_req_idx_cpu.to(num_accepted_tokens.device)
-        ]
+        if not sx_nosync:
+            num_accepted_tokens = num_accepted_tokens[
+                spec_req_idx_cpu.to(num_accepted_tokens.device)
+            ]
+        elif spec_req_idx is None:
+            num_accepted_tokens = num_accepted_tokens[:num_spec_decodes]
+        else:
+            num_accepted_tokens = num_accepted_tokens[
+                spec_req_idx
+                if spec_req_idx.device == num_accepted_tokens.device
+                else self._sx_h2d(spec_req_idx_cpu, num_accepted_tokens.device)
+            ]
 
         # Compute the conv-state slots for the non-spec decode/prefill split,
         # plus the initial-state masks and Triton causal_conv1d metadata.
@@ -435,7 +514,17 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         if num_decodes > 0 or num_prefills > 0:
             num_computed_tokens = m.compute_num_computed_tokens()
             if non_spec_req_idx_cpu is not None:
-                non_spec_req_idx = non_spec_req_idx_cpu.to(num_computed_tokens.device)
+                if not sx_nosync:
+                    non_spec_req_idx = non_spec_req_idx_cpu.to(
+                        num_computed_tokens.device
+                    )
+                elif (
+                    non_spec_req_idx is None
+                    or non_spec_req_idx.device != num_computed_tokens.device
+                ):
+                    non_spec_req_idx = self._sx_h2d(
+                        non_spec_req_idx_cpu, num_computed_tokens.device
+                    )
                 num_computed_tokens = num_computed_tokens[non_spec_req_idx]
 
             state_indices_tensor_d = state_indices_tensor[:num_decodes]

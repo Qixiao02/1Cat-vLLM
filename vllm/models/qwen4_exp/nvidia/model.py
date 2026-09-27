@@ -11,7 +11,7 @@ from torch import nn
 
 from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
-from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
+from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling, set_sm70_mtp_lane_installed, sm70_target_main_backbone  # noqa: E501 - one line keeps the compiled forwards' co_firstlineno (AOT cache dir key)
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
@@ -802,6 +802,27 @@ def _make_qwen38_decode_compile_config(vllm_config: VllmConfig) -> VllmConfig:
     return decode_config
 
 
+def _sx_sm70_qwen38_mtp_lane_installed(vllm_config: VllmConfig) -> bool:
+    """SX batch 3a: dual-compile target of the SM70 Qwen3.8 native-MTP lane.
+
+    False for every no-MTP configuration (no speculative config), for other
+    speculative methods/models, with SX_OPT_MTP_LANE=0, and when the operator
+    disabled VLLM_SM70_QWEN38_DUAL_COMPILE.
+    """
+    if not envs.VLLM_SM70_QWEN38_DUAL_COMPILE:
+        return False
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if speculative_config is None:
+        return False
+    from vllm.config.vllm import _is_sm70_qwen38_mtp_lane_contract
+
+    return _is_sm70_qwen38_mtp_lane_contract(
+        getattr(vllm_config, "model_config", None),
+        speculative_config,
+        getattr(vllm_config, "parallel_config", None),
+    )
+
+
 class Qwen4ExpForCausalLM(
     nn.Module,
     HasInnerState,
@@ -860,6 +881,18 @@ class Qwen4ExpForCausalLM(
             self, self.model_config.dtype, self.vllm_config
         )
         object.__setattr__(self, "_sm70_decode_graph_model", None)
+        # SX batch 3a (lane-core, MTP-1): in the SM70 Qwen3.8 native-MTP lane
+        # the target runs dual-compile; its main backbone is marked so the
+        # separately compiled MTP drafter keeps decode semantics.
+        sx_mtp_lane = _sx_sm70_qwen38_mtp_lane_installed(vllm_config)
+        set_sm70_mtp_lane_installed(sx_mtp_lane)
+        object.__setattr__(self, "_sx_mtp_lane_main_backbone", sx_mtp_lane)
+        if sx_mtp_lane:
+            logger.info_once(
+                "SM70 Qwen3.8 native-MTP lane installed (SX_OPT_MTP_LANE): "
+                "dual-compile target, FULL verify graphs on the decode "
+                "compiler, drafter keeps single-compile decode semantics."
+            )
 
     def prepare_sm70_decode_graph_model(self) -> bool:
         """Create the shared-weight decode compiler just before graph capture."""
@@ -904,6 +937,17 @@ class Qwen4ExpForCausalLM(
                     "SM70 Qwen3.8 decode graph compiler was not prepared"
                 )
             backbone = decode_backbone
+        elif self._sx_mtp_lane_main_backbone and not torch.compiler.is_compiling():
+            # SX batch 3a: native-MTP lane main compile (prefill/mixed/eager
+            # steps) keeps the no-MTP main-compile semantics.
+            with sm70_target_main_backbone():
+                return backbone(
+                    input_ids,
+                    positions,
+                    intermediate_tensors,
+                    inputs_embeds,
+                    **kwargs,
+                )
         return backbone(
             input_ids,
             positions,

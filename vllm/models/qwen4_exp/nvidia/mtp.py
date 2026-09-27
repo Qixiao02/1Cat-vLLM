@@ -11,17 +11,59 @@ The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
   - emits TWO hidden streams per step (scheme A): a single stream [T, H]
     (final-mixer collapsed, fed to the LM head) and a pre-final-mixer
     multi stream [T, hc_count*H] (fed to the next draft step).
+
+SX batch-3 "draft" group (design_4 MTP-K1, design_1 MTP-7 / MTP-8)
+-------------------------------------------------------------------
+Only under the exact SM70 TP4 FP16 Qwen3.8 Flash-Next MTP contract
+(``_sx_mtp_draft_contract``: speculative method "mtp", TP4, PP1, no EP, the
+same topology check as the no-MTP fast paths) the drafter
+
+* arms the exact-shape draft MoE tile table in fused_moe.py
+  (``SX_OPT_MTP_DRAFT_TILES``, default on; ``0`` keeps 1Cat's M1/M5 tile and
+  the 0.0.3 tile elsewhere);
+* installs the existing checkpoint-FP16 SM70 routes on its own layer
+  (``SX_OPT_MTP_DRAFT_GEMV``, default on; ``0`` = previous behaviour):
+  the M=1 row GEMV (sm70_fp16_gemv.Qwen38SM70FP16LinearMethod) on
+  qkv / o / indexer / router / HC down and the fused FP16 HC route on the
+  attn and mlp HC modules.  Both engage where the drafter has decode-graph
+  semantics (single-compile lane, or the batch-3a native-MTP lane, which
+  keeps the drafter on them), at M = 1: draft decode of one request with
+  split draft graphs (VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS=1, set by the
+  MTP lane; otherwise one request pads to k+1 rows).  M > 1 stays on
+  F.linear inside the opaque ops, because the rows kernels additionally
+  require the target's FULL decode-graph capture.  The shared-expert gate is
+  left to qwen2_moe (SX_OPT_MTP_MOE_ROUTES admits its rows for the drafter).
+  Not installed with online QPN8 or VLLM_BATCH_INVARIANT; an explicit
+  VLLM_SM70_QWEN38_FP16_GEMV=0 / VLLM_SM70_QWEN38_FUSED_HC_FP16=0 also keeps
+  the drafter off that kernel family.
+
+All of this changes draft proposals only.  The target model and the
+rejection sampler are untouched, so the output distribution is unchanged.
+
+FP8 draft experts: Swift 1.5 uses the routed-experts-only NVFP4 recipe with
+``mtp.*`` in exclude_modules, so its MTP experts are unquantized and the
+online FP8 route (mtp_fp8_experts.MTPFp8SM70MoEMethod) applies unchanged.
+Enable it with ``"mtp_expert_quantization": "fp8"`` in --speculative-config,
+e.g. ``{"method": "mtp", "num_speculative_tokens": 4,
+"mtp_expert_quantization": "fp8"}``.  It keeps 960 MiB packed FP8 + 15 MiB
+scales instead of 1200 MiB FP16 per rank (1Cat measured -892 MiB/rank whole
+GPU with an NVFP4 target) and is a draft-only precision change.  The draft
+MoE then runs Fp8SM70MoEMethod, so the Triton tile table does not apply.
 """
 
+import os
 from collections.abc import Iterable
+from types import SimpleNamespace
 
 import regex as re
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -39,12 +81,15 @@ from vllm.model_executor.models.utils import (
     maybe_fuse_shared_experts,
     maybe_prefix,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
 
 from .hyperconnection import GatedResidual, HyperConnectionConfig
+
+logger = init_logger(__name__)
 
 try:
     from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
@@ -229,6 +274,179 @@ def _make_draft_vllm_config(
         )
     draft_vllm_config.quant_config = draft_quant_config
     return draft_vllm_config
+
+
+def _sx_mtp_draft_contract(vllm_config) -> bool:
+    """Exact SM70 TP4 FP16 Qwen3.8 Flash-Next drafter (speculative "mtp").
+
+    ``vllm_config`` is the config Qwen4ExpMTP is constructed with (target
+    model config plus the speculative config).  The topology part reuses the
+    no-MTP fast-path contract of sm70_fp16_gemv; that helper also rejects any
+    speculative config because it guards the target lane, so it is evaluated
+    on a view without one.
+    """
+    try:
+        spec = vllm_config.speculative_config
+        model_config = vllm_config.model_config
+        parallel_config = vllm_config.parallel_config
+        if spec is None or getattr(spec, "method", None) != "mtp":
+            return False
+        if model_config.dtype != torch.float16:
+            return False
+        if (
+            int(parallel_config.tensor_parallel_size) != 4
+            or int(parallel_config.pipeline_parallel_size) != 1
+            or bool(getattr(parallel_config, "enable_expert_parallel", False))
+        ):
+            return False
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if not (
+        current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+    ):
+        return False
+
+    from .sm70_fp16_gemv import _exact_runtime_contract
+
+    view = SimpleNamespace(
+        model_config=model_config,
+        parallel_config=parallel_config,
+        speculative_config=None,
+    )
+    return _exact_runtime_contract(view)
+
+
+def _sx_install_mtp_draft_fp16_routes(
+    model: nn.Module, *, gemv: bool = True, hc: bool = True
+) -> dict[str, int]:
+    """MTP-8: put the drafter's own projections on the existing SM70 routes.
+
+    Same selection rules as enable_qwen38_sm70_fp16_gemv /
+    enable_qwen38_sm70_fp16_fused_hc (role suffix + exact shape, unquantized
+    FP16 weights, base HC modules with a combine), applied independently of
+    the no-MTP env defaults and without touching the target model.  The
+    module-global fused-HC counter (MR9a combine-norm tile of the *target*
+    decode graph) is deliberately left alone.  ``gemv`` / ``hc`` select the
+    two route families (the caller maps the global kill switches onto them).
+    """
+    from vllm.model_executor.layers.linear import (
+        LinearBase,
+        UnquantizedLinearMethod,
+    )
+
+    from .sm70_fp16_gemv import _ROLE_PLANS, Qwen38SM70FP16LinearMethod, _plan_for
+    from .sm70_fp16_hc import _HC_COUNT, _HC_DIM, _HC_HIDDEN, _HC_RANK
+
+    counts = {"gemv": 0, "hc": 0}
+    roles: list[str] = []
+    for child in model.modules() if gemv else ():
+        if not (
+            isinstance(child, LinearBase)
+            and type(child.quant_method) is UnquantizedLinearMethod
+        ):
+            continue
+        weight = getattr(child, "weight", None)
+        if (
+            not isinstance(weight, torch.Tensor)
+            or weight.ndim != 2
+            or weight.dtype != torch.float16
+        ):
+            continue
+        prefix = str(getattr(child, "prefix", ""))
+        shape = (int(weight.shape[0]), int(weight.shape[1]))
+        if _plan_for(prefix, shape) is None:
+            continue
+        child.quant_method = Qwen38SM70FP16LinearMethod()
+        counts["gemv"] += 1
+        roles.extend(
+            suffix.rsplit(".", 1)[-1]
+            for suffix, _, _ in _ROLE_PLANS
+            if prefix.endswith(suffix)
+        )
+
+    for child in model.modules() if hc else ():
+        down = getattr(child, "input_mix_weight_down_block_inject", None)
+        up = getattr(child, "input_mix_weight_up", None)
+        down_weight = getattr(down, "weight", None)
+        up_weight = getattr(up, "weight", None)
+        if not (
+            getattr(child, "use_combine", False)
+            and getattr(child, "lora_rank", None) == _HC_RANK
+            and getattr(child, "hc_count", None) == _HC_COUNT
+            and getattr(child, "hidden_size", None) == _HC_DIM
+            and isinstance(down_weight, torch.Tensor)
+            and isinstance(up_weight, torch.Tensor)
+            and tuple(down_weight.shape) == (_HC_RANK + _HC_COUNT + 12, _HC_HIDDEN)
+            and tuple(up_weight.shape) == (_HC_HIDDEN, _HC_RANK)
+            and down_weight.dtype == torch.float16
+            and up_weight.dtype == torch.float16
+            # The HC down projection itself has a GEMV plan (installed above,
+            # as enable_qwen38_sm70_fp16_gemv does for the target); the fused
+            # route only reads the FP16 weights.
+            and isinstance(getattr(down, "quant_method", None), UnquantizedLinearMethod)
+            and isinstance(getattr(up, "quant_method", None), UnquantizedLinearMethod)
+        ):
+            continue
+        child._sm70_qwen38_fp16_fused_hc = True
+        counts["hc"] += 1
+
+    # The shared-expert gate is not touched here: its exact M == 1 gate is
+    # already active in the drafter, and the multi-row gate for draft rows is
+    # admitted by qwen2_moe under the MTP-lane switch (SX_OPT_MTP_MOE_ROUTES).
+    logger.info(
+        "SX MTP draft SM70 FP16 routes (SX_OPT_MTP_DRAFT_GEMV): %d M=1 GEMV "
+        "projections %s, %d fused HC modules.",
+        counts["gemv"],
+        sorted(set(roles)),
+        counts["hc"],
+    )
+    if not counts["gemv"] and not counts["hc"]:
+        logger.warning(
+            "SX_OPT_MTP_DRAFT_GEMV matched the runtime but found no draft "
+            "projection with an exact SM70 FP16 plan."
+        )
+    return counts
+
+
+def _sx_prepare_mtp_draft_sm70(model: nn.Module, vllm_config) -> dict[str, int]:
+    """Arm the draft MoE tile table and install the draft FP16 routes."""
+    if not _sx_mtp_draft_contract(vllm_config):
+        return {}
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
+        arm_sm70_mtp_draft_moe_tiles,
+    )
+
+    arm_sm70_mtp_draft_moe_tiles(True)
+    if os.environ.get("SX_OPT_MTP_DRAFT_GEMV", "1").strip() == "0":
+        return {}
+    if envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8:
+        # Online QPN8 repacks the unquantized projections at load time.
+        logger.info_once(
+            "SX_OPT_MTP_DRAFT_GEMV skipped: VLLM_SM70_QWEN4_EXP_ONLINE_QPN8 is set."
+        )
+        return {}
+    if envs.VLLM_BATCH_INVARIANT:
+        # UnquantizedLinearMethod keeps linear_batch_invariant for the draft;
+        # the opaque GEMV / fused-HC ops would bypass it (M=1 kernels, plain
+        # F.linear otherwise), so a draft row would depend on the batch width.
+        logger.info_once("SX_OPT_MTP_DRAFT_GEMV skipped: VLLM_BATCH_INVARIANT is set.")
+        return {}
+    # An explicit "0" of the global kernel-family switches (the target lane's
+    # rollback knobs) also keeps the drafter off that family; unset means the
+    # draft default (on), since the no-MTP lane defaults them only when absent.
+    gemv = _sx_env_not_forced_off("VLLM_SM70_QWEN38_FP16_GEMV")
+    hc = _sx_env_not_forced_off("VLLM_SM70_QWEN38_FUSED_HC_FP16")
+    if not gemv and not hc:
+        logger.info_once(
+            "SX_OPT_MTP_DRAFT_GEMV skipped: VLLM_SM70_QWEN38_FP16_GEMV=0 and "
+            "VLLM_SM70_QWEN38_FUSED_HC_FP16=0."
+        )
+        return {}
+    return _sx_install_mtp_draft_fp16_routes(model, gemv=gemv, hc=hc)
+
+
+def _sx_env_not_forced_off(name: str) -> bool:
+    return os.environ.get(name, "").strip() != "0"
 
 
 @support_torch_compile(
@@ -509,6 +727,8 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         )
         self.set_moe_parameters(self.model.layers)
         enable_qwen4_exp_low_latency_gemm(self, vllm_config.model_config.dtype)
+        # SX batch 3 (draft): MTP-K1 tile table + MTP-8 draft FP16 routes.
+        _sx_prepare_mtp_draft_sm70(self, vllm_config)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

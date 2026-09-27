@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -685,6 +686,17 @@ class EagleSpeculator:
             input_batch.num_tokens,
             max_query_len,
         )
+        if (
+            uniform_token_count is not None
+            and uniform_token_count > 1
+            and os.environ.get("SX_OPT_SPEC_PREFILL_NO_FULL", "1").strip() != "0"
+            and bool(np.any(input_batch.is_prefilling_np[:num_reqs]))
+        ):
+            # SX b3a (validation): mirror the target runner. A (k+1)-token
+            # prefill chunk makes the batch look uniform; the target step then
+            # runs eager/PIECEWISE, so the draft prefill must not replay the
+            # FULL graph that reads the target's FULL-graph metadata buffers.
+            uniform_token_count = None
         prefill_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.prefill_cudagraph_manager,
             num_reqs,

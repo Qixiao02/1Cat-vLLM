@@ -18,8 +18,32 @@
 #   source rows equal topk_softmax; weights within the admitted 1e-7 contract
 #   (M17..32 previously used topk_softmax, so those widths are not bitwise
 #   vs. the old route; M1..16 are bitwise vs. the old Triton route).
+#
+# SX_OPT_MTP_MOE_ROUTES (default "1"; "0" restores the 1.8.0-dev2 MTP lane
+#   for every item of the batch-3a "moe-verify" group), design_1 [MTP-3] /
+#   design_4 [MTP-K4]: the SM70 Qwen3.8-Flash-Next TP4 native-MTP lane
+#   (speculative method "mtp" with the Qwen4Exp MTP drafter, 1 <= k <= 7,
+#   standard rejection sampling, no parallel drafting, the exact no-MTP
+#   Qwen3.8 TP4 model contract of vllm/config/vllm.py on the *target* model,
+#   no DBO, SM70) is admitted to the SX_OPT fast paths that were gated on
+#   ``speculative_config is None``. ``sx_sm70_qwen38_mtp_verify_q`` below is
+#   the single lane contract shared by this router (SX_OPT_ROUTER32 for the
+#   target verify rows and the MTP draft), qwen2_moe.py
+#   (SX_OPT_SHARED_GATE_ROWS), nvfp4_sm70_moe.py (verify-width MoE routes,
+#   SX_OPT_MOE_EAGER_IOTA) and custom_all_reduce.py (25-KiB MTP5 push). Every
+#   other speculative configuration keeps the previous behaviour, and without
+#   a speculative config nothing changes (the no-MTP lane is untouched).
+#   Router numerics in the lane: M1..16 bitwise vs the previous constexpr-M
+#   kernel (only the compiled variant is shared); M17..32 (verify widths
+#   20/24/25/28/30/32 and wide draft step-0 widths) move from topk_softmax to
+#   the runtime-M kernel: ids and source rows equal, weights within 3e-7, each
+#   row bitwise equal to the no-MTP lane's router on that row.
+#   SX_OPT_MTP_LANE=0 (the batch-3a MTP-lane master of vllm/config/vllm.py,
+#   also honoured by the QSA / GEMV / model lane items) disables this group's
+#   items as well, so that one switch restores the 1.8.0-dev2 MTP lane.
 import os
 from collections.abc import Callable
+from typing import Any
 
 import torch
 
@@ -39,20 +63,96 @@ from vllm.triton_utils import tl, triton
 logger = init_logger(__name__)
 
 _SX_OPT_ROUTER32 = os.environ.get("SX_OPT_ROUTER32", "1") != "0"
+# SX_OPT_MTP_MOE_ROUTES: master switch of the MTP-lane admissions (see top).
+_SX_OPT_MTP_MOE_ROUTES = os.environ.get("SX_OPT_MTP_MOE_ROUTES", "1") != "0"
 # Width limits of the exact SM70 Qwen3.8 E512/K10 Triton router.
 _SM70_QWEN38_ROUTER_TOPK_LEGACY_MAX_M = 16
 _SM70_QWEN38_ROUTER_TOPK_RUNTIME_M_MAX_M = 32
+# Verify rows per request (1 + k) admitted by the MTP-lane contract.
+_SX_MTP_LANE_MAX_VERIFY_Q = 8
+
+
+def sx_sm70_qwen38_mtp_verify_q(config: Any) -> int:
+    """Rows per request (1 + num_speculative_tokens) of the SM70 Qwen3.8 MTP lane.
+
+    Returns 0 unless ``config`` is the SM70 Qwen3.8-Flash-Next TP4 native-MTP
+    deployment (see SX_OPT_MTP_MOE_ROUTES at the top of this file) and the
+    master switch is on. Pure host logic on the vLLM config; evaluated at
+    model construction / weight processing / custom-AR init, never per step.
+    The model identity is checked on the *target* model config (the MTP
+    drafter is built under the draft model config), with the same exact
+    no-MTP Qwen3.8 TP4 contract as vllm/config/vllm.py's dual-compile lane;
+    any import or attribute problem fails closed (0). SX_OPT_MTP_LANE=0 (the
+    lane-wide master, read here at call time like the other lane groups do)
+    also returns 0.
+    """
+    if not _SX_OPT_MTP_MOE_ROUTES or config is None:
+        return 0
+    if os.environ.get("SX_OPT_MTP_LANE", "1").strip() == "0":
+        return 0
+    spec = getattr(config, "speculative_config", None)
+    if spec is None or getattr(spec, "method", None) != "mtp":
+        return 0
+    use_qwen4_exp_mtp = getattr(spec, "use_qwen4_exp_mtp", None)
+    try:
+        if not callable(use_qwen4_exp_mtp) or not use_qwen4_exp_mtp():
+            return 0
+        num_spec = int(getattr(spec, "num_speculative_tokens", 0) or 0)
+        # Chain drafting only: every verify request carries exactly 1 + k
+        # rows (tree verification would carry more state tokens than k).
+        state_tokens_fn = getattr(spec, "num_speculative_state_tokens", None)
+        state_tokens = (
+            int(state_tokens_fn()) if callable(state_tokens_fn) else num_spec
+        )
+    except Exception:  # noqa: BLE001 - malformed/partial configs fail closed
+        return 0
+    if (
+        not 1 <= num_spec <= _SX_MTP_LANE_MAX_VERIFY_Q - 1
+        or state_tokens != num_spec
+    ):
+        return 0
+    if getattr(spec, "parallel_drafting", False):
+        return 0
+    if getattr(spec, "rejection_sample_method", "standard") != "standard":
+        return 0
+    model_config = getattr(spec, "target_model_config", None) or getattr(
+        config, "model_config", None
+    )
+    parallel_config = getattr(spec, "target_parallel_config", None) or getattr(
+        config, "parallel_config", None
+    )
+    if parallel_config is None:
+        return 0
+    if (
+        getattr(parallel_config, "enable_dbo", False)
+        or getattr(parallel_config, "use_ubatching", False)
+        or int(getattr(parallel_config, "ubatch_size", 0) or 0) > 1
+    ):
+        return 0
+    try:
+        from vllm.config.vllm import _is_sm70_qwen38_nomtp_dual_compile_contract
+
+        if not _is_sm70_qwen38_nomtp_dual_compile_contract(
+            model_config, None, parallel_config
+        ):
+            return 0
+        if not current_platform.is_device_capability(70):
+            return 0
+    except Exception:  # noqa: BLE001 - defensive; never fail model build
+        return 0
+    return num_spec + 1
 
 
 def _sm70_qwen38_router_runtime_m_for_current_config() -> bool:
-    """Arm the M<=32 runtime-M router only for the no-spec TP4 contract.
+    """Arm the M<=32 runtime-M router for the no-spec TP4 contract and the
+    SM70 Qwen3.8 MTP lane (SX_OPT_MTP_MOE_ROUTES).
 
     Evaluated once per router at model construction, where the vLLM config is
     current. Without a config (standalone kernels/benchmarks) the deployment
-    contract is assumed. Speculative decoding, a TP size other than 4, or a
-    text hidden size other than Qwen3.8-Flash-Next's 2560 (e.g. Qwen3-Next,
-    which shares the E512/K10 router shape) keeps the previous route (M<=16
-    constexpr-M kernel, topk_softmax above).
+    contract is assumed. Speculative decoding outside the MTP lane, a TP size
+    other than 4, or a text hidden size other than Qwen3.8-Flash-Next's 2560
+    (e.g. Qwen3-Next, which shares the E512/K10 router shape) keeps the
+    previous route (M<=16 constexpr-M kernel, topk_softmax above).
     """
     if not _SX_OPT_ROUTER32:
         return False
@@ -65,7 +165,9 @@ def _sm70_qwen38_router_runtime_m_for_current_config() -> bool:
     if config is None:
         return True
     if getattr(config, "speculative_config", None) is not None:
-        return False
+        # Target verify rows and the MTP draft (built under the draft model
+        # config; the lane contract resolves the target model config).
+        return sx_sm70_qwen38_mtp_verify_q(config) > 0
     hidden_size = getattr(
         getattr(getattr(config, "model_config", None), "hf_text_config", None),
         "hidden_size",

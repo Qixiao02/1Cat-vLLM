@@ -6,7 +6,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import torch
 
@@ -45,6 +45,206 @@ GDN_SPEC_METADATA_TENSORS = tuple[
     torch.Tensor,
 ]
 _GDN_SPEC_METADATA_TENSOR_REGISTRY: dict[str, GDN_SPEC_METADATA_TENSORS] = {}
+
+
+# ---------------------------------------------------------------------------
+# SX_OPT_SPEC_META_NOSYNC (opt 1.8.0 batch 3a, MTP lane)
+#
+# The speculative-decode metadata builders of the GDN and PLE short-conv
+# backends used to block the host on every verify step:
+#   * boolean-mask indexing of device tensors (``t[mask]`` runs ``nonzero``
+#     and waits for the GPU to drain),
+#   * ``assert spec_query_start_loc[-1].item() == ...``,
+#   * blocking pageable ``cpu_index.to(device)`` copies,
+#   * ``repeat_interleave`` without ``output_size`` and CUDA tensors indexed
+#     with a CPU mask (both hide a sync).
+# Every one of these masks is known on the host, so the row split is decided
+# on the host instead. Pure verify batches (spec rows first, graph padding
+# last) use plain slices; other batches copy the ascending row indices once
+# from pinned memory (non_blocking) and gather with ``index_select`` or the
+# same advanced indexing as before. Both are the exact gathers that boolean
+# indexing performs, so values, shapes and dtypes are unchanged; the old
+# device-side assert becomes the equivalent host-side check.
+#
+# Pinned staging tensors come from torch's caching host allocator: the
+# non_blocking copy records a stream event, so a pinned block is only reused
+# after its copy has executed (safe while async scheduling runs the host a
+# step ahead of the GPU). Builders never run inside CUDA graph capture.
+#
+# Admission: speculative_config.method == "mtp" on the exact SM70 Qwen3.8
+# (Qwen4Exp) TP4 topology, i.e. the no-MTP fast-path contract with the MTP
+# method (see ``sx_spec_meta_nosync_contract``). "0" restores the old code.
+# ---------------------------------------------------------------------------
+def _sx_spec_meta_nosync_switch() -> bool:
+    return os.environ.get("SX_OPT_SPEC_META_NOSYNC", "1") != "0"
+
+
+def sx_spec_meta_nosync_contract(vllm_config: object) -> bool:
+    """MTP-lane admission: the SM70 Qwen3.8 TP4 contract with method "mtp"."""
+    try:
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if (
+            speculative_config is None
+            or getattr(speculative_config, "method", None) != "mtp"
+        ):
+            return False
+        from vllm.config.vllm import (
+            _any_participating_device_is_capability,
+            _is_sm70_qwen38_nomtp_dual_compile_contract,
+        )
+
+        # The topology half of the existing no-MTP contract (architecture,
+        # dtype, hidden/expert/QSA geometry, TP4/PP1) is reused verbatim; the
+        # speculative_config slot is passed as None because the MTP method is
+        # checked above.
+        return bool(
+            _is_sm70_qwen38_nomtp_dual_compile_contract(
+                getattr(vllm_config, "model_config", None),
+                None,
+                getattr(vllm_config, "parallel_config", None),
+            )
+            and _any_participating_device_is_capability(
+                vllm_config,  # type: ignore[arg-type]
+                (7, 0),
+            )
+        )
+    except Exception:  # pragma: no cover - never block startup
+        logger.warning(
+            "SX_OPT_SPEC_META_NOSYNC: contract check failed; keeping the "
+            "legacy spec-decode metadata path.",
+            exc_info=True,
+        )
+        return False
+
+
+def sx_spec_meta_nosync_admitted(vllm_config: object) -> bool:
+    enabled = _sx_spec_meta_nosync_switch() and sx_spec_meta_nosync_contract(
+        vllm_config
+    )
+    if enabled:
+        logger.info_once(
+            "SX_OPT_SPEC_META_NOSYNC: sync-free GDN/PLE short-conv "
+            "speculative-decode metadata active (MTP lane)."
+        )
+    return enabled
+
+
+_SX_PIN_MEMORY: bool | None = None
+
+
+def _sx_pin_memory() -> bool:
+    global _SX_PIN_MEMORY
+    if _SX_PIN_MEMORY is None:
+        from vllm.utils.platform_utils import is_pin_memory_available
+
+        _SX_PIN_MEMORY = bool(is_pin_memory_available())
+    return _SX_PIN_MEMORY
+
+
+def sx_h2d_nosync(cpu_tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Host->device copy that never blocks the host on the stream.
+
+    The staging tensor is pinned through the caching host allocator, which
+    records the copy's stream event and recycles the block only after it has
+    completed.
+    """
+    if device.type == "cpu":
+        return cpu_tensor
+    if _sx_pin_memory():
+        cpu_tensor = cpu_tensor.pin_memory()
+    return cpu_tensor.to(device=device, non_blocking=True)
+
+
+class SxSpecRows:
+    """Host-derived spec / non-spec row split replacing boolean-mask indexing.
+
+    ``prefix``: the spec rows are exactly rows ``[0, num_spec)`` (every pure
+    verify batch). Spec rows are then ``t[:num_spec]`` and non-spec rows
+    ``t[num_spec:]``: no copy, no index tensor.
+
+    Otherwise ``order`` holds ``[spec rows | non-spec rows]`` (each ascending,
+    the order boolean indexing produces) on the device, copied from pinned
+    host memory, and rows are gathered with ``index_select``.
+    """
+
+    __slots__ = ("num_spec", "prefix", "order_cpu", "order")
+
+    def __init__(
+        self,
+        num_spec: int,
+        prefix: bool,
+        order_cpu: torch.Tensor | None = None,
+        order: torch.Tensor | None = None,
+    ) -> None:
+        self.num_spec = num_spec
+        self.prefix = prefix
+        self.order_cpu = order_cpu
+        self.order = order
+
+    @staticmethod
+    def is_prefix(mask_cpu: torch.Tensor, num_spec: int) -> bool:
+        # num_spec == mask.sum(): all-True leading rows imply an all-False tail.
+        return bool(mask_cpu[:num_spec].all())
+
+    @staticmethod
+    def host_order(mask_cpu: torch.Tensor) -> torch.Tensor:
+        return torch.cat(
+            (
+                mask_cpu.nonzero(as_tuple=True)[0],
+                (~mask_cpu).nonzero(as_tuple=True)[0],
+            )
+        ).to(torch.int32)
+
+    def _order_for(self, device: torch.device) -> torch.Tensor:
+        if self.order is not None and self.order.device == device:
+            return self.order
+        assert self.order_cpu is not None
+        order = sx_h2d_nosync(self.order_cpu, device)
+        if self.order is None:
+            self.order = order
+        return order
+
+    def spec(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.prefix:
+            return tensor[: self.num_spec]
+        return tensor.index_select(
+            0, self._order_for(tensor.device)[: self.num_spec]
+        )
+
+    def non_spec(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.prefix:
+            return tensor[self.num_spec :]
+        return tensor.index_select(
+            0, self._order_for(tensor.device)[self.num_spec :]
+        )
+
+
+def _sx_pad4(tensor: torch.Tensor) -> torch.Tensor:
+    """Pad an int32 staging segment to 16 bytes so every device view starts
+    16-byte aligned, like a fresh allocation."""
+    pad = (-tensor.numel()) % 4
+    if pad == 0:
+        return tensor
+    return torch.cat((tensor, tensor.new_zeros(pad)))
+
+
+class _SxGDNSpecParts(NamedTuple):
+    num_prefills: int
+    num_prefill_tokens: int
+    num_decodes: int
+    num_decode_tokens: int
+    num_spec_decode_tokens: int
+    spec_token_indx: torch.Tensor
+    non_spec_token_indx: torch.Tensor
+    spec_query_start_loc: torch.Tensor
+    non_spec_query_start_loc: torch.Tensor | None
+    non_spec_query_start_loc_cpu: torch.Tensor | None
+    spec_state_indices_tensor: torch.Tensor
+    non_spec_state_indices_tensor: torch.Tensor | None
+    num_accepted_tokens: torch.Tensor
+    spec_state_slot_selectors: torch.Tensor
+    rows: SxSpecRows
+    spec_qsl_last: int
 
 
 @dataclass
@@ -583,6 +783,84 @@ def select_gdn_state_block_ids(
     return block_table[row_indices, state_offsets]
 
 
+def _build_gdn_spec_state_rows_nosync(
+    *,
+    block_table_tensor: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    num_spec: int,
+    num_accepted_tokens: torch.Tensor,
+    current_state_block_ids: torch.Tensor | None,
+    is_mamba_cache_all: bool,
+    spec_state_slot_selectors: torch.Tensor | None,
+    spec_rows: SxSpecRows,
+    need_non_spec_state: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    """Sync-free twin of the boolean-mask gathers in the state contract.
+
+    ``rows.spec(t)`` / ``rows.non_spec(t)`` return exactly ``t[mask]`` /
+    ``t[~mask]``. Spec outputs are made contiguous like the fresh tensors that
+    boolean indexing returns (a no-op for the contiguous slices of the
+    normal align/none-mode tables).
+    """
+    rows = spec_rows
+
+    def _non_spec_accepted() -> torch.Tensor | None:
+        # select_gdn_state_block_ids ignores the counts in legacy slot-0 mode.
+        if envs.VLLM_SM70_MTP_LEGACY_GDN_NON_SPEC_SLOT0:
+            return None
+        return rows.non_spec(num_accepted_tokens)
+
+    non_spec_state_indices_tensor: torch.Tensor | None = None
+    if current_state_block_ids is not None:
+        state_block_ids = current_state_block_ids[:, : num_spec + 1]
+        spec_state_indices_tensor = rows.spec(state_block_ids).contiguous()
+        if need_non_spec_state:
+            non_spec_state_indices_tensor = select_gdn_state_block_ids(
+                rows.non_spec(state_block_ids),
+                _non_spec_accepted(),
+                num_spec,
+            )
+    elif is_mamba_cache_all:
+        spec_state_indices_tensor = gather_gdn_state_block_ids(
+            rows.spec(block_table_tensor),
+            rows.spec(seq_lens),
+            block_size,
+            num_spec + 1,
+        )
+        if need_non_spec_state:
+            non_spec_state_indices_tensor = gather_gdn_state_block_ids(
+                rows.non_spec(block_table_tensor),
+                rows.non_spec(seq_lens),
+                block_size,
+                1,
+            ).squeeze(1)
+    else:
+        spec_state_indices_tensor = rows.spec(
+            block_table_tensor[:, : num_spec + 1]
+        ).contiguous()
+        if need_non_spec_state:
+            non_spec_state_indices_tensor = select_gdn_state_block_ids(
+                rows.non_spec(block_table_tensor),
+                _non_spec_accepted(),
+                num_spec,
+            )
+
+    spec_num_accepted_tokens = rows.spec(num_accepted_tokens).contiguous()
+    if spec_state_slot_selectors is None:
+        # Same values as the separate masked copy of num_accepted_tokens the
+        # legacy path made; consumers only read it.
+        spec_selectors = spec_num_accepted_tokens
+    else:
+        spec_selectors = rows.spec(spec_state_slot_selectors).contiguous()
+    return (
+        spec_state_indices_tensor,
+        non_spec_state_indices_tensor,
+        spec_num_accepted_tokens,
+        spec_selectors,
+    )
+
+
 def build_gdn_spec_decode_state_contract(
     *,
     block_table_tensor: torch.Tensor,
@@ -594,6 +872,8 @@ def build_gdn_spec_decode_state_contract(
     current_state_block_ids: torch.Tensor | None,
     is_mamba_cache_all: bool,
     spec_state_slot_selectors: torch.Tensor | None = None,
+    spec_rows: SxSpecRows | None = None,
+    need_non_spec_state: bool = True,
 ) -> GDNSpecDecodeStateContract:
     """Build the state-index/count contract consumed by active-MTP GDN.
 
@@ -603,6 +883,12 @@ def build_gdn_spec_decode_state_contract(
     speculative slot as ``num_accepted_tokens - 1`` in the recurrent kernels.
     DDTree can accept a non-linear tree path, so callers may pass
     ``spec_state_slot_selectors`` to select that slot independently.
+
+    ``spec_rows`` (SX_OPT_SPEC_META_NOSYNC) replaces every boolean-mask
+    gather with the equivalent host-decided slice / ``index_select``; the
+    returned tensors hold the same values. ``need_non_spec_state=False``
+    (pure verify batches, whose caller discards the non-spec state) skips the
+    non-spec gathers and returns ``non_spec_state_indices_tensor=None``.
     """
     assert spec_sequence_masks_cpu.dtype == torch.bool
     assert num_accepted_tokens is not None
@@ -612,46 +898,65 @@ def build_gdn_spec_decode_state_contract(
             return spec_sequence_masks_cpu
         return spec_sequence_masks_cpu.to(tensor.device, non_blocking=True)
 
-    block_mask = _mask_for(block_table_tensor)
-    seq_mask = _mask_for(seq_lens)
-    accepted_mask = _mask_for(num_accepted_tokens)
-    if spec_state_slot_selectors is None:
-        spec_state_slot_selectors = num_accepted_tokens
-    selector_mask = _mask_for(spec_state_slot_selectors)
-
-    if current_state_block_ids is not None:
-        current_mask = _mask_for(current_state_block_ids)
-        state_block_ids = current_state_block_ids[:, : num_spec + 1]
-        spec_state_indices_tensor = state_block_ids[current_mask]
-        non_spec_source = state_block_ids[~current_mask]
-        non_spec_state_indices_tensor = select_gdn_state_block_ids(
-            non_spec_source,
-            num_accepted_tokens[~accepted_mask],
-            num_spec,
+    if spec_rows is not None:
+        (
+            spec_state_indices_tensor,
+            non_spec_state_indices_tensor,
+            spec_num_accepted_tokens,
+            spec_state_slot_selectors,
+        ) = _build_gdn_spec_state_rows_nosync(
+            block_table_tensor=block_table_tensor,
+            seq_lens=seq_lens,
+            block_size=block_size,
+            num_spec=num_spec,
+            num_accepted_tokens=num_accepted_tokens,
+            current_state_block_ids=current_state_block_ids,
+            is_mamba_cache_all=is_mamba_cache_all,
+            spec_state_slot_selectors=spec_state_slot_selectors,
+            spec_rows=spec_rows,
+            need_non_spec_state=need_non_spec_state,
         )
-    elif is_mamba_cache_all:
-        spec_state_indices_tensor = gather_gdn_state_block_ids(
-            block_table_tensor[block_mask],
-            seq_lens[seq_mask],
-            block_size,
-            num_spec + 1,
-        )
-        non_spec_state_indices_tensor = gather_gdn_state_block_ids(
-            block_table_tensor[~block_mask],
-            seq_lens[~seq_mask],
-            block_size,
-            1,
-        ).squeeze(1)
     else:
-        spec_state_indices_tensor = block_table_tensor[block_mask, : num_spec + 1]
-        non_spec_state_indices_tensor = select_gdn_state_block_ids(
-            block_table_tensor[~block_mask],
-            num_accepted_tokens[~accepted_mask],
-            num_spec,
-        )
+        block_mask = _mask_for(block_table_tensor)
+        seq_mask = _mask_for(seq_lens)
+        accepted_mask = _mask_for(num_accepted_tokens)
+        if spec_state_slot_selectors is None:
+            spec_state_slot_selectors = num_accepted_tokens
+        selector_mask = _mask_for(spec_state_slot_selectors)
 
-    spec_num_accepted_tokens = num_accepted_tokens[accepted_mask]
-    spec_state_slot_selectors = spec_state_slot_selectors[selector_mask]
+        if current_state_block_ids is not None:
+            current_mask = _mask_for(current_state_block_ids)
+            state_block_ids = current_state_block_ids[:, : num_spec + 1]
+            spec_state_indices_tensor = state_block_ids[current_mask]
+            non_spec_source = state_block_ids[~current_mask]
+            non_spec_state_indices_tensor = select_gdn_state_block_ids(
+                non_spec_source,
+                num_accepted_tokens[~accepted_mask],
+                num_spec,
+            )
+        elif is_mamba_cache_all:
+            spec_state_indices_tensor = gather_gdn_state_block_ids(
+                block_table_tensor[block_mask],
+                seq_lens[seq_mask],
+                block_size,
+                num_spec + 1,
+            )
+            non_spec_state_indices_tensor = gather_gdn_state_block_ids(
+                block_table_tensor[~block_mask],
+                seq_lens[~seq_mask],
+                block_size,
+                1,
+            ).squeeze(1)
+        else:
+            spec_state_indices_tensor = block_table_tensor[block_mask, : num_spec + 1]
+            non_spec_state_indices_tensor = select_gdn_state_block_ids(
+                block_table_tensor[~block_mask],
+                num_accepted_tokens[~accepted_mask],
+                num_spec,
+            )
+
+        spec_num_accepted_tokens = num_accepted_tokens[accepted_mask]
+        spec_state_slot_selectors = spec_state_slot_selectors[selector_mask]
     if os.getenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT") == "1":
         if spec_num_accepted_tokens.numel() != spec_state_indices_tensor.shape[0]:
             raise AssertionError(
@@ -756,6 +1061,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.num_spec_state_tokens = 0
         self.use_spec_decode: bool = self.num_spec > 0
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
+        # SX_OPT_SPEC_META_NOSYNC: sync-free spec-decode metadata (MTP lane).
+        self._sx_spec_meta_nosync: bool = (
+            self.use_spec_decode and sx_spec_meta_nosync_admitted(vllm_config)
+        )
 
         self.use_full_cuda_graph: bool = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
@@ -1283,6 +1592,194 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         return attn_metadata
 
+    def _sx_build_spec_nosync(
+        self,
+        *,
+        m: CommonAttentionMetadata,
+        query_start_loc: torch.Tensor,
+        query_start_loc_cpu: torch.Tensor,
+        query_lens_cpu: torch.Tensor,
+        non_spec_query_lens_cpu: torch.Tensor,
+        num_zero_len: int,
+        spec_sequence_masks: torch.Tensor,
+        spec_sequence_masks_cpu: torch.Tensor,
+        num_spec_decodes: int,
+        num_accepted_tokens: torch.Tensor,
+        spec_state_slot_selectors: torch.Tensor | None,
+        block_table_tensor: torch.Tensor,
+        current_state_block_ids: torch.Tensor | None,
+        is_mamba_cache_all: bool,
+        for_cudagraph_capture: bool,
+    ) -> _SxGDNSpecParts:
+        """SX_OPT_SPEC_META_NOSYNC twin of the per-builder spec branch.
+
+        Request classification is host-only and unchanged. The device side
+        needs no ``nonzero``/``.item()``/blocking copy:
+          * pure verify batch with spec rows first (the MTP decode step):
+            slices only, no host->device copy besides the spec mask;
+          * otherwise one pinned non_blocking int32 copy carries the row
+            order and, for mixed batches, the query lengths and both query
+            start offsets, which are cumulated on the host (the same int32
+            values the device cumsum over the masked lengths produced).
+
+        Mixed batches always gather through the row order, even when the
+        spec rows lead: the non-spec rows (``t[num_spec:]``) would otherwise
+        be views at an arbitrary offset, i.e. not 16-byte aligned, and they
+        feed the TileLang/Triton prefill and causal-conv kernels, which
+        specialize on (or assume) pointer alignment. Gathers return fresh
+        allocations, exactly like the legacy boolean indexing. Pure batches
+        only take ``t[:num_spec]`` slices, which start at offset 0.
+        """
+        device = query_start_loc.device
+        if envs.VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING:
+            num_decodes = (non_spec_query_lens_cpu == 1).sum().item()
+            num_prefills = non_spec_query_lens_cpu.size(0) - num_decodes - num_zero_len
+            num_decode_tokens = num_decodes
+            num_prefill_tokens = (
+                non_spec_query_lens_cpu.sum().item() - num_decode_tokens
+            )
+        else:
+            num_decodes = 0
+            num_prefills = non_spec_query_lens_cpu.size(0) - num_zero_len
+            num_decode_tokens = 0
+            num_prefill_tokens = non_spec_query_lens_cpu.sum().item()
+        num_spec_decode_tokens = (
+            query_lens_cpu.sum().item() - num_prefill_tokens - num_decode_tokens
+        )
+        pure = num_prefills == 0 and num_decodes == 0
+
+        num_rows = spec_sequence_masks_cpu.numel()
+        num_non_spec_rows = num_rows - num_spec_decodes
+        # Slices only for pure verify batches (see the docstring).
+        prefix = pure and SxSpecRows.is_prefix(
+            spec_sequence_masks_cpu, num_spec_decodes
+        )
+
+        staged_parts: list[torch.Tensor] = []
+        order_cpu: torch.Tensor | None = None
+        if not prefix:
+            order_cpu = SxSpecRows.host_order(spec_sequence_masks_cpu)
+            staged_parts.append(_sx_pad4(order_cpu))
+        spec_qsl_cpu: torch.Tensor | None = None
+        non_spec_query_start_loc_cpu: torch.Tensor | None = None
+        if not pure:
+            spec_qsl_cpu = torch.zeros(num_spec_decodes + 1, dtype=torch.int32)
+            torch.cumsum(
+                query_lens_cpu[spec_sequence_masks_cpu],
+                dim=0,
+                out=spec_qsl_cpu[1:],
+            )
+            non_spec_query_start_loc_cpu = torch.zeros(
+                num_non_spec_rows + 1,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            torch.cumsum(
+                query_lens_cpu[~spec_sequence_masks_cpu],
+                dim=0,
+                out=non_spec_query_start_loc_cpu[1:],
+            )
+            staged_parts.append(_sx_pad4(query_lens_cpu.to(torch.int32)))
+            staged_parts.append(_sx_pad4(spec_qsl_cpu))
+            staged_parts.append(_sx_pad4(non_spec_query_start_loc_cpu))
+        staged: torch.Tensor | None = None
+        if staged_parts:
+            staged = sx_h2d_nosync(
+                staged_parts[0] if len(staged_parts) == 1 else torch.cat(staged_parts),
+                device,
+            )
+
+        offset = 0
+
+        def _take(numel: int) -> torch.Tensor:
+            nonlocal offset
+            assert staged is not None
+            view = staged[offset : offset + numel]
+            offset += numel + ((-numel) % 4)
+            return view
+
+        rows = SxSpecRows(
+            num_spec_decodes,
+            prefix,
+            order_cpu,
+            None if order_cpu is None else _take(num_rows),
+        )
+        state_contract = build_gdn_spec_decode_state_contract(
+            block_table_tensor=block_table_tensor,
+            seq_lens=m.seq_lens,
+            block_size=self.kv_cache_spec.block_size,
+            num_spec=self.num_spec_state_tokens,
+            spec_sequence_masks_cpu=spec_sequence_masks_cpu,
+            num_accepted_tokens=num_accepted_tokens,
+            current_state_block_ids=current_state_block_ids,
+            is_mamba_cache_all=is_mamba_cache_all,
+            spec_state_slot_selectors=spec_state_slot_selectors,
+            spec_rows=rows,
+            need_non_spec_state=not pure,
+        )
+        spec_state_indices_tensor = state_contract.spec_state_indices_tensor
+        non_spec_state_indices_tensor: torch.Tensor | None
+        non_spec_query_start_loc: torch.Tensor | None
+        if pure:
+            spec_token_size = min(
+                num_spec_decodes * (self.num_spec_state_tokens + 1),
+                query_start_loc_cpu[-1].item(),
+            )
+            spec_token_indx = torch.arange(
+                spec_token_size, dtype=torch.int32, device=device
+            )
+            non_spec_token_indx = torch.empty(0, dtype=torch.int32, device=device)
+            non_spec_state_indices_tensor = None
+            # Padded sequences are always at the back.
+            spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
+            non_spec_query_start_loc = None
+            spec_qsl_last = int(query_start_loc_cpu[num_spec_decodes].item())
+        else:
+            assert spec_qsl_cpu is not None
+            query_lens = _take(num_rows)
+            spec_query_start_loc = _take(num_spec_decodes + 1)
+            non_spec_query_start_loc = _take(num_non_spec_rows + 1)
+            spec_token_masks = torch.repeat_interleave(
+                spec_sequence_masks,
+                query_lens,
+                output_size=query_start_loc_cpu[-1].item(),
+            )
+            index = torch.argsort(spec_token_masks, stable=True)
+            num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
+            non_spec_token_indx = index[:num_non_spec_tokens]
+            spec_token_indx = index[num_non_spec_tokens:]
+            non_spec_state_indices_tensor = (
+                state_contract.non_spec_state_indices_tensor
+            )
+            assert non_spec_state_indices_tensor is not None
+            if for_cudagraph_capture:
+                spec_state_indices_tensor = torch.full_like(
+                    spec_state_indices_tensor, PAD_SLOT_ID
+                )
+                non_spec_state_indices_tensor = torch.full_like(
+                    non_spec_state_indices_tensor, PAD_SLOT_ID
+                )
+            spec_qsl_last = int(spec_qsl_cpu[-1].item())
+
+        return _SxGDNSpecParts(
+            num_prefills=num_prefills,
+            num_prefill_tokens=num_prefill_tokens,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            num_spec_decode_tokens=num_spec_decode_tokens,
+            spec_token_indx=spec_token_indx,
+            non_spec_token_indx=non_spec_token_indx,
+            spec_query_start_loc=spec_query_start_loc,
+            non_spec_query_start_loc=non_spec_query_start_loc,
+            non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
+            spec_state_indices_tensor=spec_state_indices_tensor,
+            non_spec_state_indices_tensor=non_spec_state_indices_tensor,
+            num_accepted_tokens=state_contract.num_accepted_tokens,
+            spec_state_slot_selectors=state_contract.spec_state_slot_selectors,
+            rows=rows,
+            spec_qsl_last=spec_qsl_last,
+        )
+
     def build(  # type: ignore[override]
         self,
         common_prefix_len: int,
@@ -1368,6 +1865,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         is_mamba_cache_all = self.vllm_config.cache_config.mamba_cache_mode == "all"
 
         num_reqs = query_start_loc_cpu.numel() - 1
+        # SX_OPT_SPEC_META_NOSYNC covers the per-builder MTP path only; the
+        # shared DFlash2 metadata and DDTree routes keep their own code.
+        sx_nosync = (
+            getattr(self, "_sx_spec_meta_nosync", False)
+            and common_gdn_metadata is None
+            and ddtree_parent_ids is None
+        )
+        sx_rows: SxSpecRows | None = None
+        sx_spec_qsl_last: int | None = None
         if common_gdn_metadata is not None:
             if ddtree_parent_ids is not None or current_state_block_ids is not None:
                 raise ValueError(
@@ -1441,13 +1947,23 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                         spec_sequence_masks_cpu = None
                     else:
                         num_spec_decodes = spec_sequence_masks_cpu.sum().item()
-                        spec_sequence_masks = spec_sequence_masks_cpu.to(
-                            query_start_loc.device, non_blocking=True
+                        spec_sequence_masks = (
+                            sx_h2d_nosync(
+                                spec_sequence_masks_cpu, query_start_loc.device
+                            )
+                            if sx_nosync
+                            else spec_sequence_masks_cpu.to(
+                                query_start_loc.device, non_blocking=True
+                            )
                         )
                 else:
                     num_spec_decodes = spec_sequence_masks_cpu.sum().item()
-                    spec_sequence_masks = spec_sequence_masks_cpu.to(
-                        query_start_loc.device, non_blocking=True
+                    spec_sequence_masks = (
+                        sx_h2d_nosync(spec_sequence_masks_cpu, query_start_loc.device)
+                        if sx_nosync
+                        else spec_sequence_masks_cpu.to(
+                            query_start_loc.device, non_blocking=True
+                        )
                     )
 
         if spec_sequence_masks is None:
@@ -1628,6 +2144,47 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     profile_state_contract_ms = (
                         time.perf_counter() - profile_state_contract_t0
                     ) * 1000.0
+            elif sx_nosync:
+                profile_state_contract_t0 = (
+                    time.perf_counter() if metadata_profile else 0.0
+                )
+                sx_parts = self._sx_build_spec_nosync(
+                    m=m,
+                    query_start_loc=query_start_loc,
+                    query_start_loc_cpu=query_start_loc_cpu,
+                    query_lens_cpu=query_lens_cpu,
+                    non_spec_query_lens_cpu=non_spec_query_lens_cpu,
+                    num_zero_len=num_zero_len,
+                    spec_sequence_masks=spec_sequence_masks,
+                    spec_sequence_masks_cpu=spec_sequence_masks_cpu,
+                    num_spec_decodes=num_spec_decodes,
+                    num_accepted_tokens=num_accepted_tokens,
+                    spec_state_slot_selectors=spec_state_slot_selectors,
+                    block_table_tensor=block_table_tensor,
+                    current_state_block_ids=current_state_block_ids,
+                    is_mamba_cache_all=is_mamba_cache_all,
+                    for_cudagraph_capture=for_cudagraph_capture,
+                )
+                num_prefills = sx_parts.num_prefills
+                num_prefill_tokens = sx_parts.num_prefill_tokens
+                num_decodes = sx_parts.num_decodes
+                num_decode_tokens = sx_parts.num_decode_tokens
+                num_spec_decode_tokens = sx_parts.num_spec_decode_tokens
+                spec_token_indx = sx_parts.spec_token_indx
+                non_spec_token_indx = sx_parts.non_spec_token_indx
+                spec_query_start_loc = sx_parts.spec_query_start_loc
+                non_spec_query_start_loc = sx_parts.non_spec_query_start_loc
+                non_spec_query_start_loc_cpu = sx_parts.non_spec_query_start_loc_cpu
+                spec_state_indices_tensor = sx_parts.spec_state_indices_tensor
+                non_spec_state_indices_tensor = sx_parts.non_spec_state_indices_tensor
+                num_accepted_tokens = sx_parts.num_accepted_tokens
+                spec_state_slot_selectors = sx_parts.spec_state_slot_selectors
+                sx_rows = sx_parts.rows
+                sx_spec_qsl_last = sx_parts.spec_qsl_last
+                if metadata_profile:
+                    profile_state_contract_ms = (
+                        time.perf_counter() - profile_state_contract_t0
+                    ) * 1000.0
             else:
                 # query_start_loc may be padded for CUDA graph replay. The CPU
                 # metadata is authoritative for the live request count here.
@@ -1785,7 +2342,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 num_accepted_tokens = state_contract.num_accepted_tokens
                 spec_state_slot_selectors = state_contract.spec_state_slot_selectors
             assert spec_query_start_loc is not None
-            if common_gdn_metadata is None:
+            if sx_spec_qsl_last is not None:
+                # Host-side twin of the device check below: the same value,
+                # read from the host copy the device tensor was built from.
+                assert sx_spec_qsl_last == num_spec_decode_tokens
+                if os.getenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT") == "1":
+                    # Opt-in debug fence (syncs): also catch a host/device
+                    # query_start_loc mismatch, as the legacy assert did.
+                    assert spec_query_start_loc[-1].item() == num_spec_decode_tokens
+            elif common_gdn_metadata is None:
                 assert spec_query_start_loc[-1].item() == num_spec_decode_tokens
             else:
                 assert (
@@ -1829,17 +2394,37 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
                 assert non_spec_query_start_loc_cpu is not None
-                chunk_indices = prepare_chunk_indices(
-                    non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE
-                ).to(device=gpu_device, non_blocking=True)
-                chunk_offsets = prepare_chunk_offsets(
-                    non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE
-                ).to(device=gpu_device, non_blocking=True)
+                if sx_nosync and spec_sequence_masks_cpu is not None:
+                    # Same values, pinned staging (MTP lane mixed steps).
+                    chunk_indices = sx_h2d_nosync(
+                        prepare_chunk_indices(
+                            non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE
+                        ),
+                        gpu_device,
+                    )
+                    chunk_offsets = sx_h2d_nosync(
+                        prepare_chunk_offsets(
+                            non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE
+                        ),
+                        gpu_device,
+                    )
+                else:
+                    chunk_indices = prepare_chunk_indices(
+                        non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE
+                    ).to(device=gpu_device, non_blocking=True)
+                    chunk_offsets = prepare_chunk_offsets(
+                        non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE
+                    ).to(device=gpu_device, non_blocking=True)
 
         if num_prefills > 0:
             has_initial_state = context_lens_tensor > 0
             if spec_sequence_masks_cpu is not None:
-                has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
+                if sx_rows is not None:
+                    # A CUDA tensor indexed by a CPU mask copies the indices
+                    # with a blocking H2D; gather the same rows sync-free.
+                    has_initial_state = sx_rows.non_spec(has_initial_state)
+                else:
+                    has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
                 assert non_spec_query_start_loc_cpu is not None
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
                 compute_causal_conv1d_metadata(

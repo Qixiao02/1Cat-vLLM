@@ -61,6 +61,45 @@ def _sx_push_ar_wide_payload(nbytes: int) -> bool:
     )
 
 
+# [SX_OPT_MTP_MOE_ROUTES] (batch 3a, design_4 [MTP-K4] phase A; gating only,
+# no native change). In the SM70 Qwen3.8 TP4 native-MTP lane with k = 4
+# (sx_sm70_qwen38_mtp_verify_q == 5, see fused_moe/router/fused_topk_router.py)
+# 1Cat's opt-in 25-KiB [5, 2560] push admission (regular and sum2 collective,
+# 13 CTAs, csrc/custom_all_reduce.cuh) is defaulted on for the M5 verify: the
+# native side reads VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5 with getenv at CUDA-graph
+# capture, so it is set in this process before any capture when absent. With
+# SX_OPT_PUSH_AR_WIDE on (default) the wide admission already pushes that
+# payload on the same 13-CTA grid, so this only matters with the wide
+# admission off. Push equals pull bitwise (rank-order FP32 upcast); the
+# decision depends on the config only, so every TP rank agrees. An explicit
+# VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5 value, SX_OPT_MTP_MOE_ROUTES=0 and
+# SX_OPT_MTP_LANE=0 keep the previous behaviour; without a speculative config
+# nothing is imported or set.
+_SX_MTP5_PUSH_AR_ENV = "VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5"
+_SX_MTP5_VERIFY_ROWS = 5
+
+
+def _sx_mtp_lane_push_ar_mtp5() -> bool:
+    """Whether to default the 25-KiB MTP5 push admission on (see above)."""
+    if os.environ.get("SX_OPT_MTP_MOE_ROUTES", "1") == "0":
+        return False
+    if _SX_MTP5_PUSH_AR_ENV in os.environ:
+        return False
+    try:
+        from vllm.config.vllm import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+        if config is None or getattr(config, "speculative_config", None) is None:
+            return False
+        from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+            sx_sm70_qwen38_mtp_verify_q,
+        )
+
+        return sx_sm70_qwen38_mtp_verify_q(config) == _SX_MTP5_VERIFY_ROWS
+    except Exception:  # noqa: BLE001 - defensive; never fail AR setup
+        return False
+
+
 _EXPANDABLE_SEGMENTS_TRUE_PATTERN = re.compile(
     r"((?:^|,)\s*expandable_segments\s*:\s*)True(?=\s*(?:,|$))"
 )
@@ -376,8 +415,19 @@ class CustomAllreduce:
             ops.register_sm70_tp4_push_allreduce_buffer(
                 self._ptr, self.sm70_tp4_push_buffer_ptrs
             )
+            if _sx_mtp_lane_push_ar_mtp5():
+                os.environ[_SX_MTP5_PUSH_AR_ENV] = "1"
+                logger.info(
+                    "SX_OPT_MTP_MOE_ROUTES: SM70 Qwen3.8 TP4 MTP lane (k=4) "
+                    "admits the 25-KiB [5, 2560] push all-reduce for the M5 "
+                    "verify (%s=1)",
+                    _SX_MTP5_PUSH_AR_ENV,
+                )
             mtp5_status = (
-                "enabled" if envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5 else "disabled"
+                "enabled"
+                if os.environ.get(_SX_MTP5_PUSH_AR_ENV) == "1"
+                or envs.VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5
+                else "disabled"
             )
             qwen38_batch_status = (
                 "enabled"
