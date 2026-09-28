@@ -596,6 +596,7 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP: bool = False
     VLLM_SM70_GDN_QPN8_BA_SPLIT: bool = False
     VLLM_SM70_GDN_RMSNORM_ONEPASS: bool = False
+    VLLM_SM70_RMSNORM_GATED_EXACT: bool = False
     VLLM_SM70_GEMMA_RMS_NORM_EAGER: bool = False
     VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE: bool = False
     VLLM_SM70_GEMMA_LONG_PREFILL_FUSED: bool = True
@@ -3596,6 +3597,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_GDN_RMSNORM_ONEPASS": lambda: bool(
         int(os.getenv("VLLM_SM70_GDN_RMSNORM_ONEPASS", "0"))
+    ),
+    # Upstream 1Cat #704: exact native gated RMSNorm (N128, sigmoid/SiLU) so
+    # C1 and batch compiled graphs share the same FP32 arithmetic.
+    "VLLM_SM70_RMSNORM_GATED_EXACT": lambda: bool(
+        int(os.getenv("VLLM_SM70_RMSNORM_GATED_EXACT", "0"))
     ),
     # Diagnostic-only: keep Qwen3.5/Gemma RMSNorm arithmetic behind an opaque
     # custom-op boundary under the SM70 compile/FULL graph lane.

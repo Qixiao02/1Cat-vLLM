@@ -382,6 +382,17 @@ def _sm70_qwen38_lane_qualified(cfg: "VllmConfig", *, is_sm70: bool) -> bool:
     )
 
 
+def _sm70_rmsnorm_gated_exact_available() -> bool:
+    """Whether _C carries the exact gated-norm op (1.9.1+; older _C lacks it)."""
+    try:
+        import torch
+
+        import vllm._C  # noqa: F401
+    except Exception:
+        return False
+    return hasattr(torch.ops._C, "sm70_rmsnorm_gated_exact_out")
+
+
 def _apply_sm70_qwen38_nomtp_defaults(
     cfg: "VllmConfig", *, is_sm70: bool
 ) -> tuple[str, ...]:
@@ -406,6 +417,11 @@ def _apply_sm70_qwen38_nomtp_defaults(
         # MTP lane only (the lane contract admitted it): exact verify widths
         # for the target and exact request counts for the draft decode.
         defaults["VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS"] = "1"
+    elif _sm70_rmsnorm_gated_exact_available():
+        # Upstream 1Cat #704: pin the native FP32 gated-norm arithmetic across
+        # independently compiled C1/batch graphs. Tiny fusion-dependent
+        # rounding differences can change an MoE route and flip an EOS token.
+        defaults["VLLM_SM70_RMSNORM_GATED_EXACT"] = "1"
     applied = []
     for name, value in defaults.items():
         if name not in os.environ:
