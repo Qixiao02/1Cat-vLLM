@@ -11,11 +11,13 @@ from vllm.model_executor.layers.layernorm import (
 from vllm.platforms import current_platform
 
 
-@pytest.mark.parametrize("rows", [1, 12, 60, 120, 192, 193])
+# SX 1.9.1-dev2: the row count is not part of admission (it is the dynamic
+# token dimension, decided once per compile range at trace time).
+@pytest.mark.parametrize("rows", [1, 12, 60, 120, 192, 193, 288, 98304])
 def test_shape_admission(rows):
     x = torch.empty(rows, 128, dtype=torch.float16)
     w = torch.empty(128, dtype=torch.float16)
-    assert _sm70_gated_norm_shape_supported(x, x, w) == (rows <= 192)
+    assert _sm70_gated_norm_shape_supported(x, x, w)
     assert not _sm70_gated_norm_shape_supported(x, None, w)
     assert not _sm70_gated_norm_shape_supported(x.float(), x, w)
     assert not _sm70_gated_norm_shape_supported(x[:, :127], x[:, :127], w[:127])
@@ -43,7 +45,7 @@ def assert_bits(actual, expected):
     )
 
 
-@pytest.mark.parametrize("rows", [1, 12, 24, 48, 60, 96, 120, 192])
+@pytest.mark.parametrize("rows", [1, 12, 24, 48, 60, 96, 120, 192, 288, 384, 12288])
 @pytest.mark.parametrize("activation", ["sigmoid", "silu"])
 def test_changed_graph_inputs_and_canaries(
     rows, activation, monkeypatch, default_vllm_config
@@ -152,3 +154,44 @@ def test_compiled_norm_keeps_native_bits_across_batch_and_fusion_context(
                 activation="sigmoid",
             )
             assert_bits(actual, expected)
+
+
+def test_empty_rows():
+    require_native()
+    x = torch.empty(0, 128, device="cuda", dtype=torch.float16)
+    w = torch.ones(128, device="cuda", dtype=torch.float16)
+    torch.ops._C.sm70_rmsnorm_gated_exact_out(torch.empty_like(x), x, x, w, 1e-6, True)
+    torch.cuda.synchronize()
+
+
+@torch.inference_mode()
+def test_compiled_norm_traced_at_largest_size_keeps_native_bits(
+    monkeypatch, default_vllm_config
+):
+    """vLLM traces a compile range once at its largest size and drops shape
+    guards. Trace at 8192 tokens x 12 heads first, then run decode sizes: no
+    recompile, and every size keeps the native bits (SX 1.9.1-dev2)."""
+    require_native()
+    monkeypatch.setenv("VLLM_SM70_RMSNORM_GATED_EXACT", "1")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    envs.disable_envs_cache()
+    torch.manual_seed(20260928)
+    norm = RMSNormGated(
+        128,
+        eps=1e-6,
+        norm_before_gate=True,
+        activation="silu",
+        dtype=torch.float16,
+        device="cuda",
+    )
+    norm.weight.data.normal_()
+    compiled = torch.compile(norm.forward_native, fullgraph=True, dynamic=True)
+    for step, rows in enumerate((98304, 288, 12, 24, 192, 193, 12288, 12)):
+        x = torch.randn(rows, 128, device="cuda", dtype=torch.float16)
+        z = torch.randn_like(x)
+        with torch.compiler.set_stance("fail_on_recompile" if step else "default"):
+            actual = compiled(x, z)
+        expected = RMSNormGated.forward_static(
+            x, z, norm.weight, 1e-6, x.dtype, norm_before_gate=True, activation="silu"
+        )
+        assert_bits(actual, expected)

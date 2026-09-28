@@ -24,6 +24,14 @@ logger = init_logger(__name__)
 # Ported from upstream 1Cat 45248dc8d + 7f27016c1 (#704): exact native gated
 # RMSNorm for SM70, pinned so independently compiled C1/batch graphs share
 # the same FP32 arithmetic (VLLM_SM70_RMSNORM_GATED_EXACT).
+#
+# SX 1.9.1-dev2: upstream also admits only 1..192 rows here. vLLM traces each
+# compile range once, at its largest size, and drops shape guards, so a row
+# limit in this check is decided once for the whole range. On Flash-Next the
+# decode range is traced at 24 requests (288 rows) and the main range at 8192
+# tokens, so no graph was admitted and the op never ran. Only properties that
+# are static under torch.compile are checked now; the kernel takes any row
+# count (one warp per row, per-row arithmetic independent of the row count).
 @torch.compiler.assume_constant_result
 def _sm70_gated_norm_device_supported(device_id: int | None) -> bool:
     # Capability is static for the device guarded by the compiled tensor input.
@@ -34,12 +42,14 @@ def _sm70_gated_norm_device_supported(device_id: int | None) -> bool:
 def _sm70_gated_norm_shape_supported(
     x: torch.Tensor, z: torch.Tensor | None, weight: torch.Tensor
 ) -> bool:
+    # No condition on the dynamic row dimension (see above). The kernel checks
+    # that z and out match x at run time.
     return bool(
         z is not None
         and x.ndim == 2
-        and 1 <= x.shape[0] <= 192
+        and z.ndim == 2
         and x.shape[1] == 128
-        and z.shape == x.shape
+        and z.shape[1] == 128
         and weight.shape == (128,)
         and x.dtype == z.dtype == weight.dtype == torch.float16
         and x.device == z.device == weight.device

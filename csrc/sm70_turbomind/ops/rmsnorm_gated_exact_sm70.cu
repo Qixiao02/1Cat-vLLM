@@ -7,6 +7,8 @@
 #include <torch/library.h>
 #include <torch/types.h>
 
+#include <limits>
+
 namespace {
 template <bool Silu>
 __global__ void rmsnorm_gated_exact_kernel(const half* x, const half* z,
@@ -49,9 +51,12 @@ __global__ void rmsnorm_gated_exact_kernel(const half* x, const half* z,
 
 void rmsnorm_gated_exact(torch::Tensor out, torch::Tensor x, torch::Tensor z,
                          torch::Tensor weight, double eps, bool silu) {
+  // SX 1.9.1-dev2: any row count (upstream: 1..192). One warp per row, and a
+  // row's arithmetic does not depend on how many rows the launch has, so
+  // decode, mixed and prefill graphs of any size give the same bits per row.
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(1) == 128 &&
-                  x.size(0) >= 1 && x.size(0) <= 192,
-              "SM70 exact gated RMSNorm requires CUDA [1..192, 128]");
+                  x.size(0) <= std::numeric_limits<int>::max() / 128,
+              "SM70 exact gated RMSNorm requires CUDA [rows, 128]");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
@@ -65,6 +70,9 @@ void rmsnorm_gated_exact(torch::Tensor out, torch::Tensor x, torch::Tensor z,
                   weight.sizes() == at::IntArrayRef({128}),
               "Invalid exact gated RMSNorm output/gate/weight geometry");
   const int rows = x.size(0);
+  if (rows == 0) {
+    return;
+  }
   const auto stream = at::cuda::getCurrentCUDAStream();
 #define LAUNCH(S)                                                    \
   rmsnorm_gated_exact_kernel<S><<<(rows + 3) / 4, 128, 0, stream>>>( \
