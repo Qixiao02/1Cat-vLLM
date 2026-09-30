@@ -1,0 +1,256 @@
+{
+ "args": {
+  "port": 8031,
+  "model": "Swift-1.5-Qwen3.8-Flash-Next",
+  "out": "/mnt/2t/build/pfx_ab/result_on.json",
+  "lengths": "8000,16000,32000,64000",
+  "conc": 4,
+  "gen": 400,
+  "passes": 2,
+  "seed": 20260930
+ },
+ "started": "2026-09-30 16:58:35",
+ "cells": [
+  {
+   "prompt_tokens": [
+    7995,
+    7999,
+    8003,
+    7998
+   ],
+   "completion_tokens": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "ttft": [
+    1.412,
+    3.765,
+    4.98,
+    5.076
+   ],
+   "prefill_tok_s": 6303.5,
+   "decode_window_s": 6.595,
+   "decode_tok_s": 59.83,
+   "decode_agg_tok_s": 239.33,
+   "e2e_s": 11.727,
+   "kv_peak": 0.1356,
+   "cache_hit_tokens": 0.0,
+   "preemptions": 0.0,
+   "length": 8000,
+   "pass": 0
+  },
+  {
+   "prompt_tokens": [
+    15993,
+    15998,
+    15996,
+    15996
+   ],
+   "completion_tokens": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "ttft": [
+    3.966,
+    6.344,
+    10.049,
+    10.206
+   ],
+   "prefill_tok_s": 6269.1,
+   "decode_window_s": 6.43,
+   "decode_tok_s": 60.89,
+   "decode_agg_tok_s": 243.56,
+   "e2e_s": 16.723,
+   "kv_peak": 0.2297,
+   "cache_hit_tokens": 0.0,
+   "preemptions": 0.0,
+   "length": 16000,
+   "pass": 0
+  },
+  {
+   "prompt_tokens": [
+    32010,
+    32019,
+    31986,
+    31991
+   ],
+   "completion_tokens": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "ttft": [
+    6.965,
+    13.279,
+    16.168,
+    20.974
+   ],
+   "prefill_tok_s": 6103.0,
+   "decode_window_s": 6.567,
+   "decode_tok_s": 58.75,
+   "decode_agg_tok_s": 234.99,
+   "e2e_s": 27.719,
+   "kv_peak": 0.4412,
+   "cache_hit_tokens": 0.0,
+   "preemptions": 0.0,
+   "length": 32000,
+   "pass": 0
+  },
+  {
+   "prompt_tokens": [
+    64037,
+    63995,
+    63995,
+    63981
+   ],
+   "completion_tokens": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "ttft": [
+    13.275,
+    24.197,
+    36.127,
+    44.601
+   ],
+   "prefill_tok_s": 5739.9,
+   "decode_window_s": 6.691,
+   "decode_tok_s": 55.6,
+   "decode_agg_tok_s": 222.4,
+   "e2e_s": 51.644,
+   "kv_peak": 0.8608,
+   "cache_hit_tokens": 0.0,
+   "preemptions": 0.0,
+   "length": 64000,
+   "pass": 0
+  },
+  {
+   "prompt_tokens": [
+    7994,
+    7999,
+    8001,
+    8000
+   ],
+   "completion_tokens": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "ttft": [
+    2.574,
+    3.732,
+    3.92,
+    5.035
+   ],
+   "prefill_tok_s": 6353.9,
+   "decode_window_s": 6.593,
+   "decode_tok_s": 59.88,
+   "decode_agg_tok_s": 239.52,
+   "e2e_s": 11.679,
+   "kv_peak": 0.1284,
+   "cache_hit_tokens": 0.0,
+   "preemptions": 0.0,
+   "length": 8000,
+   "pass": 1
+  },
+  {
+   "prompt_tokens": [
+    15998,
+    16004,
+    16007,
+    16000
+   ],
+   "completion_tokens": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "ttft": [
+    3.996,
+    6.375,
+    10.068,
+    10.238
+   ],
+   "prefill_tok_s": 6252.1,
+   "decode_window_s": 6.471,
+   "decode_tok_s": 60.73,
+   "decode_agg_tok_s": 242.93,
+   "e2e_s": 16.792,
+   "kv_peak": 0.2387,
+   "cache_hit_tokens": 0.0,
+   "preemptions": 0.0,
+   "length": 16000,
+   "pass": 1
+  },
+  {
+   "prompt_tokens": [
+    32002,
+    32001,
+    31990,
+    31991
+   ],
+   "completion_tokens": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "ttft": [
+    6.772,
+    13.145,
+    16.069,
+    20.917
+   ],
+   "prefill_tok_s": 6118.7,
+   "decode_window_s": 6.506,
+   "decode_tok_s": 59.34,
+   "decode_agg_tok_s": 237.35,
+   "e2e_s": 27.6,
+   "kv_peak": 0.4448,
+   "cache_hit_tokens": 0.0,
+   "preemptions": 0.0,
+   "length": 32000,
+   "pass": 1
+  },
+  {
+   "prompt_tokens": [
+    63991,
+    63996,
+    63968,
+    63979
+   ],
+   "completion_tokens": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "ttft": [
+    13.108,
+    23.884,
+    35.88,
+    44.322
+   ],
+   "prefill_tok_s": 5774.4,
+   "decode_window_s": 6.537,
+   "decode_tok_s": 57.37,
+   "decode_agg_tok_s": 229.48,
+   "e2e_s": 51.203,
+   "kv_peak": 0.8608,
+   "cache_hit_tokens": 0.0,
+   "preemptions": 0.0,
+   "length": 64000,
+   "pass": 1
+  }
+ ],
+ "finished": "2026-09-30 17:02:33"
+}

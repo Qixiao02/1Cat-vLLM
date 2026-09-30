@@ -1,0 +1,256 @@
+{
+ "args": {
+  "port": 8131,
+  "model": "Swift-1.5-Qwen3.8-Flash-Next",
+  "out": "/mnt/2t/build/pfx_ab/result_off.json",
+  "lengths": "8000,16000,32000,64000",
+  "conc": 4,
+  "gen": 400,
+  "passes": 2,
+  "seed": 20260930
+ },
+ "started": "2026-09-30 17:28:00",
+ "cells": [
+  {
+   "prompt_tokens": [
+    7995,
+    7999,
+    8003,
+    7998
+   ],
+   "completion_tokens": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "ttft": [
+    1.334,
+    2.555,
+    3.749,
+    4.84
+   ],
+   "prefill_tok_s": 6610.0,
+   "decode_window_s": 6.385,
+   "decode_tok_s": 61.87,
+   "decode_agg_tok_s": 247.46,
+   "e2e_s": 11.28,
+   "kv_peak": 0.1157,
+   "cache_hit_tokens": 0.0,
+   "preemptions": 0.0,
+   "length": 8000,
+   "pass": 0
+  },
+  {
+   "prompt_tokens": [
+    15993,
+    15998,
+    15996,
+    15996
+   ],
+   "completion_tokens": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "ttft": [
+    2.657,
+    5.118,
+    7.563,
+    9.847
+   ],
+   "prefill_tok_s": 6497.6,
+   "decode_window_s": 6.541,
+   "decode_tok_s": 60.0,
+   "decode_agg_tok_s": 239.99,
+   "e2e_s": 16.462,
+   "kv_peak": 0.1881,
+   "cache_hit_tokens": 0.0,
+   "preemptions": 0.0,
+   "length": 16000,
+   "pass": 0
+  },
+  {
+   "prompt_tokens": [
+    32010,
+    32019,
+    31986,
+    31991
+   ],
+   "completion_tokens": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "ttft": [
+    5.894,
+    11.079,
+    16.243,
+    21.021
+   ],
+   "prefill_tok_s": 6089.3,
+   "decode_window_s": 6.562,
+   "decode_tok_s": 58.93,
+   "decode_agg_tok_s": 235.7,
+   "e2e_s": 27.74,
+   "kv_peak": 0.34,
+   "cache_hit_tokens": 0.0,
+   "preemptions": 0.0,
+   "length": 32000,
+   "pass": 0
+  },
+  {
+   "prompt_tokens": [
+    64037,
+    63995,
+    63995,
+    63981
+   ],
+   "completion_tokens": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "ttft": [
+    11.907,
+    22.8,
+    33.783,
+    44.0
+   ],
+   "prefill_tok_s": 5818.3,
+   "decode_window_s": 6.541,
+   "decode_tok_s": 57.18,
+   "decode_agg_tok_s": 228.72,
+   "e2e_s": 50.889,
+   "kv_peak": 0.6365,
+   "cache_hit_tokens": 0.0,
+   "preemptions": 0.0,
+   "length": 64000,
+   "pass": 0
+  },
+  {
+   "prompt_tokens": [
+    7994,
+    7999,
+    8001,
+    8000
+   ],
+   "completion_tokens": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "ttft": [
+    1.731,
+    2.877,
+    4.052,
+    5.207
+   ],
+   "prefill_tok_s": 6144.2,
+   "decode_window_s": 6.418,
+   "decode_tok_s": 61.71,
+   "decode_agg_tok_s": 246.83,
+   "e2e_s": 11.658,
+   "kv_peak": 0.1157,
+   "cache_hit_tokens": 0.0,
+   "preemptions": 0.0,
+   "length": 8000,
+   "pass": 1
+  },
+  {
+   "prompt_tokens": [
+    15998,
+    16004,
+    16007,
+    16000
+   ],
+   "completion_tokens": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "ttft": [
+    2.787,
+    5.242,
+    7.736,
+    9.992
+   ],
+   "prefill_tok_s": 6406.0,
+   "decode_window_s": 6.498,
+   "decode_tok_s": 60.5,
+   "decode_agg_tok_s": 241.99,
+   "e2e_s": 16.565,
+   "kv_peak": 0.1881,
+   "cache_hit_tokens": 0.0,
+   "preemptions": 0.0,
+   "length": 16000,
+   "pass": 1
+  },
+  {
+   "prompt_tokens": [
+    32002,
+    32001,
+    31990,
+    31991
+   ],
+   "completion_tokens": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "ttft": [
+    5.851,
+    10.977,
+    16.125,
+    20.908
+   ],
+   "prefill_tok_s": 6121.4,
+   "decode_window_s": 6.483,
+   "decode_tok_s": 59.63,
+   "decode_agg_tok_s": 238.52,
+   "e2e_s": 27.578,
+   "kv_peak": 0.34,
+   "cache_hit_tokens": 0.0,
+   "preemptions": 0.0,
+   "length": 32000,
+   "pass": 1
+  },
+  {
+   "prompt_tokens": [
+    63991,
+    63996,
+    63968,
+    63979
+   ],
+   "completion_tokens": [
+    400,
+    400,
+    400,
+    400
+   ],
+   "ttft": [
+    11.886,
+    22.698,
+    33.582,
+    43.647
+   ],
+   "prefill_tok_s": 5863.7,
+   "decode_window_s": 6.532,
+   "decode_tok_s": 57.18,
+   "decode_agg_tok_s": 228.74,
+   "e2e_s": 50.518,
+   "kv_peak": 0.6365,
+   "cache_hit_tokens": 0.0,
+   "preemptions": 0.0,
+   "length": 64000,
+   "pass": 1
+  }
+ ],
+ "finished": "2026-09-30 17:31:57"
+}

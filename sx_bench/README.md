@@ -1,0 +1,54 @@
+# sx_bench：压测脚本和原始结果
+
+这个目录放的是 README 里那几张实测表用到的脚本和原始数据，任何人都可以拿同样的脚本在自己的机器上重测。
+
+## 脚本
+
+| 文件 | 用途 |
+|---|---|
+| `pfx_bench.py` | 压测本体。对一个已启动的 OpenAI 兼容接口，按固定并发发送冷 prompt，记录 prefill 和 decode |
+| `summarize.py` | 把两条线的详细记录汇总成并排的 `summary_fork_vs_official.json` |
+| `as_run/pfx_ab.sh` | 2026-09-30 “前缀缓存开/关”那一轮的外层脚本，原样保留 |
+| `as_run/ab_detail.sh` | 2026-09-30 “本分支对官方”那一轮的外层脚本，原样保留 |
+
+`as_run/` 下的两个脚本带着我们服务器上的路径、容器名和 compose 文件名，换机器要改。`pfx_bench.py` 和 `summarize.py` 不依赖这些，只用 Python 标准库。
+
+## 怎么跑
+
+服务先用正常方式启动好，然后在同一台机器上执行：
+
+```bash
+python3 pfx_bench.py --port 8001 --model <served-model-name> --out result.json \
+    --conc 4 --lengths 8000,16000,32000,64000 --gen 400 --passes 2 --gpus 0,1,2,3
+```
+
+- `--conc`：同时发出的请求数。
+- `--lengths`：每条 prompt 的 token 数，用引擎自己的 `/tokenize` 校准，误差约 0.2%。
+- `--gen`：每条请求固定生成的 token 数（`ignore_eos`）。
+- `--passes`：每个长度重复几遍，每遍换一批新 prompt。
+- `--seed`：同一个种子在分词器相同的引擎上生成完全相同的 prompt，两条线对比时用同一个值。
+- `--gpus`：这条线用的显卡编号，只用于每秒采样利用率、显存和功耗，可以不填。
+
+## 测的是什么
+
+- **冷 prefill**：每条 prompt 是不同的随机文本，开头带一个随机会话号，互相没有共同前缀，所以前缀缓存命中为 0。结果里的 `cache_hit_tokens` 用来确认这一点。
+- **prefill 合计（`prefill_tok_s`）**：这一组请求的 prompt token 总数 ÷ 最后一条拿到首字的时间。
+- **首字延迟（`ttft`）**：从同时发出到每条请求生成第一个 token 的时间，按先后排序。
+- **decode（`decode_tok_s`、`decode_agg_tok_s`）**：只统计所有请求都在生成的那段时间，前者是每路速度的平均，后者是各路之和。token 数取自流式返回里的累计用量，不是数 SSE 分片。
+- **KV 占用峰值（`kv_peak`）**：这一格期间 `vllm:kv_cache_usage_perc` 的最大值，每秒采样一次。
+- **wave**：KV 缓存放不下全部 prompt 时，一部分请求要等别的请求结束才能开始，“所有请求都在生成”的时间段就不存在。`wave` 是第一批一起跑起来的请求数，`wave_*` 字段只按这一批计算。全部放得下时 `wave` 等于并发数。
+
+详细记录（`detail_*.json`，schema 2）里每个格子还有：
+
+- `requests[]`：每条请求的 prompt 和生成 token 数、首字延迟、结束时间、自己的 decode 速度、token 间隔的 p50/p90/p99/最大值，以及完整的逐 token 时间线。
+- `server`：引擎自己的计数在这一格里的变化，包括 prompt 和生成 token 数、前缀缓存查询和命中、抢占次数，以及引擎侧统计的首字、排队、prefill、decode、端到端时间（次数和总秒数）。
+- `timeline[]`：每秒一次的 KV 占用、运行和排队的请求数，以及每张显卡的利用率、显存和功耗。
+
+## 结果
+
+| 目录 | 内容 |
+|---|---|
+| `results/2026-09-30-prefix-on-off/` | 本分支开/关前缀缓存，4 并发，8K/16K/32K/64K，两遍。`summary_on_vs_off.json` 是并排汇总，`result_on.json`、`result_off.json` 是每个格子的数据 |
+| `results/2026-09-30-fork-vs-official/` | 本分支对官方 `main@d30469863`，同一模型、同一批 prompt，4 并发，8K/16K/32K/64K，两遍。`summary_fork_vs_official.json` 是并排汇总，`detail_*.json` 是详细记录 |
+
+开/关前缀缓存那一轮用的是脚本的第一版，测法和指标算法相同，只是没有上面“详细记录”里的那些字段。

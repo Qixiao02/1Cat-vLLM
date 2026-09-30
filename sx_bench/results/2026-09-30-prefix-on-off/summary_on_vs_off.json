@@ -1,0 +1,164 @@
+{
+ "test": "V1 (1.5.1-heavily-modified-v1) prefix caching on vs off, concurrency 4, cold random prompts, 400 generated tokens per request, 2 passes",
+ "date": "2026-09-30",
+ "on_instance": "production 8031 (live, idle)",
+ "off_instance": "test instance 127.0.0.1:8131, same image and config plus --no-enable-prefix-caching",
+ "rows": [
+  {
+   "length": 8000,
+   "on_prefill": [
+    6303.5,
+    6353.9
+   ],
+   "off_prefill": [
+    6610.0,
+    6144.2
+   ],
+   "on_prefill_mean": 6329,
+   "off_prefill_mean": 6377,
+   "on_decode": [
+    59.83,
+    59.88
+   ],
+   "off_decode": [
+    61.87,
+    61.71
+   ],
+   "on_decode_mean": 59.9,
+   "off_decode_mean": 61.8,
+   "on_agg": 239,
+   "off_agg": 247,
+   "on_ttft_first": [
+    1.412,
+    2.574
+   ],
+   "off_ttft_first": [
+    1.334,
+    1.731
+   ],
+   "on_ttft_last": 5.1,
+   "off_ttft_last": 5.0,
+   "on_kv": 13.6,
+   "off_kv": 11.6,
+   "prefill_ratio": 0.992,
+   "decode_ratio": 0.969
+  },
+  {
+   "length": 16000,
+   "on_prefill": [
+    6269.1,
+    6252.1
+   ],
+   "off_prefill": [
+    6497.6,
+    6406.0
+   ],
+   "on_prefill_mean": 6261,
+   "off_prefill_mean": 6452,
+   "on_decode": [
+    60.89,
+    60.73
+   ],
+   "off_decode": [
+    60.0,
+    60.5
+   ],
+   "on_decode_mean": 60.8,
+   "off_decode_mean": 60.2,
+   "on_agg": 243,
+   "off_agg": 241,
+   "on_ttft_first": [
+    3.966,
+    3.996
+   ],
+   "off_ttft_first": [
+    2.657,
+    2.787
+   ],
+   "on_ttft_last": 10.2,
+   "off_ttft_last": 9.9,
+   "on_kv": 23.9,
+   "off_kv": 18.8,
+   "prefill_ratio": 0.97,
+   "decode_ratio": 1.009
+  },
+  {
+   "length": 32000,
+   "on_prefill": [
+    6103.0,
+    6118.7
+   ],
+   "off_prefill": [
+    6089.3,
+    6121.4
+   ],
+   "on_prefill_mean": 6111,
+   "off_prefill_mean": 6105,
+   "on_decode": [
+    58.75,
+    59.34
+   ],
+   "off_decode": [
+    58.93,
+    59.63
+   ],
+   "on_decode_mean": 59.0,
+   "off_decode_mean": 59.3,
+   "on_agg": 236,
+   "off_agg": 237,
+   "on_ttft_first": [
+    6.965,
+    6.772
+   ],
+   "off_ttft_first": [
+    5.894,
+    5.851
+   ],
+   "on_ttft_last": 20.9,
+   "off_ttft_last": 21.0,
+   "on_kv": 44.5,
+   "off_kv": 34.0,
+   "prefill_ratio": 1.001,
+   "decode_ratio": 0.996
+  },
+  {
+   "length": 64000,
+   "on_prefill": [
+    5739.9,
+    5774.4
+   ],
+   "off_prefill": [
+    5818.3,
+    5863.7
+   ],
+   "on_prefill_mean": 5757,
+   "off_prefill_mean": 5841,
+   "on_decode": [
+    55.6,
+    57.37
+   ],
+   "off_decode": [
+    57.18,
+    57.18
+   ],
+   "on_decode_mean": 56.5,
+   "off_decode_mean": 57.2,
+   "on_agg": 226,
+   "off_agg": 229,
+   "on_ttft_first": [
+    13.275,
+    13.108
+   ],
+   "off_ttft_first": [
+    11.907,
+    11.886
+   ],
+   "on_ttft_last": 44.5,
+   "off_ttft_last": 43.8,
+   "on_kv": 86.1,
+   "off_kv": 63.6,
+   "prefill_ratio": 0.986,
+   "decode_ratio": 0.988
+  }
+ ]
+}
