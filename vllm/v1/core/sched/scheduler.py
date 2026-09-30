@@ -49,6 +49,7 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -70,6 +71,43 @@ def _ddtree_debug_enabled() -> bool:
 def _ddtree_debug_log(message: str, *args: object) -> None:
     if _ddtree_debug_enabled():
         logger.info("DFlash DDTree debug: %s", message % args if args else message)
+
+
+# Speculative methods that SX_OPT_ALIGN_MULTIBLOCK_SPEC can admit to multi-block
+# prefill chunks in Mamba ``align`` mode (see `_sx_init_mamba_align_policy`).
+_SX_ALIGN_SPEC_LANES = ("dflash", "mtp")
+# Query lengths served by the SM70 Flash-V100 long-prefill attention route
+# (`_SM70_79T_CORE_QUERY_LEN` and `_SM70_79T_MAX_QUERY_LEN`).
+_SX_ALIGN_DFLASH_CHUNK_WINDOW = (8000, 8192)
+
+
+def _sx_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)).strip())
+    except ValueError:
+        return default
+
+
+def _sx_align_lane_contract(vllm_config: VllmConfig, lane: str) -> bool:
+    """Whether `lane` runs on the hardware and model shape it was validated on."""
+    # These helpers are private to the config module. Importing them here makes
+    # a rename there fail this check, which the caller handles, not startup.
+    from vllm.config.vllm import (
+        _any_participating_device_is_capability,
+        _is_sm70_qwen38_decode_compile_contract,
+    )
+
+    if not _any_participating_device_is_capability(vllm_config, (7, 0)):
+        return False
+    model_config = vllm_config.model_config
+    if lane == "dflash":
+        # `_is_sm70_dflash2_verifier_contract` also pins the draft's selector
+        # width, which has no bearing on how the target prefill is chunked.
+        architectures = getattr(model_config, "architectures", None) or ()
+        return any(arch.startswith("Qwen3_5For") for arch in architectures)
+    return _is_sm70_qwen38_decode_compile_contract(
+        model_config, vllm_config.speculative_config, vllm_config.parallel_config
+    )
 
 
 class Scheduler(SchedulerInterface):
@@ -302,6 +340,7 @@ class Scheduler(SchedulerInterface):
         self.mamba_state_block_size = (
             next(iter(mamba_state_block_sizes)) if mamba_state_block_sizes else None
         )
+        self._sx_init_mamba_align_policy(vllm_config)
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
@@ -411,6 +450,172 @@ class Scheduler(SchedulerInterface):
             - request.num_output_placeholders,
         )
 
+    def _sx_init_mamba_align_policy(self, vllm_config: VllmConfig) -> None:
+        """Decide once whether aligned prefill chunks may span state blocks.
+
+        Only the state at the end of a chunk is materialized. A chunk that
+        starts on a state-block boundary leaves the state at its start intact
+        in the previous column, and the allocator pads the columns it crosses
+        with the null block, which is never cached. Such a chunk can therefore
+        run to the token budget and only has to end where the prefix cache
+        retains a state, which preserves the hits of per-block chunking as
+        long as retention is sparse. `_mamba_block_aligned_split` applies the
+        resulting policy.
+
+        Switches, read once:
+          SX_OPT_ALIGN_MULTIBLOCK: "1" (default) admits the validated lanes,
+            "0" keeps per-block chunks, "force" skips only the hardware and
+            model-shape contract.
+          SX_OPT_ALIGN_MULTIBLOCK_SPEC: comma-separated speculative methods to
+            admit, out of "dflash" and "mtp"; "0" (default) admits none.
+          SX_OPT_ALIGN_MAX_CHUNK_BLOCKS: cap a chunk at this many state blocks;
+            0 (default) leaves it to the token budget.
+        """
+        self._sx_align_multiblock = False
+        self._sx_align_lane: str | None = None
+        # Cache-hit alignment the coordinator derives replay boundaries with.
+        self._sx_align_hit_alignment = 0
+        # Spacing in tokens of the periodically retained states (0: none).
+        self._sx_align_retention = 0
+        self._sx_align_max_blocks = 0
+        if not self.need_mamba_block_aligned_split:
+            return
+
+        block_size = self.mamba_state_block_size
+        assert block_size is not None
+        coordinator = self.kv_cache_manager.coordinator
+        speculative_config = vllm_config.speculative_config
+        mode = os.environ.get("SX_OPT_ALIGN_MULTIBLOCK", "1").strip().lower()
+        spec_value = os.environ.get("SX_OPT_ALIGN_MULTIBLOCK_SPEC", "0")
+        spec_lanes = {name.strip().lower() for name in spec_value.split(",")}
+        spec_lanes -= {"", "0"}
+        if unknown_lanes := spec_lanes.difference(_SX_ALIGN_SPEC_LANES):
+            logger.warning(
+                "SX_OPT_ALIGN_MULTIBLOCK_SPEC: ignoring unknown lane(s) %s; "
+                "known lanes are %s.",
+                ", ".join(sorted(unknown_lanes)),
+                ", ".join(_SX_ALIGN_SPEC_LANES),
+            )
+
+        lane: str | None = None
+        reason: str | None = None
+        try:
+            if speculative_config is None:
+                lane = "no-spec"
+            elif (
+                speculative_config.method == "dflash"
+                and "dflash" in spec_lanes
+                and not self.use_eagle
+            ):
+                lane = "dflash"
+            elif (
+                "mtp" in spec_lanes
+                and speculative_config.use_qwen4_exp_mtp()
+                and not speculative_config.parallel_drafting
+            ):
+                lane = "mtp"
+            # What `MambaManager.cache_blocks` is called with for this layout.
+            alignment = getattr(coordinator, "lcm_block_size", block_size)
+            interval = coordinator.retention_interval
+
+            if mode == "0":
+                reason = "SX_OPT_ALIGN_MULTIBLOCK=0"
+            elif self.connector is not None:
+                reason = "KV connector keeps per-block checkpoints"
+            elif lane is None:
+                reason = (
+                    "speculative decoding keeps per-block checkpoints (method "
+                    f"{getattr(speculative_config, 'method', None)} is not "
+                    "admitted by SX_OPT_ALIGN_MULTIBLOCK_SPEC)"
+                )
+            elif not self.use_v2_model_runner:
+                reason = "Model Runner V2 is required"
+            elif mode != "force" and not _sx_align_lane_contract(vllm_config, lane):
+                reason = f"outside the SM70 contract of the {lane} lane"
+            elif any(
+                manager.reachable_block_mask(
+                    0, 1, alignment, manager.kv_cache_spec, interval, ()
+                )
+                is None
+                for manager in coordinator.single_type_managers
+                if isinstance(manager, MambaManager)
+            ):
+                # Every boundary state is cached, so none can be skipped.
+                reason = (
+                    "dense Mamba prefix-cache retention "
+                    f"(prefix_cache_retention_interval={interval}, hit "
+                    f"alignment {alignment}, state block {block_size})"
+                )
+        except Exception:
+            logger.warning(
+                "SX align multi-block: contract check failed; keeping "
+                "per-block chunking.",
+                exc_info=True,
+            )
+            return
+        if reason is not None:
+            logger.info(
+                "SX align multi-block prefill chunking disabled (%s); every "
+                "Mamba state block boundary ends a prefill chunk.",
+                reason,
+            )
+            return
+
+        self._sx_align_multiblock = True
+        self._sx_align_lane = lane
+        self._sx_align_hit_alignment = alignment
+        if interval:
+            # The spacing `reachable_block_mask` retains blocks at.
+            self._sx_align_retention = interval // block_size * block_size
+        self._sx_align_max_blocks = max(
+            0, _sx_env_int("SX_OPT_ALIGN_MAX_CHUNK_BLOCKS", 0)
+        )
+
+        # The chunk a request gets when it starts on a boundary with the whole
+        # step budget to itself.
+        budget = self.max_num_scheduled_tokens
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        chunk = min(threshold, budget) if threshold > 0 else budget
+        if chunk >= block_size:
+            chunk = chunk // block_size * block_size
+        for cap in (self._sx_align_max_blocks * block_size, self._sx_align_retention):
+            if cap > 0:
+                chunk = min(chunk, cap)
+        logger.info(
+            "SX align multi-block prefill chunking enabled (%s lane): state "
+            "block %d, hit alignment %d, retention=%s, max_chunk_blocks=%s, "
+            "single-request chunk=%d tokens.",
+            lane,
+            block_size,
+            alignment,
+            self._sx_align_retention or "replay/shared only",
+            self._sx_align_max_blocks or "budget",
+            chunk,
+        )
+        if lane == "dflash":
+            low, high = _SX_ALIGN_DFLASH_CHUNK_WINDOW
+            if not low <= chunk <= high:
+                logger.warning(
+                    "SX align multi-block: the single-request prefill chunk "
+                    "(%d tokens) is outside the %d-%d token window of the SM70 "
+                    "long-prefill attention route; pick --block-size and "
+                    "--long-prefill-token-threshold so that a chunk lands in "
+                    "it.",
+                    chunk,
+                    low,
+                    high,
+                )
+            if chunk == budget:
+                logger.warning(
+                    "SX align multi-block: the single-request prefill chunk "
+                    "takes the whole step budget (%d tokens), so a row "
+                    "scheduled ahead of a prefill shrinks its chunk by a state "
+                    "block and rows behind it wait for the prefill; keep "
+                    "--max-num-batched-tokens above "
+                    "--long-prefill-token-threshold.",
+                    budget,
+                )
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -456,6 +661,37 @@ class Scheduler(SchedulerInterface):
             # implies `end < next_block_boundary`.
             if aligned_end > start:
                 end = aligned_end
+
+        if getattr(self, "_sx_align_multiblock", False) and start % block_size == 0:
+            # A chunk that starts on a boundary materializes only the state at
+            # its end. The columns it crosses stay null and are never cached,
+            # so it has to end at each boundary whose state
+            # `MambaManager.cache_blocks` admits, and nowhere else: the replay
+            # and shared-prefix boundaries and the periodic retention
+            # boundaries. A chunk that starts mid-block keeps its state in
+            # that block's column. Crossing the boundary would get the column
+            # cached under the boundary's hash while it holds the state from
+            # mid-block, so such a chunk keeps the per-block rule below.
+            coordinator = self.kv_cache_manager.coordinator
+            alignment = self._sx_align_hit_alignment
+            retention = self._sx_align_retention
+            max_blocks = self._sx_align_max_blocks
+            stops = [
+                last_cache_position,
+                getattr(request, "shared_prefix_boundary", 0)
+                // block_size
+                * block_size,
+            ]
+            stops.extend(
+                boundary // alignment * alignment
+                for boundary in coordinator.get_replay_boundaries(request, alignment)
+            )
+            if retention > 0:
+                stops.append((start // retention + 1) * retention)
+            if max_blocks > 0:
+                stops.append(start + max_blocks * block_size)
+            end = min((stop for stop in stops if start < stop < end), default=end)
+            return max(end - start, 0)
 
         # The align allocator materializes one recurrent-state column per
         # scheduler step. A step spanning multiple state blocks leaves the
