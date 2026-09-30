@@ -90,6 +90,42 @@ _MADV_RANDOM = 1
 
 logger = init_logger(__name__)
 
+# SX_OPT_PLE_PREFILL_MAX_PACKED_ROWS (opt180dev1 validation fix, default 8192;
+# "0" = old behaviour). The dilated PLE short-conv prefill packs every prefill
+# request of a step into a zero-padded [num_prefills, max_len, hidden] buffer
+# (plus ~5 temporaries of the same size). With SX_OPT_ALIGN_MULTIBLOCK one
+# request can prefill ~7.8K tokens per step next to other prefills, so the
+# padding grew to num_prefills x ~7.8K rows and OOMed at gmu 0.90 (4 x 7056
+# rows, 276 MiB per temporary). When num_prefills x max_len exceeds the bound,
+# consecutive prefill requests are packed in groups whose padded rows stay
+# within it (a single request always forms a group of its own). Steps under the
+# bound, and every single-prefill step, run the unchanged code path.
+try:
+    _SX_PLE_PREFILL_MAX_PACKED_ROWS = int(
+        os.environ.get("SX_OPT_PLE_PREFILL_MAX_PACKED_ROWS", "8192")
+    )
+except ValueError:
+    _SX_PLE_PREFILL_MAX_PACKED_ROWS = 8192
+
+
+def _sx_ple_prefill_groups(
+    lengths: Sequence[int], max_rows: int
+) -> list[tuple[int, int]]:
+    """Greedy consecutive groups with len(group) * max(group) <= max_rows."""
+    groups: list[tuple[int, int]] = []
+    first = 0
+    group_max = 0
+    for index, length in enumerate(lengths):
+        new_max = max(group_max, int(length))
+        if index > first and (index - first + 1) * new_max > max_rows:
+            groups.append((first, index))
+            first = index
+            new_max = int(length)
+        group_max = new_max
+    groups.append((first, len(lengths)))
+    return groups
+
+
 
 def _advise_random_file_access(tensor: torch.Tensor) -> str:
     """Require a lazy file mapping and disable destructive mmap read-around."""
@@ -1976,13 +2012,75 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             )
         if num_prefills == 0 or x_p.numel() == 0:
             return output
-        lengths = q_starts[1:] - q_starts[:-1]
         # Use the CPU-computed packing width from the metadata builder instead
         # of synchronizing on lengths.max().
         max_len = metadata.max_prefill_query_len
         if max_len <= 0:
             return output
+        lens_cpu = getattr(metadata, "prefill_query_lens_cpu", None)
+        if (
+            _SX_PLE_PREFILL_MAX_PACKED_ROWS > 0
+            and num_prefills > 1
+            and num_prefills * max_len > _SX_PLE_PREFILL_MAX_PACKED_ROWS
+            and lens_cpu is not None
+            and len(lens_cpu) == num_prefills
+            and sum(lens_cpu) == num_prefill_tokens
+        ):
+            groups = _sx_ple_prefill_groups(lens_cpu, _SX_PLE_PREFILL_MAX_PACKED_ROWS)
+            if len(groups) > 1:
+                token_start = 0
+                for first, last in groups:
+                    group_lens = lens_cpu[first:last]
+                    group_tokens = sum(group_lens)
+                    token_end = token_start + group_tokens
+                    if group_tokens > 0:
+                        self._short_conv_dilated_prefill_packed(
+                            x_p[token_start:token_end],
+                            q_starts[first : last + 1] - token_start,
+                            has_initial_states_p[first:last],
+                            conv_state,
+                            conv_weights,
+                            state_indices_tensor_p[first:last],
+                            last - first,
+                            group_tokens,
+                            max(group_lens),
+                            output[token_start:token_end],
+                        )
+                    token_start = token_end
+                return output
+        return self._short_conv_dilated_prefill_packed(
+            x_p,
+            q_starts,
+            has_initial_states_p,
+            conv_state,
+            conv_weights,
+            state_indices_tensor_p,
+            num_prefills,
+            num_prefill_tokens,
+            max_len,
+            output,
+        )
 
+    def _short_conv_dilated_prefill_packed(
+        self,
+        x_p: torch.Tensor,
+        q_starts: torch.Tensor,
+        has_initial_states_p: torch.Tensor,
+        conv_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+        state_indices_tensor_p: torch.Tensor,
+        num_prefills: int,
+        num_prefill_tokens: int,
+        max_len: int,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pack prefill requests into [num_prefills, max_len] and convolve.
+
+        The original batched-prefill arithmetic, unchanged. ``q_starts`` are
+        the int64 request offsets into ``x_p`` (starting at 0) and ``output``
+        (same shape as ``x_p``, possibly a view) receives the result.
+        """
+        lengths = q_starts[1:] - q_starts[:-1]
         hidden_size = x_p.shape[1]
         positions = torch.arange(
             num_prefill_tokens, device=x_p.device, dtype=torch.int64
