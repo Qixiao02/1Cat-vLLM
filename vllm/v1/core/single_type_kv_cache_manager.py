@@ -1181,6 +1181,9 @@ class MambaManager(SingleTypeKVCacheManager):
             # Mapping from request ID to the index of the block
             # allocated in the previous step
             self.last_state_block_idx: dict[str, int] = {}
+            # Mapping from request ID to the earlier state block indices that
+            # `last_state_block_idx` moved past before they could be freed
+            self.stale_state_block_idxs: dict[str, list[int]] = {}
             # The set of the requests that have been allocated blocks
             self._allocated_block_reqs: set[str] = set()
 
@@ -1268,6 +1271,32 @@ class MambaManager(SingleTypeKVCacheManager):
                 if blocks[last_state_block_idx] != self._null_block:
                     self.block_pool.free_blocks([blocks[last_state_block_idx]])
                     blocks[last_state_block_idx] = self._null_block
+            # While a step is in flight, the state block it copies from cannot
+            # be freed yet, and the next allocation moves `last_state_block_idx`
+            # past it. The backward scan in the base class reaches such a block
+            # only through a contiguous run of state blocks, which the null
+            # blocks of a chunk spanning several blocks interrupt. Free these
+            # blocks on the same processed-token basis.
+            stale_state_block_idxs = self.stale_state_block_idxs.get(request_id)
+            if stale_state_block_idxs:
+                blocks = self.req_to_blocks[request_id]
+                num_skipped_blocks = (
+                    cdiv(processed_computed_tokens, self.block_size) - 1
+                )
+                num_passed = 0
+                freed: list[KVCacheBlock] = []
+                # The indices were recorded in increasing order.
+                for block_idx in stale_state_block_idxs:
+                    if block_idx >= num_skipped_blocks:
+                        break
+                    num_passed += 1
+                    if blocks[block_idx] != self._null_block:
+                        freed.append(blocks[block_idx])
+                        blocks[block_idx] = self._null_block
+                del stale_state_block_idxs[:num_passed]
+                if freed:
+                    # Tail blocks first, as in `free`.
+                    self.block_pool.free_blocks(reversed(freed))
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
@@ -1376,6 +1405,17 @@ class MambaManager(SingleTypeKVCacheManager):
                 )
                 prev_block_len = len(req_blocks)
                 blocks_allocated = request_id in self._allocated_block_reqs
+                # The index recorded by the previous allocation is replaced
+                # below. Keep it if `remove_skipped_blocks` could not free
+                # that block yet.
+                stale_state_block_idx = self.last_state_block_idx.get(request_id)
+                if (
+                    stale_state_block_idx is not None
+                    and req_blocks[stale_state_block_idx] != self._null_block
+                ):
+                    self.stale_state_block_idxs.setdefault(request_id, []).append(
+                        stale_state_block_idx
+                    )
                 # Record the last state block
                 if blocks_allocated:
                     # We always save the running state at the last
@@ -1424,6 +1464,7 @@ class MambaManager(SingleTypeKVCacheManager):
         if self.mamba_cache_mode == "align":
             self._allocated_block_reqs.discard(request_id)
             self.last_state_block_idx.pop(request_id, None)
+            self.stale_state_block_idxs.pop(request_id, None)
             # A hand-off is valid only while its source still belongs to this
             # request. Drop offers that have not reached the connector before
             # returning the request's blocks to the pool.
