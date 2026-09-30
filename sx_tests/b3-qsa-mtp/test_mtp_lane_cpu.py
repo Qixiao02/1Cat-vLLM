@@ -589,7 +589,7 @@ def page4_host(monkeypatch):
         partition = 256 if kv_cache_dtype == "fp8_e4m3" else 1024
         partitions = math.ceil(logical_indices.shape[1] / partition)
         if state.capturing:
-            ops._qsa_xqa_page4_workspace(q, partitions)
+            ops._qsa_xqa_page4_workspace(q, partitions, kv_cache_dtype)
         state.requests.append(("xqa", q.shape[0]))
 
     monkeypatch.setattr(
@@ -696,12 +696,12 @@ def test_page4_graph_workspace_growth_retires(page4_host):
     ops = page4_host.ops
     page4_host.capturing = True
     q = torch.zeros(65, 6, 256, dtype=torch.float16)
-    first = ops._qsa_xqa_page4_graph_workspace(q, 3, 65)
+    first = ops._qsa_xqa_page4_graph_workspace(q, 3, 65, "auto")
     ((key, entry),) = ops._SM70_QSA_XQA_PAGE4_GRAPH_WORKSPACES.items()
     assert entry[0] == 128 and first[0].shape[0] == 65
     old_ptr = entry[1].data_ptr()
     ops._qsa_xqa_page4_graph_workspace(
-        torch.zeros(160, 6, 256, dtype=torch.float16), 3, 160
+        torch.zeros(160, 6, 256, dtype=torch.float16), 3, 160, "auto"
     )
     assert ops._SM70_QSA_XQA_PAGE4_GRAPH_WORKSPACES[key][0] == 256
     assert any(
@@ -710,7 +710,7 @@ def test_page4_graph_workspace_growth_retires(page4_host):
     )
     # A smaller later capture reuses the grown workspace (no allocation).
     before = _page4_graph_state(ops)
-    ops._qsa_xqa_page4_graph_workspace(q, 3, 65)
+    ops._qsa_xqa_page4_graph_workspace(q, 3, 65, "auto")
     assert _page4_graph_state(ops) == before
     grouped = ops._qsa_grouped_page4_graph_workspace(q[:64], 8)
     assert [tensor.shape[0] for tensor in grouped] == [8, 8, 8, 64]
