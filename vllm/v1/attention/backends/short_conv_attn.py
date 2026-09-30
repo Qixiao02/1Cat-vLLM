@@ -66,7 +66,7 @@ class PleShortConvAttentionMetadata(ShortConvAttentionMetadata):
     # packing buffer without a device->host sync (``lengths.max().item()``).
     # 0 when there are no prefill requests.
     max_prefill_query_len: int = 0
-    # SX_OPT (opt180dev1): host copy of the non-spec prefill query lengths, in
+    # SX_OPT: host copy of the non-spec prefill query lengths, in
     # prefill order. Lets the PLE dilated short-conv bound its padded packing
     # buffer (num_prefills x max_len rows) without a device->host sync. None on
     # the spec-decode builder path (the packing then behaves as before).

@@ -90,7 +90,7 @@ _MADV_RANDOM = 1
 
 logger = init_logger(__name__)
 
-# SX_OPT_PLE_PREFILL_MAX_PACKED_ROWS (opt180dev1 validation fix, default 8192;
+# SX_OPT_PLE_PREFILL_MAX_PACKED_ROWS (default 8192;
 # "0" = old behaviour). The dilated PLE short-conv prefill packs every prefill
 # request of a step into a zero-padded [num_prefills, max_len, hidden] buffer
 # (plus ~5 temporaries of the same size). With SX_OPT_ALIGN_MULTIBLOCK one
