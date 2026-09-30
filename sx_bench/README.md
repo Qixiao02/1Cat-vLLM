@@ -15,6 +15,7 @@
 | `as_run/calib_traffic.py` | E4M3 标定时发的 18 条请求。文本取自服务器上的源码和文档，换机器要改路径 |
 | `as_run/kvq_check.py` | 输出对照：长文本里找 8 个验证码，加 4 道短题，贪心解码 |
 | `as_run/build_fork.sh`、`dockerfile-local-gitmirror.patch` | 2026-10-01 从源码构建 1001 的 wheel 和镜像。补丁只在那次构建时用：GitHub 链路太慢，CMake 要拉的第三方仓库改从本地镜像取（提交哈希都核对过），不在仓库里 |
+| `as_run/arm_compose.py`、`run_all.sh`、`mtp_bench.py`、`cmp_summary.py` | 2026-10-01 本分支对官方最新（双方最佳参数）：`arm_compose.py` 写出 6 种配置的 compose（本分支和官方，各自开、关前缀缓存，以及两边开 MTP），`run_all.sh` 依次启动并测，`mtp_bench.py` 用自然 prompt 测 MTP，`cmp_summary.py` 汇总 |
 | `as_run/wheel_check.sh`、`mk_forkwheel_compose.py` | 用 1001 的镜像按生产配置启动，和 0930 的镜像对照答题，再跑第 1 组的压测 |
 
 `as_run/` 下的脚本带着我们服务器上的路径、容器名和 compose 文件名，换机器要改。`pfx_bench.py` 和 `summarize.py` 不依赖这些，只用 Python 标准库。
@@ -55,7 +56,8 @@ python3 pfx_bench.py --port 8001 --model <served-model-name> --out result.json \
 | 目录 | 内容 |
 |---|---|
 | `results/2026-09-30-prefix-on-off/` | 本分支开/关前缀缓存，4 并发，8K/16K/32K/64K，两遍。`summary_on_vs_off.json` 是并排汇总，`result_on.json`、`result_off.json` 是每个格子的数据 |
-| `results/2026-09-30-fork-vs-official/` | 本分支对官方 `main@d30469863`，同一模型、同一批 prompt，4 并发，8K/16K/32K/64K，两遍。`summary_fork_vs_official.json` 是并排汇总，`detail_*.json` 是详细记录 |
+| `results/2026-09-30-fork-vs-official/` | 本分支对官方 `main@d30469863`，同一模型、同一批 prompt，4 并发，8K/16K/32K/64K，两遍。`summary_fork_vs_official.json` 是并排汇总，`detail_*.json` 是详细记录。**注意**：这次官方用的不是官方的最佳参数，结论已作废，见 README 的“历史记录” |
+| `results/2026-10-01-fork-vs-official-best/` | 本分支对官方最新，双方最佳参数（README 实测第 1 组）。文件名前缀：`F1` 本分支开前缀缓存（线上配置），`F2` 本分支关前缀缓存，`O1` 官方最佳参数（关前缀缓存），`O2` 官方开前缀缓存，`OM` 官方开 MTP，`FM` 本分支开 MTP。`*_sweep_c<N>.json` 是 8K 输入、贪心、N 并发；`*_long.json` 是 4 并发 8K–64K、默认采样；`*_l128k.json` 是单条 128K；`*_mtp.json` 是自然 prompt 的 MTP 测试；`*_answers.json` 是答题对照；`summary_nomtp.txt` 是不开 MTP 的汇总 |
 | `results/2026-10-01-wheel-1001/` | 发行的 wheel（1001）：`detail_wheel_1001_c4.json` 是和第 1 组同样的压测，`answers_*.json` 是 1001 和 0930 的答题对照 |
 | `results/2026-09-30-mtp-fp16-vs-e4m3/` | 开 MTP（k=4）时 FP16 KV 和 E4M3 KV。`c1s`、`c1g` 是单请求 8K（采样、贪心），`c4s2k`、`c4g2k` 是 4 并发 2K（采样、贪心），`c4` 是 4 并发 8K/16K/32K；`answers_*.json` 是输出对照，`kv_scale_report.json` 是标定得到的各层 K、V 最大值和 scale |
 

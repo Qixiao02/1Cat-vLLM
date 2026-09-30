@@ -1,0 +1,377 @@
+{
+ "port": 8141,
+ "cells": [
+  {
+   "workload": "code",
+   "conc": 1,
+   "requests": [
+    {
+     "prompt": "Write a Python function that parses an ISO-8601 duration str",
+     "prompt_tokens": 44,
+     "completion_tokens": 512,
+     "t_send": 1790799692.7382433,
+     "t_first": 1790799692.8765376,
+     "t_last": 1790799696.0866122,
+     "ttft": 0.13829421997070312,
+     "decode_tok_s": 159.18632854994593
+    },
+    {
+     "prompt": "用 Python 实现一个 LRU 缓存类，支持 get/put，O(1) 复杂度，并写出单元测试。",
+     "prompt_tokens": 39,
+     "completion_tokens": 512,
+     "t_send": 1790799696.0875313,
+     "t_first": 1790799696.2406592,
+     "t_last": 1790799699.1333768,
+     "ttft": 0.15312790870666504,
+     "decode_tok_s": 176.65049641319328
+    },
+    {
+     "prompt": "Implement quicksort and mergesort in C++ with templates, and",
+     "prompt_tokens": 32,
+     "completion_tokens": 512,
+     "t_send": 1790799699.134041,
+     "t_first": 1790799699.2844043,
+     "t_last": 1790799702.086596,
+     "ttft": 0.15036320686340332,
+     "decode_tok_s": 182.35725762181062
+    },
+    {
+     "prompt": "Write a SQL schema for an e-commerce order system (users, pr",
+     "prompt_tokens": 37,
+     "completion_tokens": 512,
+     "t_send": 1790799702.0872154,
+     "t_first": 1790799702.2361042,
+     "t_last": 1790799705.311884,
+     "ttft": 0.14888882637023926,
+     "decode_tok_s": 166.1367372684777
+    },
+    {
+     "prompt": "用 JavaScript 写防抖和节流两个函数，解释它们的区别，并给出使用示例。",
+     "prompt_tokens": 32,
+     "completion_tokens": 512,
+     "t_send": 1790799705.3124185,
+     "t_first": 1790799705.4701777,
+     "t_last": 1790799708.9527678,
+     "ttft": 0.1577591896057129,
+     "decode_tok_s": 146.7298679636849
+    },
+    {
+     "prompt": "Write a Go HTTP server with two JSON endpoints and graceful ",
+     "prompt_tokens": 25,
+     "completion_tokens": 512,
+     "t_send": 1790799708.9531586,
+     "t_first": 1790799709.0891855,
+     "t_last": 1790799711.9657104,
+     "ttft": 0.13602685928344727,
+     "decode_tok_s": 177.6449060175615
+    },
+    {
+     "prompt": "Write a Python script that reads a CSV of sales, groups by m",
+     "prompt_tokens": 37,
+     "completion_tokens": 512,
+     "t_send": 1790799711.966298,
+     "t_first": 1790799712.1134741,
+     "t_last": 1790799715.2859287,
+     "ttft": 0.14717602729797363,
+     "decode_tok_s": 161.07401527959928
+    },
+    {
+     "prompt": "Implement a thread-safe bounded blocking queue in Java with ",
+     "prompt_tokens": 33,
+     "completion_tokens": 512,
+     "t_send": 1790799715.2864814,
+     "t_first": 1790799715.4513066,
+     "t_last": 1790799718.2017977,
+     "ttft": 0.1648252010345459,
+     "decode_tok_s": 185.7850011390039
+    }
+   ],
+   "errors": 0,
+   "completion_tokens": 4096,
+   "decode_tok_s_mean": 169.45,
+   "agg_tok_s": 160.9,
+   "wall_s": 25.5,
+   "tokens_per_round": 4.219,
+   "ttft_mean": 0.15
+  },
+  {
+   "workload": "code",
+   "conc": 4,
+   "requests": [
+    {
+     "prompt": "Write a Python function that parses an ISO-8601 duration str",
+     "prompt_tokens": 44,
+     "completion_tokens": 512,
+     "t_send": 1790799718.218155,
+     "t_first": 1790799718.3770404,
+     "t_last": 1790799723.1893818,
+     "ttft": 0.15888547897338867,
+     "decode_tok_s": 106.1853164690415
+    },
+    {
+     "prompt": "用 Python 实现一个 LRU 缓存类，支持 get/put，O(1) 复杂度，并写出单元测试。",
+     "prompt_tokens": 39,
+     "completion_tokens": 512,
+     "t_send": 1790799718.2187114,
+     "t_first": 1790799718.5527387,
+     "t_last": 1790799722.825777,
+     "ttft": 0.3340272903442383,
+     "decode_tok_s": 119.58703706452175
+    },
+    {
+     "prompt": "Implement quicksort and mergesort in C++ with templates, and",
+     "prompt_tokens": 32,
+     "completion_tokens": 512,
+     "t_send": 1790799718.219105,
+     "t_first": 1790799718.8722045,
+     "t_last": 1790799722.7573245,
+     "ttft": 0.653099536895752,
+     "decode_tok_s": 131.52747178432358
+    },
+    {
+     "prompt": "Write a SQL schema for an e-commerce order system (users, pr",
+     "prompt_tokens": 37,
+     "completion_tokens": 512,
+     "t_send": 1790799718.2196617,
+     "t_first": 1790799718.8720171,
+     "t_last": 1790799723.060135,
+     "ttft": 0.652355432510376,
+     "decode_tok_s": 122.01185148397445
+    },
+    {
+     "prompt": "用 JavaScript 写防抖和节流两个函数，解释它们的区别，并给出使用示例。",
+     "prompt_tokens": 32,
+     "completion_tokens": 512,
+     "t_send": 1790799723.1902444,
+     "t_first": 1790799723.3322625,
+     "t_last": 1790799728.0887988,
+     "ttft": 0.14201807975769043,
+     "decode_tok_s": 107.4311166029644
+    },
+    {
+     "prompt": "Write a Go HTTP server with two JSON endpoints and graceful ",
+     "prompt_tokens": 25,
+     "completion_tokens": 512,
+     "t_send": 1790799723.1907706,
+     "t_first": 1790799723.48632,
+     "t_last": 1790799727.5007248,
+     "ttft": 0.2955493927001953,
+     "decode_tok_s": 127.29159833263985
+    },
+    {
+     "prompt": "Write a Python script that reads a CSV of sales, groups by m",
+     "prompt_tokens": 37,
+     "completion_tokens": 512,
+     "t_send": 1790799723.191234,
+     "t_first": 1790799723.4861588,
+     "t_last": 1790799727.7864616,
+     "ttft": 0.2949247360229492,
+     "decode_tok_s": 118.82884309098017
+    },
+    {
+     "prompt": "Implement a thread-safe bounded blocking queue in Java with ",
+     "prompt_tokens": 33,
+     "completion_tokens": 512,
+     "t_send": 1790799723.1918013,
+     "t_first": 1790799723.4864287,
+     "t_last": 1790799727.5001566,
+     "ttft": 0.29462742805480957,
+     "decode_tok_s": 127.31306463785273
+    }
+   ],
+   "errors": 0,
+   "completion_tokens": 4096,
+   "decode_tok_s_mean": 120.02,
+   "agg_tok_s": 414.9,
+   "wall_s": 9.9,
+   "tokens_per_round": 4.221,
+   "ttft_mean": 0.353
+  },
+  {
+   "workload": "chat",
+   "conc": 1,
+   "requests": [
+    {
+     "prompt": "为什么天空是蓝色的？请从物理角度解释，并说明日落为什么是红色的。",
+     "prompt_tokens": 70,
+     "completion_tokens": 834,
+     "t_send": 1790799728.1088,
+     "t_first": 1790799728.2343028,
+     "t_last": 1790799737.2146268,
+     "ttft": 0.1255028247833252,
+     "decode_tok_s": 92.75834560361517
+    },
+    {
+     "prompt": "Compare TCP and QUIC: handshake, head-of-line blocking and c",
+     "prompt_tokens": 68,
+     "completion_tokens": 1024,
+     "t_send": 1790799737.2153342,
+     "t_first": 1790799737.3761148,
+     "t_last": 1790799751.265607,
+     "ttft": 0.160780668258667,
+     "decode_tok_s": 73.6528002513288
+    },
+    {
+     "prompt": "一家跨境电商想降低退货率，请给出分步骤的分析和改进方案。",
+     "prompt_tokens": 68,
+     "completion_tokens": 1024,
+     "t_send": 1790799751.266312,
+     "t_first": 1790799751.4360895,
+     "t_last": 1790799761.3565392,
+     "ttft": 0.16977763175964355,
+     "decode_tok_s": 103.12032493056493
+    },
+    {
+     "prompt": "Explain step by step, for a beginner, how a transformer deco",
+     "prompt_tokens": 69,
+     "completion_tokens": 1024,
+     "t_send": 1790799761.3573387,
+     "t_first": 1790799761.5088072,
+     "t_last": 1790799771.281944,
+     "ttft": 0.15146851539611816,
+     "decode_tok_s": 104.67468278246028
+    },
+    {
+     "prompt": "比较定期盘点、永续盘存和 ABC 分析三种库存管理方法，各自适合什么场景？",
+     "prompt_tokens": 73,
+     "completion_tokens": 1024,
+     "t_send": 1790799771.2827725,
+     "t_first": 1790799771.5850487,
+     "t_last": 1790799782.1555994,
+     "ttft": 0.3022761344909668,
+     "decode_tok_s": 96.77830710561098
+    },
+    {
+     "prompt": "A train leaves at 9:40 and arrives at 13:05 after covering 2",
+     "prompt_tokens": 88,
+     "completion_tokens": 387,
+     "t_send": 1790799782.156253,
+     "t_first": 1790799782.3005955,
+     "t_last": 1790799784.6933308,
+     "ttft": 0.14434242248535156,
+     "decode_tok_s": 161.32165109135153
+    },
+    {
+     "prompt": "写一封给供应商的邮件，说明因为质量问题需要退回一批货，语气专业但友好。",
+     "prompt_tokens": 72,
+     "completion_tokens": 377,
+     "t_send": 1790799784.6941137,
+     "t_first": 1790799784.835486,
+     "t_last": 1790799788.6708512,
+     "ttft": 0.1413722038269043,
+     "decode_tok_s": 98.03499042189418
+    },
+    {
+     "prompt": "What are the trade-offs between microservices and a modular ",
+     "prompt_tokens": 73,
+     "completion_tokens": 1024,
+     "t_send": 1790799788.6715326,
+     "t_first": 1790799788.8238282,
+     "t_last": 1790799799.524349,
+     "ttft": 0.15229558944702148,
+     "decode_tok_s": 95.60282378134988
+    }
+   ],
+   "errors": 0,
+   "completion_tokens": 6718,
+   "decode_tok_s_mean": 103.24,
+   "agg_tok_s": 94.1,
+   "wall_s": 71.4,
+   "tokens_per_round": 2.416,
+   "ttft_mean": 0.168
+  },
+  {
+   "workload": "chat",
+   "conc": 4,
+   "requests": [
+    {
+     "prompt": "为什么天空是蓝色的？请从物理角度解释，并说明日落为什么是红色的。",
+     "prompt_tokens": 70,
+     "completion_tokens": 569,
+     "t_send": 1790799799.5402274,
+     "t_first": 1790799799.6858077,
+     "t_last": 1790799808.5315807,
+     "ttft": 0.14558029174804688,
+     "decode_tok_s": 64.21146022836967
+    },
+    {
+     "prompt": "Compare TCP and QUIC: handshake, head-of-line blocking and c",
+     "prompt_tokens": 68,
+     "completion_tokens": 1024,
+     "t_send": 1790799799.5407515,
+     "t_first": 1790799800.0039468,
+     "t_last": 1790799816.876057,
+     "ttft": 0.4631953239440918,
+     "decode_tok_s": 60.63260565599733
+    },
+    {
+     "prompt": "一家跨境电商想降低退货率，请给出分步骤的分析和改进方案。",
+     "prompt_tokens": 68,
+     "completion_tokens": 1024,
+     "t_send": 1790799799.5412846,
+     "t_first": 1790799800.0044646,
+     "t_last": 1790799812.925855,
+     "ttft": 0.4631800651550293,
+     "decode_tok_s": 79.17104712745842
+    },
+    {
+     "prompt": "Explain step by step, for a beginner, how a transformer deco",
+     "prompt_tokens": 69,
+     "completion_tokens": 1024,
+     "t_send": 1790799799.5416834,
+     "t_first": 1790799799.8296194,
+     "t_last": 1790799812.4855974,
+     "ttft": 0.2879359722137451,
+     "decode_tok_s": 80.83136703283587
+    },
+    {
+     "prompt": "比较定期盘点、永续盘存和 ABC 分析三种库存管理方法，各自适合什么场景？",
+     "prompt_tokens": 73,
+     "completion_tokens": 1024,
+     "t_send": 1790799816.876905,
+     "t_first": 1790799817.0304134,
+     "t_last": 1790799830.2689974,
+     "ttft": 0.15350842475891113,
+     "decode_tok_s": 77.27412514705102
+    },
+    {
+     "prompt": "A train leaves at 9:40 and arrives at 13:05 after covering 2",
+     "prompt_tokens": 88,
+     "completion_tokens": 540,
+     "t_send": 1790799816.8773568,
+     "t_first": 1790799817.0309365,
+     "t_last": 1790799821.9591072,
+     "ttft": 0.1535797119140625,
+     "decode_tok_s": 109.37121193429435
+    },
+    {
+     "prompt": "写一封给供应商的邮件，说明因为质量问题需要退回一批货，语气专业但友好。",
+     "prompt_tokens": 72,
+     "completion_tokens": 300,
+     "t_send": 1790799816.8787153,
+     "t_first": 1790799817.0307293,
+     "t_last": 1790799821.298857,
+     "ttft": 0.15201401710510254,
+     "decode_tok_s": 70.05413671511145
+    },
+    {
+     "prompt": "What are the trade-offs between microservices and a modular ",
+     "prompt_tokens": 73,
+     "completion_tokens": 1024,
+     "t_send": 1790799816.8790996,
+     "t_first": 1790799817.031152,
+     "t_last": 1790799831.0986314,
+     "ttft": 0.1520524024963379,
+     "decode_tok_s": 72.72091701334934
+    }
+   ],
+   "errors": 0,
+   "completion_tokens": 6529,
+   "decode_tok_s_mean": 76.78,
+   "agg_tok_s": 206.9,
+   "wall_s": 31.6,
+   "tokens_per_round": 2.453,
+   "ttft_mean": 0.246
+  }
+ ]
+}
