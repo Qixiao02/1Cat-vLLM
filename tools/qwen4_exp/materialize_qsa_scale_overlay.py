@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import math
@@ -21,6 +22,10 @@ E4M3_MAX = 448.0
 INDEX_FILENAME = "model.safetensors.index.json"
 MANIFEST_FILENAME = "kvscales-manifest.json"
 MTP_SCALE_FILENAME = "model-bf16-kvscales-mtp.safetensors"
+# Qwen4ExpMTP.allow_patterns_overrides: the drafter loads the files of the
+# first pattern that matches anything, this one before *.safetensors.
+DRAFT_SHARD_PATTERN = "model-bf16-*.safetensors"
+PLAIN_MTP_SCALE_FILENAME = "model-kvscales-mtp.safetensors"
 _SCALE_NAME = re.compile(r"layers\.(\d+)\.self_attn\.([kv])_scale$")
 
 
@@ -193,6 +198,35 @@ def _draft_scales(args: argparse.Namespace) -> tuple[dict[str, float], str]:
     return scales, source
 
 
+def _mtp_scale_filename(
+    args: argparse.Namespace, base: Path, target_filename: str
+) -> str:
+    """Name the MTP scale shard so that the drafter's loader reads it.
+
+    A base with compact model-bf16-* shards is loaded from those alone, so the
+    scale shard needs that prefix. A base without them is loaded through
+    *.safetensors; there a model-bf16-* scale shard would be the only match
+    of the first pattern and hide every MTP weight from the drafter.
+    """
+    draft_shards = any(
+        fnmatch.fnmatch(entry.name, DRAFT_SHARD_PATTERN) for entry in base.iterdir()
+    )
+    name = getattr(args, "mtp_scale_filename", None) or (
+        MTP_SCALE_FILENAME if draft_shards else PLAIN_MTP_SCALE_FILENAME
+    )
+    if Path(name).name != name or not name.endswith(".safetensors"):
+        raise ValueError(f"MTP scale shard must be a .safetensors file name: {name}")
+    if name == target_filename:
+        raise ValueError("MTP and target scales need separate shards")
+    if fnmatch.fnmatch(name, DRAFT_SHARD_PATTERN) != draft_shards:
+        raise ValueError(
+            f"MTP scale shard {name} would not load with this base checkpoint: "
+            f"it {'has' if draft_shards else 'has no'} {DRAFT_SHARD_PATTERN} "
+            "shards, and the drafter reads those alone when any exists"
+        )
+    return name
+
+
 def materialize(args: argparse.Namespace) -> None:
     pack_dir = Path(args.pack_dir).resolve()
     base = Path(args.base_checkpoint).resolve()
@@ -223,6 +257,7 @@ def materialize(args: argparse.Namespace) -> None:
     ):
         raise ValueError("Published scale tensor coverage does not match its manifest")
 
+    mtp_scale_filename = _mtp_scale_filename(args, base, scale_details["filename"])
     target, target_provenance = _target_scales(args, manifest, published)
     draft, draft_source = _draft_scales(args)
     base_index = _load_json(base_index_path)
@@ -244,7 +279,7 @@ def materialize(args: argparse.Namespace) -> None:
         excluded = {
             INDEX_FILENAME,
             scale_details["filename"],
-            MTP_SCALE_FILENAME,
+            mtp_scale_filename,
             "kvscales-provenance.json",
         }
         for source in base.iterdir():
@@ -260,7 +295,7 @@ def materialize(args: argparse.Namespace) -> None:
             shutil.copy2(published_path, target_path)
         else:
             save_scale_shard(target_path, target, metadata)
-        draft_path = staging / MTP_SCALE_FILENAME
+        draft_path = staging / mtp_scale_filename
         save_scale_shard(draft_path, draft, {"source": draft_source})
 
         merged_weight_map = dict(weight_map)
@@ -285,6 +320,7 @@ def materialize(args: argparse.Namespace) -> None:
             "target_scale_source": getattr(args, "target_scale_source", "published"),
             "target_scales": target_provenance,
             "target_tensor_count": len(target),
+            "mtp_scale_file": mtp_scale_filename,
             "mtp_scale_file_sha256": _sha256(draft_path),
             "mtp_scale_source": draft_source,
             "mtp_tensor_count": len(draft),
@@ -309,6 +345,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mtp-layer-id", type=int, default=48)
     parser.add_argument("--mtp-scale-from-layer", type=int)
     parser.add_argument("--mtp-unit-scale", action="store_true")
+    parser.add_argument(
+        "--mtp-scale-filename",
+        help="MTP scale shard name; default: chosen from the base checkpoint layout",
+    )
     parser.add_argument(
         "--target-scale-source",
         choices=("published", "envelope"),
