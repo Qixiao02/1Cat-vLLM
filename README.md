@@ -4,6 +4,27 @@
 
 This is a heavily modified fork of 1Cat-vLLM (branch `1cat-vllm-heavily-modified-v1`, tag `1cat-vllm-heavily-modified-v1-0930`, based on upstream `main@02c87ab89`) tuned for concurrency and prefill of Swift 1.5 Qwen3.8-Flash-Next on 4x V100. See [HEAVILY_MODIFIED.md](HEAVILY_MODIFIED.md) for the changes, switches and measurements.
 
+## 提示：E4M3 KV（官方 PR #664）默认不生效
+
+> [!IMPORTANT]
+> **E4M3 KV（官方 PR #664 的移植）默认不生效。生产环境建议保持默认的 FP16。**
+>
+> **怎样才生效**，下面三项缺一不可：
+>
+> 1. 启动参数 `--kv-cache-dtype fp8_e4m3`。不写就是 FP16。
+> 2. 开着 MTP 时设置环境变量 `VLLM_QWEN4EXP_QSA_E4M3_MTP=1`。不设会在启动时报错 `Qwen4Exp QSA E4M3 phase 1 requires MTP0`。
+> 3. 模型目录里带有标定出来的 scale：24 个目标层 scale，开 MTP 时再加 2 个 MTP 层 scale。缺 MTP 层 scale 会拒绝启动。缺目标层 scale 时，默认只打一条警告并按 scale = 1 运行，数值可能被截断；设置 `VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1` 后改为拒绝启动。
+>
+> 生效时启动日志里有 `Using fp8_e4m3 data type to store kv cache` 和 `QSA E4M3 calibrated scale gate passed: loaded 24/24 K/V scales`（开 MTP 时还有一条 `loaded 2/2`）。标定和启动的步骤见“注意和已知限制”里的[KV 缓存的格式](#kv-缓存的格式fp16-和-e4m3)一节。
+>
+> **已知问题**（数据见实测第 5 组）：
+>
+> - 4 并发的 decode 速度只有 FP16 KV 的一半左右（每路 30–39 tok/s，FP16 是 61–71），单请求基本不变。
+> - KV 缓存容量多 65%，但开 MTP 时每条在跑的请求固定占约 13% 的缓存池，4 条 32K 并发仍然放不下。
+> - 每张卡显存峰值 32,267 MiB，整卡 32,768 MiB，余量约 500 MiB。
+> - scale 只覆盖标定时见过的数值范围，超出的会被截断。我们的标定只用了 18 条请求，prompt 最长 36K token。
+> - 不开 MTP 时用 E4M3，本分支的各项优化会回到官方路径，这个组合没有测过。
+
 ## 改动（按提交顺序）
 
 下文中，prefill 指引擎计算整段输入 prompt 的阶段，decode 指之后逐个生成输出 token 的阶段。引擎按“步”推进，每一步对一批 token 做一次前向计算；“行”指一步里一起计算的 token 数，纯 decode 时每条请求占一行。
@@ -36,7 +57,7 @@ This is a heavily modified fork of 1Cat-vLLM (branch `1cat-vllm-heavily-modified
 
 6. **MTP 通道的显存（2026-09-30，在 tag `1cat-vllm-heavily-modified-v1-0930` 之后）**
    - 移植官方 PR #707：PLE 的短卷积在 prefill 时原来同时占 6 块和整批输入一样大的缓冲，现在只占 2 块，结果逐位不变。开 MTP 时这一步另外按请求长度分组打包，不再把短请求补齐到最长请求的长度。改之前，开 MTP、4 条 8K prompt 并发会在这一步显存溢出；改之后不再溢出，每步 prefill 仍是 8192 token。
-   - 移植官方 PR #664：开 MTP 时 KV 缓存可以用 8 位的 E4M3 格式存放（FP8 的一种：1 位符号、4 位指数、3 位尾数）。**默认不启用，KV 缓存仍是 FP16。** 启用要同时满足三点：启动参数 `--kv-cache-dtype fp8_e4m3`；环境变量 `VLLM_QWEN4EXP_QSA_E4M3_MTP=1`；模型目录里有标定出来的 26 个 scale（12 个 QSA 层和 MTP 层，每层 K、V 各一个）。scale 要在自己的模型上标定，工具在 `tools/qwen4_exp/`，整套流程见 [`sx_bench/as_run/e4m3_chain.sh`](sx_bench/as_run/e4m3_chain.sh)。实测见第 5 组：KV 缓存容量多 65%，但 4 并发的 decode 速度只有 FP16 的一半左右。怎样才生效、有哪些已知问题，见“注意”里“KV 缓存的格式”一节开头的提示。
+   - 移植官方 PR #664：开 MTP 时 KV 缓存可以用 8 位的 E4M3 格式存放（FP8 的一种：1 位符号、4 位指数、3 位尾数）。**默认不启用，KV 缓存仍是 FP16。** 启用要同时满足三点：启动参数 `--kv-cache-dtype fp8_e4m3`；环境变量 `VLLM_QWEN4EXP_QSA_E4M3_MTP=1`；模型目录里有标定出来的 26 个 scale（12 个 QSA 层和 MTP 层，每层 K、V 各一个）。scale 要在自己的模型上标定，工具在 `tools/qwen4_exp/`，整套流程见 [`sx_bench/as_run/e4m3_chain.sh`](sx_bench/as_run/e4m3_chain.sh)。实测见第 5 组：KV 缓存容量多 65%，但 4 并发的 decode 速度只有 FP16 的一半左右。怎样才生效、有哪些已知问题，见 README 开头的提示。
 7. **开着前缀缓存时及时释放换下来的状态块（2026-10-01，在 tag 之后）**：一步 prefill 跨多个状态块时，换下来的状态块原来要到请求结束才释放，现在处理完对应的 token 就释放。只改 KV 管理器，不改变分块方案、前缀命中和输出。CPU 模拟里（本分支的调度器和 KV 管理器，生产的缓存池大小），一条冷的 110K 请求在 decode 阶段占用的缓存块从 198 降到 146，KV 占用峰值从 36.5% 降到 27.8%。V100 上的实测数字待补。
 
 ## 实测测试对比
@@ -211,24 +232,7 @@ vllm serve <模型目录> \
 
 ### KV 缓存的格式（FP16 和 E4M3）
 
-> [!IMPORTANT]
-> **E4M3 KV（官方 PR #664 的移植）默认不生效。生产环境建议保持默认的 FP16。**
->
-> **怎样才生效**，下面三项缺一不可：
->
-> 1. 启动参数 `--kv-cache-dtype fp8_e4m3`。不写就是 FP16。
-> 2. 开着 MTP 时设置环境变量 `VLLM_QWEN4EXP_QSA_E4M3_MTP=1`。不设会在启动时报错 `Qwen4Exp QSA E4M3 phase 1 requires MTP0`。
-> 3. 模型目录里带有标定出来的 scale：24 个目标层 scale，开 MTP 时再加 2 个 MTP 层 scale。缺 MTP 层 scale 会拒绝启动。缺目标层 scale 时，默认只打一条警告并按 scale = 1 运行，数值可能被截断；设置 `VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1` 后改为拒绝启动。
->
-> 生效时启动日志里有 `Using fp8_e4m3 data type to store kv cache` 和 `QSA E4M3 calibrated scale gate passed: loaded 24/24 K/V scales`（开 MTP 时还有一条 `loaded 2/2`）。标定和启动的步骤见本节末尾。
->
-> **已知问题**（数据见实测第 5 组）：
->
-> - 4 并发的 decode 速度只有 FP16 KV 的一半左右（每路 30–39 tok/s，FP16 是 61–71），单请求基本不变。
-> - KV 缓存容量多 65%，但开 MTP 时每条在跑的请求固定占约 13% 的缓存池，4 条 32K 并发仍然放不下。
-> - 每张卡显存峰值 32,267 MiB，整卡 32,768 MiB，余量约 500 MiB。
-> - scale 只覆盖标定时见过的数值范围，超出的会被截断。我们的标定只用了 18 条请求，prompt 最长 36K token。
-> - 不开 MTP 时用 E4M3，本分支的各项优化会回到官方路径，这个组合没有测过。
+怎样才生效、有哪些已知问题，见 README 开头的[提示](#提示e4m3-kv官方-pr-664默认不生效)。
 
 Flash-Next 的注意力（QSA）只支持下面两种 KV 缓存格式，没有介于两者之间的位宽。默认是 FP16，不加任何开关就是它。
 
