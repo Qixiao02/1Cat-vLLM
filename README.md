@@ -1,5 +1,192 @@
-<!-- markdownlint-disable MD041 -->
+# 1Cat-vLLM-heavily-modified
 
-> **1Cat-vLLM 1.5.1-heavily-modified-v1**：这是基于 1Cat 官方代码的魔改分支（默认分支 `heavily-modified`，基于官方 `main@02c87ab89`，即 v1.5.0 之后第 670 个提交）。它面向 4 张 V100 上的 Swift 1.5 Qwen3.8-Flash-Next，重点优化并发吞吐和 prefill。改动清单、开关和与官方 `main@357d07bcb` 的实测对比见 [HEAVILY_MODIFIED.md](HEAVILY_MODIFIED.md)。官方原版请看 [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)。
->
-> This is a heavily modified fork of 1Cat-vLLM (branch `heavily-modified`, based on upstream `main@02c87ab89`) tuned for concurrency and prefill of Swift 1.5 Qwen3.8-Flash-Next on 4x V100. See [HEAVILY_MODIFIED.md](HEAVILY_MODIFIED.md) for the changes, switches and measurements.
+**1cat-vllm-heavily-modified-v1-0930**：这是基于 1Cat 官方代码的魔改分支（默认分支 `1cat-vllm-heavily-modified-v1-0930`，基于官方 `main@02c87ab89`，即 v1.5.0 之后第 670 个提交）。它面向 4 张 V100 上的 Swift 1.5 Qwen3.8-Flash-Next，重点优化并发吞吐和 prefill。改动清单、开关和与官方 `main@357d07bcb` 的实测对比见 [HEAVILY_MODIFIED.md](HEAVILY_MODIFIED.md)。官方原版请看 [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)。
+
+This is a heavily modified fork of 1Cat-vLLM (branch `1cat-vllm-heavily-modified-v1-0930`, based on upstream `main@02c87ab89`) tuned for concurrency and prefill of Swift 1.5 Qwen3.8-Flash-Next on 4x V100. See [HEAVILY_MODIFIED.md](HEAVILY_MODIFIED.md) for the changes, switches and measurements.
+
+## 改动（按提交顺序）
+
+下文中，prefill 指引擎计算整段输入 prompt 的阶段，decode 指之后逐个生成输出 token 的阶段。引擎按“步”推进，每一步对一批 token 做一次前向计算；“行”指一步里一起计算的 token 数，纯 decode 时每条请求占一行。
+
+每项改动都有 `SX_OPT_*` 环境变量开关，默认开，设为 `0` 就回到官方原路径。
+
+1. **Flash-V100 分组验证和 DFlash2 speculator**（提交 `d3400c869`）：V100 注意力后端 `FLASH_ATTN_V100` 在 DFlash2 推测解码（先草拟几个 token，再由主模型一次验证）的验证步里，把多条请求合并成一次调用，并配套修改了 DFlash2 speculator。官方 `main@02c87ab89` 加上这一项，是后面各项改动和收益对比的起点。
+2. **第一批（Python/Triton）**
+   - 采样器的 top-k/top-p 去掉每步一次的主机同步（CPU 停下来等 GPU 的结果）。
+   - 开着前缀缓存（开头相同的 prompt 复用已经算过的部分）时，一步 prefill 可以跨多个状态块。Flash-Next 有带循环状态的层，前缀缓存以 mamba `align` 模式按 784 token 一块存放循环状态（下称“状态块”）；官方的一步 prefill 最多推进一个状态块。
+   - QSA（模型的稀疏注意力算子）：去掉主机同步，双 warp 内核覆盖到 32 行，decode 的地址解析，混合步（同一步里既有 prefill 又有 decode）的内核路由。
+   - 稠密层的 GEMV（矩阵乘向量）和 HC（HyperConnection 残差）增加多行内核，单请求路径的结果逐位不变。
+   - MoE（混合专家层）的路由和持久缓冲区扩到 32 行。
+   - PLE（模型的 n-gram 嵌入表）在 prefill 时分组打包。
+3. **第二批（CUDA 内核和 CUDA graph）**
+   - NVFP4（权重 4 bit 的量化格式）MoE 的分组 decode 内核扩到 17–32 行，并跳过补齐行。CUDA graph 把一步的 GPU 调用按固定行数录制下来重放，请求数不足时用空行补齐。
+   - TP4（张量并行，模型分摊在 4 张卡上）的 push all-reduce 覆盖 10–160 KiB 的数据。
+   - 共享专家的门控支持多行。
+   - QSA 的 decode top-k 覆盖所有行。
+   - 25–1024 token 的混合步使用 PIECEWISE（分段录制的）CUDA graph。
+4. **第三批（3a）**
+   - MTP（用模型自带的多 token 预测头做推测解码）通道的优化。只有启动时开了 MTP 才会用到；MTP 默认不开，未达到生产条件，见“已知限制”。
+   - prefill 保护：只有 1 个 token（不开 MTP）或 k+1 个 token（开 MTP，k 是每步草拟的 token 数）的 prefill 分块不再重放 FULL（整步录制的）CUDA graph。
+   - 短 prompt 不再为了在末尾留缓存检查点而多拆一步。
+5. **移植官方 #704 质量修复，并让它真正生效**
+   - Qwen3.8 的 gated RMSNorm 改用精确的原生 CUDA 算子（`_C::sm70_rmsnorm_gated_exact_out`），结果与 PyTorch eager 的 FP32 计算逐位相同。
+   - 目的是让单请求和批量、decode 和混合步都用同一套算术，避免微小的舍入差异改变 MoE 路由、翻转 EOS（结束符）。
+   - 不开 MTP 时默认启用，由 `VLLM_SM70_RMSNORM_GATED_EXACT` 控制，设为 `0` 关闭。
+   - 与官方的区别：官方在 Python 里只对 1–192 行的输入放行这个算子。vLLM 对每个编译范围只追踪一次，按最大尺寸追踪，而且丢弃形状守卫，所以这个行数条件对整个范围只判断一次。Flash-Next 的 decode 图按 24 并发（这个算子的输入是 288 行）追踪，主编译按 8192 token 追踪，官方的条件在这样的部署上从来不满足，算子一次也没有运行（官方 `main@357d07bcb` 同样如此）。本分支只检查编译期不变的条件（2 维、宽 128、FP16、连续），内核接受任意行数，所以 decode、混合步和 prefill 图的每一行结果都相同。
+
+## 实测测试对比
+
+4 条互不相同的长 prompt（每条 8K–32K token）同时到达时，本分支的 prefill 速度是官方 `main@d30469863` 的 1.57–1.73 倍，每路 decode 速度是官方的 1.41–1.56 倍；每条 64K 时，官方的 KV 缓存（存放各请求已算状态的显存池）放不下 4 条，本分支可以同时处理。本分支开着前缀缓存时，prefill 速度是关掉时的 97%–100%。
+
+四组测试共用的条件：
+
+- 硬件是 4 张 Tesla V100-SXM2-32GB，TP4。
+- 模型是 Swift 1.5 Qwen3.8-Flash-Next 的 NVFP4 量化版（PLE 表以 FP8 存储），不开 MTP。
+- 除特别说明外都开着前缀缓存。启动参数和环境变量见“注意”。
+
+第 1、2 组用同一套测法，指标这样算：
+
+- **prefill 速度**：同时发出的几条请求的 prompt token 总数 ÷ 最后一条拿到首字的时间。
+- **首字延迟（TTFT）**：从发出请求到收到第一个输出 token 的时间。表里的“第 1 条”“第 4 条”按拿到首字的先后排序。
+- **decode 速度**：只统计几条请求都在生成的那段时间。“每路”是各条请求速度的平均，“合计”是各路之和。
+- **KV 占用**：KV 缓存已用的比例，每秒采样一次，表里是峰值。KV 缓存容量指它能放下的 token 数。
+
+脚本和这两组的原始结果在 [`sx_bench/`](sx_bench/)，用法和字段说明见 [`sx_bench/README.md`](sx_bench/README.md)。第 3、4 组的脚本和原始记录没有收录。
+
+### 1. 与官方 `main@d30469863` 并排对比（2026-09-30）
+
+本分支（2 遍平均）：
+
+| 每条输入 | prefill（token/s） | 第 1 条首字 | 第 4 条首字 | decode 每路（token/s） | decode 合计（token/s） |
+|---|---|---|---|---|---|
+| 8K | 6544 | 2.4 s | 4.9 s | 61.9 | 248 |
+| 16K | 6427 | 3.7 s | 10.0 s | 60.4 | 242 |
+| 32K | 6130 | 6.7 s | 20.9 s | 59.3 | 237 |
+| 64K | 5764 | 13.2 s | 44.4 s | 57.1 | 228 |
+
+官方 `main@d30469863`（2 遍平均）：
+
+| 每条输入 | prefill（token/s） | 第 1 条首字 | 第 4 条首字 | decode 每路（token/s） | decode 合计（token/s） |
+|---|---|---|---|---|---|
+| 8K | 4162 | 7.0 s | 7.7 s | 43.8 | 175 |
+| 16K | 3972 | 15.1 s | 16.1 s | 38.7 | 155 |
+| 32K | 3551 | 34.6 s | 36.1 s | 40.4 | 162 |
+| 64K（KV 缓存放不下） | 1870 | 77.0 s | 136.9 s | 40.5（只有 3 路） | 122（3 路） |
+
+本分支 ÷ 官方：
+
+| 每条输入 | prefill 速度 | decode 每路速度 |
+|---|---|---|
+| 8K | 1.57 | 1.41 |
+| 16K | 1.62 | 1.56 |
+| 32K | 1.73 | 1.47 |
+
+64K 不列比值：官方只有 3 条请求同时运行，两边的负载不一样。
+
+测法：
+
+- 两条线在同一台服务器上，本分支用 GPU 0–3，官方用 GPU 4–7。模型文件、启动参数和 prompt（同一个随机种子）都相同，一次只压测一条线。
+- 官方这条线用官方自己的 Dockerfile 从 `main@d30469863` 干净构建，使用官方默认设置，并打开官方的可选开关 `VLLM_SM70_QWEN38_BATCH_FASTPATH=1`（批量快速路径）。本分支的代码早于这个开关，它自己的多行 decode 路径默认就是开的。
+- KV 缓存容量：本分支 410,247 token，官方 201,421 token（批量快速路径每张卡约占 1 GiB 显存）。
+- 每次同时发出 4 条请求，8K、16K、32K、64K 是每条 prompt 的 token 数（8,000 到 64,000）。每条 prompt 是不同的随机文本，没有共同前缀，前缀缓存命中为 0，所以测的是冷 prefill。每条固定生成 400 token。
+- 每个输入长度跑 2 遍，表里是 2 遍的平均值。
+
+其他观察（来自同一批记录）：
+
+- 每条 64K 时，官方的 KV 占用峰值到 99.6%，2 遍各发生 2 次抢占（KV 缓存用满时，引擎中止一条正在跑的请求并收回它的缓存，之后重算），只有 3 条请求同时运行，第 4 条在 137 秒后才拿到首字。本分支的峰值是 86.1%，没有抢占。
+- 2 遍之间的差：本分支的 prefill 和 decode 速度在各个长度上都不超过 2%。官方 8K 的 2 遍是 prefill 3905 和 4420 token/s，decode 每路 47.4 和 40.2 token/s。
+- 首字的分布：本分支一条接一条地做 prefill，第 1 条的首字来得早；官方 4 条一起推进，4 个首字都来得晚，而且挨得很近。
+- 本分支的代价：别的请求在 prefill 时，已经在生成的请求会停顿。相邻两个 token 的最长间隔，本分支是 1.2–1.5 秒，官方是 0.5–0.8 秒；稳定 decode 时的间隔中位数，本分支是 16–18 ms，官方是 22–24 ms。
+- 各次测试期间的 GPU 平均利用率：本分支 92%–96%，官方 69%–84%。
+
+### 2. 本分支开、关前缀缓存（2026-09-30）
+
+开着前缀缓存时，prefill 速度是关掉时的 97%–100%，decode 速度最多相差约 3%。
+
+| 每条输入 | prefill 开 / 关（token/s） | 开 ÷ 关 | decode 每路 开 / 关（token/s） | 第 1 条首字 开 / 关 | KV 占用峰值 开 / 关 |
+|---|---|---|---|---|---|
+| 8K | 6329 / 6377 | 0.99 | 59.9 / 61.8 | 2.0 / 1.5 s | 13.6% / 11.6% |
+| 16K | 6261 / 6452 | 0.97 | 60.8 / 60.2 | 4.0 / 2.7 s | 23.9% / 18.8% |
+| 32K | 6111 / 6105 | 1.00 | 59.0 / 59.3 | 6.9 / 5.9 s | 44.5% / 34.0% |
+| 64K | 5757 / 5841 | 0.99 | 56.5 / 57.2 | 13.2 / 11.9 s | 86.1% / 63.6% |
+
+测法：
+
+- 方法同第 1 组：4 条冷 prompt 同时发出，每条生成 400 token，每个长度跑 2 遍取平均。
+- “开”在作者的线上实例上测，测试时实例空闲；“关”用同一个镜像和同一套配置，另加 `--no-enable-prefix-caching`。
+- 2 遍之间 prefill 速度最多差 7%（关、8K），其余都在 2% 以内。
+
+作为对照，官方开着前缀缓存时一步 prefill 最多推进一个状态块，一条 110K 的 prompt 要 141 个调度步，而不是 14 个（见改动第 2 项）。开着前缀缓存的两个代价（第 1 条首字晚约 1 秒、KV 占用更高）见“已知限制”。
+
+### 3. 与官方 `main@357d07bcb` 对比（2026-09-28）
+
+| 指标 | 本分支 | 官方 `main@357d07bcb` |
+|---|---|---|
+| 每路 token/s，并发 1 / 4 / 8 / 24 | 91 / 62 / 41 / 25 | 90 / 45 / 39 / 18 |
+| 24 并发总吞吐 | 439 token/s | 313 token/s |
+| 业务 JSON，8 / 24 并发 | 1.43 / 2.90 请求/秒 | 0.96 / 1.91 请求/秒 |
+| 真实请求回放（1.5 请求/秒）：首字延迟 p95 / 端到端 p95 | 0.39 s / 8.4 s | 1.2 s / 19.3 s |
+| 长文请求耗时，32K / 64K / 110K | 5.2 / 10.3 / 17.8 s | 11.3 / 23.8 / 39.6 s |
+| 长文检索（9 处） | 9/9 | 9/9 |
+| KV 缓存容量 | 410K token | 201K token |
+
+测法和配置：
+
+- 官方 `main@357d07bcb` 是 2026-09-28 当时的最新提交，干净构建，全部原生库和 FlashAttention 都重新编译过。
+- 两边的模型、压测和真实请求回放相同。每项只跑了一次，单次结果的波动估计在 ±10% 左右。
+- 两列各用各的最佳配置。本分支用作者线上服务的配置，即“注意”里的环境变量：关闭 hybrid PLE 通道，打开 MoE 分组 decode。官方用它默认的 PLE 和 MoE 设置，并打开批量快速路径 `VLLM_SM70_QWEN38_BATCH_FASTPATH=1`。把本分支的线上配置直接套到官方代码上会更慢（24 并发总吞吐 210 token/s），所以不用它做对比。
+- “业务 JSON”和“真实请求回放”是作者自己的业务负载。p95 是第 95 百分位，“端到端”指从发出请求到整条回答结束。
+- 长文请求耗时是非流式请求的总时间，两列都开着前缀缓存。64K 和 110K 两条各有大约 10% 的 token 命中了缓存，两列相同。
+
+### 4. 分支内部对比
+
+| 对比项 | 结果 |
+|---|---|
+| prefill 速度：起点 → 本分支 | 1.4–1.7 倍 |
+| 采样 decode（开着 top-k/top-p 采样）每步：起点 → 本分支 | 快 18%–37% |
+| 业务 JSON，24 并发：起点 → 本分支 | 1.84 → 2.89 请求/秒 |
+| 同一组 24 条请求单独跑和 8 并发跑，输出逐 token 相同的条数：精确 gated RMSNorm 生效前 → 后 | 21/24 → 21/24 |
+
+- 起点是官方 `main@02c87ab89` 加改动第 1 项。
+- 精确 gated RMSNorm（改动第 5 项）生效前后，吞吐、首字延迟和长文首字延迟都没有可测的变化。“逐 token 相同的条数”这个指标，同一份代码测两次会在 17–21 之间波动，24 条样本分辨不出差异。
+
+## 注意和已知限制
+
+### 注意
+
+- **适用范围**：只在 4 张 V100-SXM2-32GB、TP4、Swift 1.5 Qwen3.8-Flash-Next NVFP4（PLE 表以 FP8 存储）、不开 MTP 这一种组合上验证过。各项优化按这套硬件和模型的形状判断是否启用；其他组合会回到官方路径，能运行，但没有加速。没有针对 Qwen3.8-27B 加 DFlash2 做调优或验证。
+- **构建和运行环境**：原生内核只为 sm_70（V100 的 CUDA 架构）编译。需要 Python 3.12 和 torch 2.10.0+cu128；运行时还需要 CUDA 12.8 toolkit，因为部分内核在首次启动时编译，冷启动要 8–25 分钟。PLE 表需要约 48 GiB 可锁定的主机内存。
+- **版本标记**：git tag `1cat-vllm-heavily-modified-v1-0930` 和默认分支同名，指向包含这份 README 的提交。引擎代码从 2026-09-28 起没有改动，之后加的只有文档和 `sx_bench/`。运行中的引擎在 `/version` 返回的是编译进去的包版本 `1.5.1+heavily.modified.v1`。
+
+启动参数（所有测量、两条线都用这一组）：
+
+```bash
+vllm serve <模型目录> \
+  --tensor-parallel-size 4 --dtype half --attention-backend FLASH_ATTN_V100 \
+  --max-model-len 131072 --max-num-seqs 24 --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.90 --kv-cache-dtype auto --trust-remote-code \
+  --enable-prefix-caching --enable-chunked-prefill \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
+  --language-model-only
+```
+
+本分支这条线的环境变量如下，`SX_OPT_*` 开关全部保持默认（开）：
+
+| 环境变量 | 值 | 作用 |
+|---|---|---|
+| `VLLM_QWEN4EXP_PLE_HOST_GIB` | `12` | 每个 TP 进程为 PLE 表锁定的主机内存（GiB），4 个进程合计约 48 GiB |
+| `OMP_NUM_THREADS` | `8` | 每个进程的 OpenMP 线程数 |
+| `VLLM_SM70_QWEN38_HYBRID_PLE` | `0` | 关闭 hybrid PLE 通道 |
+| `VLLM_PLE_CPU_OFFLOAD` | `0` | 不把 PLE 查表交给单独的 CPU 进程 |
+| `VLLM_PLE_DISK_OFFLOAD` | `0` | 不用磁盘文件映射存放 PLE 表 |
+| `VLLM_SM70_NVFP4_MOE_GROUPED_DECODE` | `1` | 打开 NVFP4 MoE 的分组 decode 内核，改动第 3 项的分组 decode 依赖它 |
+| `VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS` | `240` | 预热时 MoE 内核调优覆盖的上限，240 对应 24 行（每个 token 选 10 个专家） |
+
+### 已知限制
+
+- **MTP 通道**：开 MTP 时 KV 缓存只有约 131K token，负载下还可能显存溢出。生产环境请保持关闭。
+- **只有 1 个 token 的 prompt**：全新请求的整个 prompt 只有 1 个 token 时，会读到没有清零的状态槽。官方也有同样的问题。聊天接口的 prompt 带模板，不会触发。
+- **开着前缀缓存时长 prompt 的 KV 占用偏高**：4 条 64K 并发时，KV 占用峰值是 86%，关掉前缀缓存是 64%。原因是一步 prefill 跨多个状态块时，换下来的状态块要到请求结束才释放，每个状态组多占“步数 − 2”个块（Flash-Next 有 4 个状态组）。一条冷的 110K 请求因此多占约 9% 的缓存池，这是用本分支的调度器和 KV 管理器模拟得到的估算值，不是实测。这只影响容量，不影响输出；长 prompt 并发多时，缓存池会更早用满，出现排队或抢占。修复已有原型，没有包含在这个版本里。
+- **别的请求 prefill 时 decode 会停顿**：相邻两个 token 的间隔最长到 1.2–1.5 秒，数据见实测第 1 组。
+- **开着前缀缓存时第 1 条请求的首字晚约 1 秒**：prompt 末尾要多跑一步，用来留下缓存检查点。
+- **测试**：`sx_tests/` 下的测试需要 V100 和对应的镜像，每个文件里写了运行方法。

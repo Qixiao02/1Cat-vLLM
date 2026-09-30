@@ -1,6 +1,6 @@
 #!/bin/bash
 # pfx_ab.sh on|off : prefix caching ON vs OFF, cold prefill + decode at concurrency 4 (8K/16K/32K/64K prompts),
-# for the production Flash-Next image (1.5.1-heavily-modified-v1) on GPU 0-3.
+# for the production Flash-Next image (1cat-vllm-heavily-modified-v1-0930) on GPU 0-3.
 #   on  : benchmarks the live production instance on 8031 as it is (prefix caching on). No restart.
 #   off : stops production 8031, starts the same image and config with --no-enable-prefix-caching on
 #         127.0.0.1:8131, benchmarks it, removes the test container and ALWAYS restores production 8031.

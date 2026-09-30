@@ -1,4 +1,4 @@
-# 1Cat-vLLM 1.5.1-heavily-modified-v1
+# 1cat-vllm-heavily-modified-v1-0930
 
 Heavily modified fork of [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) for serving
 **Swift 1.5 Qwen3.8-Flash-Next (NVFP4)** on **4× V100-SXM2-32GB (TP4, SM70)**. It focuses on
@@ -11,10 +11,9 @@ All switches default to on, and setting one to `0` restores the upstream code pa
 
 | 项 | 值 |
 |---|---|
-| 版本名 | 1.5.1-heavily-modified-v1 |
-| git tag | `v1.5.1-heavily-modified-v1` |
-| Python 包版本（PEP 440） | `1.5.1+heavily.modified.v1`。从源码构建时设置 `SETUPTOOLS_SCM_PRETEND_VERSION=1.5.1+heavily.modified.v1` |
-| Docker 镜像 tag | `1.5.1-heavily-modified-v1-sm70main` |
+| 版本名 | 1cat-vllm-heavily-modified-v1-0930 |
+| git tag | `1cat-vllm-heavily-modified-v1-0930` |
+| Python 包版本（PEP 440） | `1.5.1+heavily.modified.v1`。这个字符串编译在构建里，运行中的引擎在 `/version` 返回的就是它。从源码构建时设置 `SETUPTOOLS_SCM_PRETEND_VERSION=1.5.1+heavily.modified.v1` |
 | 官方基线 | `main@02c87ab89`（2026-09-14），即官方 v1.5.0 之后第 670 个提交 |
 
 ## 改动（按提交顺序）
@@ -44,6 +43,56 @@ All switches default to on, and setting one to `0` restores the upstream code pa
    - **与官方的区别**：官方在 Python 里只放行 1–192 行。vLLM 每个编译范围只追踪一次，按最大尺寸追踪，而且丢弃形状守卫，所以这个行数条件对整个范围只判断一次。Flash-Next 的 decode 图按 24 并发（288 行）追踪，主编译按 8192 token 追踪，官方条件在我们的部署上从来不满足，算子一次也没运行（官方 `main@357d07bcb` 同样如此）。本分支只检查编译期不变的条件（2 维、宽 128、FP16、连续），内核接受任意行数，所以 decode、混合和 prefill 图的每一行结果都相同
 
 ## 实测：Flash-Next，4× V100，不开 MTP
+
+### 和官方 `main@d30469863` 并排对比（2026-09-30，4 并发）
+
+对比对象是官方 `main@d30469863`（2026-09-30），用官方自己的 Dockerfile 干净构建。两条线在同一台服务器上测，模型、启动参数和 prompt 都相同。8K–32K 的输入下，本分支的 prefill 是官方的 1.57–1.73 倍，decode 每路是官方的 1.41–1.56 倍；4 条 64K 官方的 KV 缓存放不下。
+
+本分支 v1（两遍平均）：
+
+| 每条输入 | prefill（token/s） | 第 1 条首字 | 第 4 条首字 | decode 每路（token/s） | decode 合计（token/s） |
+|---|---|---|---|---|---|
+| 8K | 6544 | 2.4 s | 4.9 s | 61.9 | 248 |
+| 16K | 6427 | 3.7 s | 10.0 s | 60.4 | 242 |
+| 32K | 6130 | 6.7 s | 20.9 s | 59.3 | 237 |
+| 64K | 5764 | 13.2 s | 44.4 s | 57.1 | 228 |
+
+官方 `main@d30469863`（两遍平均）：
+
+| 每条输入 | prefill（token/s） | 第 1 条首字 | 第 4 条首字 | decode 每路（token/s） | decode 合计（token/s） |
+|---|---|---|---|---|---|
+| 8K | 4162 | 7.0 s | 7.7 s | 43.8 | 175 |
+| 16K | 3972 | 15.1 s | 16.1 s | 38.7 | 155 |
+| 32K | 3551 | 34.6 s | 36.1 s | 40.4 | 162 |
+| 64K（KV 缓存放不下） | 1870 | 77.0 s | 136.9 s | 40.5（只有 3 路） | 122（3 路） |
+
+本分支 ÷ 官方：
+
+| 每条输入 | prefill | decode 每路 |
+|---|---|---|
+| 8K | 1.57 | 1.41 |
+| 16K | 1.62 | 1.56 |
+| 32K | 1.73 | 1.47 |
+
+64K 不列比值：官方只有 3 条请求同时运行，两边的负载不一样。
+
+测法：
+
+- 本分支用 GPU 0–3，官方用 GPU 4–7，一次只压测一条线。prompt 用同一个随机种子生成，两边相同。
+- 官方用默认设置，并打开它的可选开关 `VLLM_SM70_QWEN38_BATCH_FASTPATH=1`（批量快速路径）。本分支的代码早于这个开关，它自己的多行 decode 路径默认就是开的。
+- KV 缓存容量：本分支 410,247 token，官方 201,421 token（批量快速路径每张卡约占 1 GiB 显存）。
+- 4 条请求同时发出。每条 prompt 是不同的随机文本，互不共享前缀，前缀缓存命中为 0，所以测的是冷 prefill。每条固定生成 400 token。
+- prefill = 4 条 prompt 的 token 总数 ÷ 最后一条拿到首字的时间。首字按拿到的先后排序，表里列第 1 条和第 4 条。
+- decode 取 4 条都在生成的时间段，“每路”是各条速度的平均，“合计”是各路之和。
+- 每个长度跑两遍取平均。脚本和原始结果在 `sx_bench/`。
+
+其他观察（来自同一批记录）：
+
+- 4 条 64K 时，官方的 KV 占用峰值到 99.6%，两遍各发生 2 次抢占，只有 3 条请求同时运行，第 4 条在 137 秒后才拿到首字。本分支的峰值是 86.1%，没有抢占。
+- 两遍之间的差：本分支的 prefill 和 decode 在各个长度上都不超过 2%。官方 8K 的两遍是 prefill 3905 和 4420 token/s，decode 每路 47.4 和 40.2 token/s。
+- 首字的分布：本分支一条接一条地做 prefill，第 1 条的首字来得早；官方 4 条一起推进，4 个首字都来得晚，而且挨得很近。
+- 本分支的代价：别的请求在 prefill 时，已经在生成的请求会停顿。相邻两个 token 的最长间隔，本分支是 1.2–1.5 秒，官方是 0.5–0.8 秒；稳定 decode 时的间隔中位数，本分支是 16–18 ms，官方是 22–24 ms。
+- 各次测试期间的 GPU 平均利用率：本分支 92%–96%，官方 69%–84%。
 
 ### 和官方对比
 
@@ -104,5 +153,7 @@ All switches default to on, and setting one to `0` restores the upstream code pa
 
 - **MTP 通道**：KV 只有约 131K token，负载下还可能显存溢出。请在生产上保持关闭。
 - **1 token prompt**：全新请求的 prompt 只有 1 个 token 时，状态槽没有清零。官方也有同样问题。聊天接口的 prompt 带模板，不会触发。
-- **开前缀缓存时长 prompt 的 KV 占用偏高**：4 条 64K prompt 并发时，KV 占用峰值是 86%，关前缀缓存是 64%。原因是 prefill 一步跨多个状态块时，换下来的状态块要到请求结束才释放，每个状态组多占“步数 − 2”个块（Flash-Next 有 4 个状态组）。一条冷的 110K 请求因此多占约 9% 的缓存池。只影响容量，不影响输出；长 prompt 并发多时，缓存池会更早用满，出现排队或抢占。修复已有原型，还没有合入这个版本。
+- **开前缀缓存时长 prompt 的 KV 占用偏高**：4 条 64K prompt 并发时，KV 占用峰值是 86%，关前缀缓存是 64%。原因是 prefill 一步跨多个状态块时，换下来的状态块要到请求结束才释放，每个状态组多占“步数 − 2”个块（Flash-Next 有 4 个状态组）。一条冷的 110K 请求因此多占约 9% 的缓存池（用本分支的调度器和 KV 管理器模拟得到的估算值，不是实测）。只影响容量，不影响输出；长 prompt 并发多时，缓存池会更早用满，出现排队或抢占。修复已有原型，还没有合入这个版本。
+- **别的请求 prefill 时 decode 会停顿**：一条请求在 prefill 时，已经在生成的请求会停顿。4 并发冷 prompt 的测量里，相邻两个 token 的最长间隔是 1.2–1.5 秒，官方 `main@d30469863` 是 0.5–0.8 秒，见“和官方 `main@d30469863` 并排对比”。
 - **测试环境**：`sx_tests/` 下的测试需要 V100 和对应镜像，每个文件里写了运行方法。
+- **压测脚本和原始结果**：在 `sx_bench/`，说明见 `sx_bench/README.md`。目前只收录 2026-09-30 的两组测量（和官方并排对比、前缀缓存开和关）。

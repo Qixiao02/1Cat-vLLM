@@ -1,5 +1,5 @@
 {
- "test": "V1 (1.5.1-heavily-modified-v1) prefix caching on vs off, concurrency 4, cold random prompts, 400 generated tokens per request, 2 passes",
+ "test": "V1 (1cat-vllm-heavily-modified-v1-0930) prefix caching on vs off, concurrency 4, cold random prompts, 400 generated tokens per request, 2 passes",
  "date": "2026-09-30",
  "on_instance": "production 8031 (live, idle)",
  "off_instance": "test instance 127.0.0.1:8131, same image and config plus --no-enable-prefix-caching",
