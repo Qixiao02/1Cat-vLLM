@@ -121,6 +121,13 @@ class _Logger(logging.Logger):
     warning_once = debug_once = info_once
 
 
+def provide_regex() -> None:
+    """``regex`` is a vLLM dependency; the code under test only uses what the
+    standard library module offers under the same names."""
+    if importlib.util.find_spec("regex") is None:
+        sys.modules["regex"] = importlib.import_module("re")
+
+
 def install() -> types.ModuleType:
     """Return the ops/qsa module: real if vLLM imports, otherwise the stubs."""
     global _OPS
@@ -133,11 +140,9 @@ def install() -> types.ModuleType:
         return real
     except Exception:  # noqa: BLE001 - any import failure means "not installed"
         pass
-    import re
-
     for name in [m for m in sys.modules if m == "vllm" or m.startswith("vllm.")]:
         del sys.modules[name]
-    sys.modules.setdefault("regex", re)
+    provide_regex()
 
     _module("vllm")
     envs = _load_file("vllm.envs", _path("vllm", "envs.py"))
