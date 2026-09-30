@@ -208,6 +208,30 @@ vllm serve <模型目录> \
 | `VLLM_SM70_NVFP4_MOE_GROUPED_DECODE` | `1` | 打开 NVFP4 MoE 的分组 decode 内核，改动第 3 项的分组 decode 依赖它 |
 | `VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS` | `240` | 预热时 MoE 内核调优覆盖的上限，240 对应 24 行（每个 token 选 10 个专家） |
 
+### KV 缓存的格式（FP16 和 E4M3）
+
+Flash-Next 的注意力（QSA）只支持下面两种 KV 缓存格式，没有介于两者之间的位宽。默认是 FP16，不加任何开关就是它。
+
+| | FP16（默认） | E4M3（可选） |
+|---|---|---|
+| 每个数占用 | 16 位 | 8 位：1 位符号、4 位指数、3 位尾数，最大能表示 448 |
+| 有效数字 | 约 3 位 | 约 1 位 |
+| scale | 不需要 | 每层 K、V 各一个，缓存里存的是“数值 ÷ scale”，要在自己的模型上标定 |
+| KV 缓存容量（开 MTP，实测第 5 组） | 131,072 token | 216,820 token |
+| 本分支的快速通道 | 开不开 MTP 都有 | 只有开 MTP 并设置 `VLLM_QWEN4EXP_QSA_E4M3_MTP=1` 时有 |
+
+- E4M3 只压缩主 K/V，QSA 的索引缓存仍是 FP16，所以容量是多 65%，不是翻倍。
+- 不开 MTP 时也可以用 `--kv-cache-dtype fp8_e4m3` 启动（需要 24 个目标层 scale），但本分支的通道检查在这个组合下只认 FP16，各项优化会回到官方路径。这个组合没有测过。
+- 官方只为它自己发布的模型提供 scale。后训练过或重新转换过的模型（例如 Swift 1.5）要自己标定。
+
+启用 E4M3 KV 的步骤（我们跑的全流程脚本是 [`sx_bench/as_run/e4m3_chain.sh`](sx_bench/as_run/e4m3_chain.sh)，工具在 `tools/qwen4_exp/`）：
+
+1. 启动一个标定实例：FP16 KV，开 MTP，加 `--enforce-eager`，设置 `VLLM_QSA_KV_CALIBRATION_DIR=<目录>`。eager 模式下启动时的显存测算占用更多，留给 KV 缓存的更少，我们用的是 `--max-model-len 40960 --max-num-batched-tokens 2048`。
+2. 实例就绪后，在该目录下建一个名为 `COLLECTING` 的文件，然后发送有代表性的请求。引擎把每个 QSA 层写进缓存的 K、V 的最大绝对值记到这个目录。
+3. 停掉标定实例，依次运行 `qsa_kv_calibration.py summarize --expected-layers 13`、`sx_scale_pack.py target-report`、`qsa_kv_calibration.py overlay`、`sx_scale_pack.py manifest`、`materialize_qsa_scale_overlay.py`。得到一个新的模型目录：原模型文件的软链接，加两个 scale 文件和合并后的索引，原模型目录不变。scale = 最大绝对值 ÷ 448。
+4. 把 scale 文件 `model-kvscales.safetensors` 的权限改成引擎用户可读（工具写出来是 0600）。
+5. 用新目录启动：`--kv-cache-dtype fp8_e4m3`，`VLLM_QWEN4EXP_QSA_E4M3_MTP=1`，建议加 `VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES=1`（缺 scale 时直接报错）。
+
 ### 已知限制
 
 - **MTP 通道**：生产环境请保持关闭。开 MTP 时 KV 缓存只有约 131K token（FP16）或 217K token（E4M3），每条在跑的请求还固定占约 13% 的缓存池，4 条 32K 并发放不下；每张卡显存峰值 32,019–32,267 MiB，整卡 32,768 MiB；E4M3 KV 下 4 并发的 decode 速度减半。数据见实测第 5 组。
