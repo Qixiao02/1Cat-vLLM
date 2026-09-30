@@ -41,6 +41,10 @@ All switches default to on, and setting one to `0` restores the upstream code pa
    - 目的：单请求和批量、decode 和混合步都用同一套算术，避免微小的舍入差异改变 MoE 路由、翻转 EOS
    - 不开 MTP 时默认启用（`VLLM_SM70_RMSNORM_GATED_EXACT`，设为 `0` 关闭）
    - **与官方的区别**：官方在 Python 里只放行 1–192 行。vLLM 每个编译范围只追踪一次，按最大尺寸追踪，而且丢弃形状守卫，所以这个行数条件对整个范围只判断一次。Flash-Next 的 decode 图按 24 并发（288 行）追踪，主编译按 8192 token 追踪，官方条件在我们的部署上从来不满足，算子一次也没运行（官方 `main@357d07bcb` 同样如此）。本分支只检查编译期不变的条件（2 维、宽 128、FP16、连续），内核接受任意行数，所以 decode、混合和 prefill 图的每一行结果都相同
+6. **MTP 通道的显存（2026-09-30，在 git tag 之后，只在默认分支上）**
+   - 移植官方 PR #707：PLE 短卷积 prefill 的缓冲从 6 块减到 2 块，结果逐位不变；开 MTP 时按请求长度分组打包
+   - 移植官方 PR #664：开 MTP 时 KV 缓存可以用 E4M3（8 位）存放。默认不启用，KV 仍是 FP16；启用需要 `--kv-cache-dtype fp8_e4m3`、`VLLM_QWEN4EXP_QSA_E4M3_MTP=1` 和标定出来的 26 个 scale
+   - 实测和启用方法见 [README.md](README.md) 的改动第 6 项和实测第 5 组
 
 ## 实测：Flash-Next，4× V100，不开 MTP
 
@@ -151,9 +155,9 @@ All switches default to on, and setting one to `0` restores the upstream code pa
 
 ## 已知限制
 
-- **MTP 通道**：KV 只有约 131K token，负载下还可能显存溢出。请在生产上保持关闭。
+- **MTP 通道**：请在生产上保持关闭。KV 只有约 131K token（FP16）或 217K token（E4M3），每条在跑的请求固定占约 13% 的缓存池；E4M3 KV 下 4 并发的 decode 速度减半。数据见 README.md 实测第 5 组。
 - **1 token prompt**：全新请求的 prompt 只有 1 个 token 时，状态槽没有清零。官方也有同样问题。聊天接口的 prompt 带模板，不会触发。
 - **开前缀缓存时长 prompt 的 KV 占用偏高**：4 条 64K prompt 并发时，KV 占用峰值是 86%，关前缀缓存是 64%。原因是 prefill 一步跨多个状态块时，换下来的状态块要到请求结束才释放，每个状态组多占“步数 − 2”个块（Flash-Next 有 4 个状态组）。一条冷的 110K 请求因此多占约 9% 的缓存池（用本分支的调度器和 KV 管理器模拟得到的估算值，不是实测）。只影响容量，不影响输出；长 prompt 并发多时，缓存池会更早用满，出现排队或抢占。修复已有原型，还没有合入这个版本。
 - **别的请求 prefill 时 decode 会停顿**：一条请求在 prefill 时，已经在生成的请求会停顿。4 并发冷 prompt 的测量里，相邻两个 token 的最长间隔是 1.2–1.5 秒，官方 `main@d30469863` 是 0.5–0.8 秒，见“和官方 `main@d30469863` 并排对比”。
 - **测试环境**：`sx_tests/` 下的测试需要 V100 和对应镜像，每个文件里写了运行方法。
-- **压测脚本和原始结果**：在 `sx_bench/`，说明见 `sx_bench/README.md`。目前只收录 2026-09-30 的两组测量（和官方并排对比、前缀缓存开和关）。
+- **压测脚本和原始结果**：在 `sx_bench/`，说明见 `sx_bench/README.md`。目前收录 2026-09-30 的三组测量（和官方并排对比、前缀缓存开和关、开 MTP 时 FP16 KV 和 E4M3 KV）。

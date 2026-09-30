@@ -1,0 +1,429 @@
+{
+  "converter_contract": "stored=e4m3fn(x/scale); reconstructed=stored*scale",
+  "e4m3_max": 448.0,
+  "excluded_corpus_shards": [],
+  "histogram": {
+    "bins": 4096,
+    "log2_max": 16.0,
+    "log2_min": -24.0
+  },
+  "input_files": [
+    "/work/calib/run2/qsa-kv-rank0-pid249.jsonl",
+    "/work/calib/run2/qsa-kv-rank1-pid250.jsonl",
+    "/work/calib/run2/qsa-kv-rank2-pid251.jsonl",
+    "/work/calib/run2/qsa-kv-rank3-pid252.jsonl"
+  ],
+  "qsa_layer_ids": [
+    3,
+    7,
+    11,
+    15,
+    19,
+    23,
+    27,
+    31,
+    35,
+    39,
+    43,
+    47,
+    48
+  ],
+  "records": 79239,
+  "saturation_definition": "abs(x) > 448*scale",
+  "scale_method": "per-layer per-tensor max_abs/448",
+  "scale_storage": "float32 rounded upward",
+  "schema_version": 1,
+  "tensor_count": 26,
+  "tensors": {
+    "model.layers.11.self_attn.k_scale": {
+      "count": 206528512,
+      "kind": "k",
+      "layer_id": 11,
+      "max_abs": 9.0703125,
+      "p99_99_abs_upper_bound": 5.672191537281661,
+      "p99_9_abs_upper_bound": 4.6297602945350045,
+      "saturation_ratio": 0.0,
+      "scale": 0.0202462337911129,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.0202462337911129
+      }
+    },
+    "model.layers.11.self_attn.v_scale": {
+      "count": 206528512,
+      "kind": "v",
+      "layer_id": 11,
+      "max_abs": 18.140625,
+      "p99_99_abs_upper_bound": 3.042946037817629,
+      "p99_9_abs_upper_bound": 2.1692367244266184,
+      "saturation_ratio": 0.0,
+      "scale": 0.0404924675822258,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.0404924675822258
+      }
+    },
+    "model.layers.15.self_attn.k_scale": {
+      "count": 206528512,
+      "kind": "k",
+      "layer_id": 15,
+      "max_abs": 10.953125,
+      "p99_99_abs_upper_bound": 5.86745297808251,
+      "p99_9_abs_upper_bound": 4.821664436020495,
+      "saturation_ratio": 0.0,
+      "scale": 0.02444894053041935,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.02444894053041935
+      }
+    },
+    "model.layers.15.self_attn.v_scale": {
+      "count": 206528512,
+      "kind": "v",
+      "layer_id": 15,
+      "max_abs": 13.7265625,
+      "p99_99_abs_upper_bound": 1.9203992131630474,
+      "p99_9_abs_upper_bound": 1.567469639965553,
+      "saturation_ratio": 0.0,
+      "scale": 0.0306396484375,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.0306396484375
+      }
+    },
+    "model.layers.19.self_attn.k_scale": {
+      "count": 206528512,
+      "kind": "k",
+      "layer_id": 19,
+      "max_abs": 11.171875,
+      "p99_99_abs_upper_bound": 7.33603234563737,
+      "p99_9_abs_upper_bound": 5.229665783738709,
+      "saturation_ratio": 0.0,
+      "scale": 0.02493722178041935,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.02493722178041935
+      }
+    },
+    "model.layers.19.self_attn.v_scale": {
+      "count": 206528512,
+      "kind": "v",
+      "layer_id": 19,
+      "max_abs": 31.46875,
+      "p99_99_abs_upper_bound": 2.767819763927664,
+      "p99_9_abs_upper_bound": 2.097047259963611,
+      "saturation_ratio": 0.0,
+      "scale": 0.0702427476644516,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.0702427476644516
+      }
+    },
+    "model.layers.23.self_attn.k_scale": {
+      "count": 206528512,
+      "kind": "k",
+      "layer_id": 23,
+      "max_abs": 10.71875,
+      "p99_99_abs_upper_bound": 6.627733646036583,
+      "p99_9_abs_upper_bound": 5.229665783738709,
+      "saturation_ratio": 0.0,
+      "scale": 0.02392578125,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.02392578125
+      }
+    },
+    "model.layers.23.self_attn.v_scale": {
+      "count": 206528512,
+      "kind": "v",
+      "layer_id": 23,
+      "max_abs": 14.09375,
+      "p99_99_abs_upper_bound": 3.2781698933238164,
+      "p99_9_abs_upper_bound": 2.3211564240549976,
+      "saturation_ratio": 0.0,
+      "scale": 0.0314592644572258,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.0314592644572258
+      }
+    },
+    "model.layers.27.self_attn.k_scale": {
+      "count": 206528512,
+      "kind": "k",
+      "layer_id": 27,
+      "max_abs": 9.8125,
+      "p99_99_abs_upper_bound": 6.627733646036583,
+      "p99_9_abs_upper_bound": 5.409693568260439,
+      "saturation_ratio": 0.0,
+      "scale": 0.02190290205180645,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.02190290205180645
+      }
+    },
+    "model.layers.27.self_attn.v_scale": {
+      "count": 206528512,
+      "kind": "v",
+      "layer_id": 27,
+      "max_abs": 32.28125,
+      "p99_99_abs_upper_bound": 2.6397304598425624,
+      "p99_9_abs_upper_bound": 1.9597955062521433,
+      "saturation_ratio": 0.0,
+      "scale": 0.0720563679933548,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.0720563679933548
+      }
+    },
+    "model.layers.3.self_attn.k_scale": {
+      "count": 206533632,
+      "kind": "k",
+      "layer_id": 3,
+      "max_abs": 7.34765625,
+      "p99_99_abs_upper_bound": 5.229665783738709,
+      "p99_9_abs_upper_bound": 4.475687706471605,
+      "saturation_ratio": 0.0,
+      "scale": 0.0164010189473629,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.0164010189473629
+      }
+    },
+    "model.layers.3.self_attn.v_scale": {
+      "count": 206533632,
+      "kind": "v",
+      "layer_id": 3,
+      "max_abs": 7.359375,
+      "p99_99_abs_upper_bound": 3.804572553516131,
+      "p99_9_abs_upper_bound": 2.228773485191785,
+      "saturation_ratio": 0.0,
+      "scale": 0.0164271779358387,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.0164271779358387
+      }
+    },
+    "model.layers.31.self_attn.k_scale": {
+      "count": 206528512,
+      "kind": "k",
+      "layer_id": 31,
+      "max_abs": 10.390625,
+      "p99_99_abs_upper_bound": 7.237386157484128,
+      "p99_9_abs_upper_bound": 5.987821647068942,
+      "saturation_ratio": 0.0,
+      "scale": 0.023193359375,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.023193359375
+      }
+    },
+    "model.layers.31.self_attn.v_scale": {
+      "count": 206528512,
+      "kind": "v",
+      "layer_id": 31,
+      "max_abs": 19.53125,
+      "p99_99_abs_upper_bound": 2.0548918982375275,
+      "p99_9_abs_upper_bound": 1.494930200087863,
+      "saturation_ratio": 0.0,
+      "scale": 0.0435965433716774,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.0435965433716774
+      }
+    },
+    "model.layers.35.self_attn.k_scale": {
+      "count": 206528512,
+      "kind": "k",
+      "layer_id": 35,
+      "max_abs": 11.515625,
+      "p99_99_abs_upper_bound": 7.436023089715282,
+      "p99_9_abs_upper_bound": 5.672191537281661,
+      "saturation_ratio": 0.0,
+      "scale": 0.0257045216858387,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.0257045216858387
+      }
+    },
+    "model.layers.35.self_attn.v_scale": {
+      "count": 206528512,
+      "kind": "v",
+      "layer_id": 35,
+      "max_abs": 37.03125,
+      "p99_99_abs_upper_bound": 2.9416806284751105,
+      "p99_9_abs_upper_bound": 1.9334425204495935,
+      "saturation_ratio": 0.0,
+      "scale": 0.0826590433716774,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.0826590433716774
+      }
+    },
+    "model.layers.39.self_attn.k_scale": {
+      "count": 206528512,
+      "kind": "k",
+      "layer_id": 39,
+      "max_abs": 11.875,
+      "p99_99_abs_upper_bound": 8.456602255061522,
+      "p99_9_abs_upper_bound": 6.069436164792859,
+      "saturation_ratio": 0.0,
+      "scale": 0.02650669775903225,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.02650669775903225
+      }
+    },
+    "model.layers.39.self_attn.v_scale": {
+      "count": 206528512,
+      "kind": "v",
+      "layer_id": 39,
+      "max_abs": 16.265625,
+      "p99_99_abs_upper_bound": 4.506086474432967,
+      "p99_9_abs_upper_bound": 3.022417845327891,
+      "saturation_ratio": 0.0,
+      "scale": 0.0363072007894516,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.0363072007894516
+      }
+    },
+    "model.layers.43.self_attn.k_scale": {
+      "count": 206528512,
+      "kind": "k",
+      "layer_id": 43,
+      "max_abs": 11.0546875,
+      "p99_99_abs_upper_bound": 6.363947239451456,
+      "p99_9_abs_upper_bound": 5.229665783738709,
+      "saturation_ratio": 0.0,
+      "scale": 0.02467564307153225,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.02467564307153225
+      }
+    },
+    "model.layers.43.self_attn.v_scale": {
+      "count": 206528512,
+      "kind": "v",
+      "layer_id": 43,
+      "max_abs": 8.5,
+      "p99_99_abs_upper_bound": 4.53669171012715,
+      "p99_9_abs_upper_bound": 2.8055453824404095,
+      "saturation_ratio": 0.0,
+      "scale": 0.01897321455180645,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.01897321455180645
+      }
+    },
+    "model.layers.47.self_attn.k_scale": {
+      "count": 206528512,
+      "kind": "k",
+      "layer_id": 47,
+      "max_abs": 15.765625,
+      "p99_99_abs_upper_bound": 11.624223966792421,
+      "p99_9_abs_upper_bound": 8.747715192583087,
+      "saturation_ratio": 0.0,
+      "scale": 0.0351911298930645,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.0351911298930645
+      }
+    },
+    "model.layers.47.self_attn.v_scale": {
+      "count": 206528512,
+      "kind": "v",
+      "layer_id": 47,
+      "max_abs": 9.703125,
+      "p99_99_abs_upper_bound": 4.821664436020495,
+      "p99_9_abs_upper_bound": 3.3454203592831933,
+      "saturation_ratio": 0.0,
+      "scale": 0.02165876142680645,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.02165876142680645
+      }
+    },
+    "model.layers.48.self_attn.k_scale": {
+      "count": 213452800,
+      "kind": "k",
+      "layer_id": 48,
+      "max_abs": 93.5,
+      "p99_99_abs_upper_bound": 92.24147962423204,
+      "p99_9_abs_upper_bound": 91.0011265388266,
+      "saturation_ratio": 0.0,
+      "scale": 0.2087053656578064,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.2087053656578064
+      }
+    },
+    "model.layers.48.self_attn.v_scale": {
+      "count": 213452800,
+      "kind": "v",
+      "layer_id": 48,
+      "max_abs": 19.875,
+      "p99_99_abs_upper_bound": 5.710716931742249,
+      "p99_9_abs_upper_bound": 4.268561602707295,
+      "saturation_ratio": 0.0,
+      "scale": 0.0443638414144516,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.0443638414144516
+      }
+    },
+    "model.layers.7.self_attn.k_scale": {
+      "count": 206532352,
+      "kind": "k",
+      "layer_id": 7,
+      "max_abs": 8.25,
+      "p99_99_abs_upper_bound": 5.373198924747341,
+      "p99_9_abs_upper_bound": 4.567504815878246,
+      "saturation_ratio": 0.0,
+      "scale": 0.0184151791036129,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.0184151791036129
+      }
+    },
+    "model.layers.7.self_attn.v_scale": {
+      "count": 206532352,
+      "kind": "v",
+      "layer_id": 7,
+      "max_abs": 11.0,
+      "p99_99_abs_upper_bound": 3.3004351478412355,
+      "p99_9_abs_upper_bound": 2.433787359505733,
+      "saturation_ratio": 0.0,
+      "scale": 0.02455357275903225,
+      "shard_scale_max_over_global": 1.0,
+      "shard_scale_min_over_global": 1.0,
+      "shard_scales": {
+        "mixed-v1": 0.02455357275903225
+      }
+    }
+  }
+}
