@@ -4,16 +4,38 @@
 
 This is a heavily modified fork of 1Cat-vLLM (branch `1cat-vllm-heavily-modified-v1`, latest tag `1cat-vllm-heavily-modified-v1-1001`, previous `1cat-vllm-heavily-modified-v1-0930`, based on upstream `main@02c87ab89`) tuned for concurrency and prefill of Swift 1.5 Qwen3.8-Flash-Next on 4x V100. See [HEAVILY_MODIFIED.md](HEAVILY_MODIFIED.md) for the changes, switches and measurements.
 
-## 和官方代码的关系
+## 本分支自己做的优化
 
-本分支基于官方 `main@02c87ab89`。它**没有整体合并官方之后的代码**（官方最新是 `main@d30469863`，2026-09-29），而是逐项移植了下面这些官方修复：
+下面这些是本分支自己的改动，官方代码里没有。每项都有 `SX_OPT_*` 环境变量开关，默认开。细节见“改动（按提交顺序）”，数据和测法见“实测测试对比”。
 
-| 官方 PR / 提交 | 内容 | 官方状态（2026-10-01） | 在本分支 |
+效果（4 张 V100，Swift 1.5 Qwen3.8-Flash-Next，不开 MTP）：
+
+| 对比 | 结果 |
+|---|---|
+| 对官方 `main@d30469863`：4 条互不相同的长 prompt 同时到达（每条 8K–32K） | prefill 速度 1.57–1.73 倍，每路 decode 速度 1.41–1.56 倍 |
+| 对官方 `main@d30469863`：4 条 64K 同时到达 | 官方的 KV 缓存放不下，只能同时跑 3 条；本分支 4 条同时跑 |
+| 本分支开着前缀缓存对关掉 | prefill 速度是关掉时的 97%–100% |
+| 对起点（官方 `main@02c87ab89` 加改动第 1 项） | prefill 1.4–1.7 倍；采样 decode 每步快 18%–37%；业务 JSON 24 并发从 1.84 到 2.89 请求/秒 |
+
+做了什么：
+
+- **开着前缀缓存时 prefill 不变慢**：一步 prefill 可以跨多个状态块，官方一步最多推进一块；短 prompt 不再为了留缓存检查点多拆一步；换下来的状态块及时释放（版本 1001）。
+- **并发 decode 更快**：QSA、稠密层（GEMV、HC）、MoE 路由和 NVFP4 MoE 分组 decode 的内核扩到 32 行；TP4 的 all-reduce 覆盖 10–160 KiB；混合步使用 PIECEWISE CUDA graph。
+- **去掉每步一次的主机同步**：采样器的 top-k/top-p，以及 QSA。
+- **PLE 在 prefill 时分组打包。**
+- **让官方 #704 的质量修复真正生效**：官方的放行条件在 Flash-Next 的部署上从来不满足，算子一次也没有运行；本分支改了判断条件。
+- **Flash-V100 分组验证和 DFlash2 speculator**，以及 **MTP 通道的优化**（MTP 默认不开）。
+
+## 从官方拿过来的修复
+
+本分支基于官方 `main@02c87ab89`，**没有整体合并官方之后的代码**（官方最新是 `main@d30469863`，2026-09-29）。下表这几项是官方作者写的修复，本分支把它们移植了进来。方向只有一个：从官方仓库到本分支。本分支没有向官方仓库提交过任何东西。
+
+| 官方的 PR / 提交 | 内容 | 官方自己合并了吗（2026-10-01） | 在本分支 |
 |---|---|---|---|
-| PR #704 | Qwen3.8 gated RMSNorm 改用精确算子（质量修复） | 已合入官方 main | 改动第 5 项，不开 MTP 时默认启用 |
-| PR #707 | PLE 短卷积 prefill 的缓冲从 6 块减到 2 块（修开 MTP 时的显存溢出） | PR 还开着，没有合入官方 main | 改动第 6 项，默认启用 |
-| PR #664 | 开 MTP 时用标定过的 E4M3（8 位）存 KV 缓存 | PR 还开着，没有合入官方 main | 改动第 6 项，**默认不生效**，见下面的提示 |
-| 提交 `4ab186009`、`c0e0ee66f`、`b3c9ce45f`、`6f6fc4c52` 里 Dockerfile 和 setup.py 的部分 | SM70 wheel 的打包修复 | 已合入官方 main | 已移植 |
+| PR #704 | Qwen3.8 gated RMSNorm 改用精确算子（质量修复） | 合并了，在官方 main 里 | 改动第 5 项，不开 MTP 时默认启用 |
+| PR #707 | PLE 短卷积 prefill 的缓冲从 6 块减到 2 块（修开 MTP 时的显存溢出） | 还没有，PR 开着 | 改动第 6 项，默认启用 |
+| PR #664 | 开 MTP 时用标定过的 E4M3（8 位）存 KV 缓存 | 还没有，PR 开着 | 改动第 6 项，**默认不生效**，见下面的提示 |
+| 提交 `4ab186009`、`c0e0ee66f`、`b3c9ce45f`、`6f6fc4c52` 里 Dockerfile 和 setup.py 的部分 | 修 V100（SM70）wheel 的打包：补上 V100 注意力内核的源码目录，修正 wheel 的标签，在 wheel 里写明依赖的 torch 版本 | 合并了，在官方 main 里 | 已移植，从源码打 wheel 需要它 |
 
 官方 `02c87ab89` 之后的其他改动没有移植，例如 `VLLM_SM70_QWEN38_BATCH_FASTPATH` 和前缀缓存的稀疏保留。
 
