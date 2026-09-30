@@ -13,7 +13,7 @@ All switches default to on, and setting one to `0` restores the upstream code pa
 |---|---|
 | 版本名 | 1cat-vllm-heavily-modified-v1-0930 |
 | git tag | `1cat-vllm-heavily-modified-v1-0930` |
-| 默认分支 | `1cat-vllm-heavily-modified-v1`，在 tag 之后加了改动第 6 项 |
+| 默认分支 | `1cat-vllm-heavily-modified-v1`，在 tag 之后加了改动第 6、7 项 |
 | Python 包版本（PEP 440） | `1.5.1+heavily.modified.v1`。这个字符串编译在构建里，运行中的引擎在 `/version` 返回的就是它。从源码构建时设置 `SETUPTOOLS_SCM_PRETEND_VERSION=1.5.1+heavily.modified.v1` |
 | 官方基线 | `main@02c87ab89`（2026-09-14），即官方 v1.5.0 之后第 670 个提交 |
 
@@ -45,7 +45,8 @@ All switches default to on, and setting one to `0` restores the upstream code pa
 6. **MTP 通道的显存（2026-09-30，在 git tag 之后，只在默认分支上）**
    - 移植官方 PR #707：PLE 短卷积 prefill 的缓冲从 6 块减到 2 块，结果逐位不变；开 MTP 时按请求长度分组打包
    - 移植官方 PR #664：开 MTP 时 KV 缓存可以用 E4M3（8 位）存放。默认不启用，KV 仍是 FP16；启用需要 `--kv-cache-dtype fp8_e4m3`、`VLLM_QWEN4EXP_QSA_E4M3_MTP=1` 和标定出来的 26 个 scale
-   - 实测和启用方法见 [README.md](README.md) 的改动第 6 项和实测第 5 组
+   - 怎样才生效、已知问题和实测见 [README.md](README.md) 的“KV 缓存的格式”一节和实测第 5 组
+7. **开着前缀缓存时及时释放换下来的状态块（2026-10-01，在 git tag 之后，只在默认分支上）**：修掉“开前缀缓存时长 prompt 的 KV 占用偏高”，只改 KV 管理器，见 README.md 改动第 7 项
 
 ## 实测：Flash-Next，4× V100，不开 MTP
 
