@@ -1,4 +1,4 @@
-# 1cat-vllm-heavily-modified-v1-0930
+# 1cat-vllm-heavily-modified-v1-1001
 
 Heavily modified fork of [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) for serving
 **Swift 1.5 Qwen3.8-Flash-Next (NVFP4)** on **4× V100-SXM2-32GB (TP4, SM70)**. It focuses on
@@ -11,9 +11,9 @@ All switches default to on, and setting one to `0` restores the upstream code pa
 
 | 项 | 值 |
 |---|---|
-| 版本名 | 1cat-vllm-heavily-modified-v1-0930 |
-| git tag | `1cat-vllm-heavily-modified-v1-0930` |
-| 默认分支 | `1cat-vllm-heavily-modified-v1`，在 tag 之后加了改动第 6、7 项 |
+| 版本名 | 1cat-vllm-heavily-modified-v1-1001 |
+| git tag | `1cat-vllm-heavily-modified-v1-1001`（最新，改动第 1–7 项）；上一个版本 `1cat-vllm-heavily-modified-v1-0930`（改动第 1–5 项） |
+| 默认分支 | `1cat-vllm-heavily-modified-v1` |
 | Python 包版本（PEP 440） | `1.5.1+heavily.modified.v1`。这个字符串编译在构建里，运行中的引擎在 `/version` 返回的就是它。从源码构建时设置 `SETUPTOOLS_SCM_PRETEND_VERSION=1.5.1+heavily.modified.v1` |
 | 官方基线 | `main@02c87ab89`（2026-09-14），即官方 v1.5.0 之后第 670 个提交 |
 
@@ -42,11 +42,11 @@ All switches default to on, and setting one to `0` restores the upstream code pa
    - 目的：单请求和批量、decode 和混合步都用同一套算术，避免微小的舍入差异改变 MoE 路由、翻转 EOS
    - 不开 MTP 时默认启用（`VLLM_SM70_RMSNORM_GATED_EXACT`，设为 `0` 关闭）
    - **与官方的区别**：官方在 Python 里只放行 1–192 行。vLLM 每个编译范围只追踪一次，按最大尺寸追踪，而且丢弃形状守卫，所以这个行数条件对整个范围只判断一次。Flash-Next 的 decode 图按 24 并发（288 行）追踪，主编译按 8192 token 追踪，官方条件在我们的部署上从来不满足，算子一次也没运行（官方 `main@357d07bcb` 同样如此）。本分支只检查编译期不变的条件（2 维、宽 128、FP16、连续），内核接受任意行数，所以 decode、混合和 prefill 图的每一行结果都相同
-6. **MTP 通道的显存（2026-09-30，在 git tag 之后，只在默认分支上）**
+6. **MTP 通道的显存（2026-09-30，版本 1001 新增）**
    - 移植官方 PR #707：PLE 短卷积 prefill 的缓冲从 6 块减到 2 块，结果逐位不变；开 MTP 时按请求长度分组打包
    - 移植官方 PR #664：开 MTP 时 KV 缓存可以用 E4M3（8 位）存放。默认不启用，KV 仍是 FP16；启用需要 `--kv-cache-dtype fp8_e4m3`、`VLLM_QWEN4EXP_QSA_E4M3_MTP=1` 和标定出来的 26 个 scale
    - 怎样才生效、已知问题和实测见 [README.md](README.md) 的“KV 缓存的格式”一节和实测第 5 组
-7. **开着前缀缓存时及时释放换下来的状态块（2026-10-01，在 git tag 之后，只在默认分支上）**：修掉“开前缀缓存时长 prompt 的 KV 占用偏高”，只改 KV 管理器，见 README.md 改动第 7 项
+7. **开着前缀缓存时及时释放换下来的状态块（2026-10-01，版本 1001 新增）**：修掉“开前缀缓存时长 prompt 的 KV 占用偏高”，只改 KV 管理器，见 README.md 改动第 7 项
 
 ## 实测：Flash-Next，4× V100，不开 MTP
 

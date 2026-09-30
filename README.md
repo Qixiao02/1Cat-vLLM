@@ -1,8 +1,8 @@
 # 1Cat-vLLM-heavily-modified
 
-**1cat-vllm-heavily-modified-v1**：这是基于 1Cat 官方代码的魔改分支（默认分支 `1cat-vllm-heavily-modified-v1`，发布 tag `1cat-vllm-heavily-modified-v1-0930`，基于官方 `main@02c87ab89`，即 v1.5.0 之后第 670 个提交）。它面向 4 张 V100 上的 Swift 1.5 Qwen3.8-Flash-Next，重点优化并发吞吐和 prefill。改动清单、开关和与官方 `main@357d07bcb` 的实测对比见 [HEAVILY_MODIFIED.md](HEAVILY_MODIFIED.md)。官方原版请看 [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)。
+**1cat-vllm-heavily-modified-v1**：这是基于 1Cat 官方代码的魔改分支（默认分支 `1cat-vllm-heavily-modified-v1`，最新版本 tag `1cat-vllm-heavily-modified-v1-1001`，上一个版本 `1cat-vllm-heavily-modified-v1-0930`，基于官方 `main@02c87ab89`，即 v1.5.0 之后第 670 个提交）。它面向 4 张 V100 上的 Swift 1.5 Qwen3.8-Flash-Next，重点优化并发吞吐和 prefill。改动清单、开关和与官方 `main@357d07bcb` 的实测对比见 [HEAVILY_MODIFIED.md](HEAVILY_MODIFIED.md)。官方原版请看 [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)。
 
-This is a heavily modified fork of 1Cat-vLLM (branch `1cat-vllm-heavily-modified-v1`, tag `1cat-vllm-heavily-modified-v1-0930`, based on upstream `main@02c87ab89`) tuned for concurrency and prefill of Swift 1.5 Qwen3.8-Flash-Next on 4x V100. See [HEAVILY_MODIFIED.md](HEAVILY_MODIFIED.md) for the changes, switches and measurements.
+This is a heavily modified fork of 1Cat-vLLM (branch `1cat-vllm-heavily-modified-v1`, latest tag `1cat-vllm-heavily-modified-v1-1001`, previous `1cat-vllm-heavily-modified-v1-0930`, based on upstream `main@02c87ab89`) tuned for concurrency and prefill of Swift 1.5 Qwen3.8-Flash-Next on 4x V100. See [HEAVILY_MODIFIED.md](HEAVILY_MODIFIED.md) for the changes, switches and measurements.
 
 ## 和官方代码的关系
 
@@ -68,10 +68,10 @@ This is a heavily modified fork of 1Cat-vLLM (branch `1cat-vllm-heavily-modified
    - 不开 MTP 时默认启用，由 `VLLM_SM70_RMSNORM_GATED_EXACT` 控制，设为 `0` 关闭。
    - 与官方的区别：官方在 Python 里只对 1–192 行的输入放行这个算子。vLLM 对每个编译范围只追踪一次，按最大尺寸追踪，而且丢弃形状守卫，所以这个行数条件对整个范围只判断一次。Flash-Next 的 decode 图按 24 并发（这个算子的输入是 288 行）追踪，主编译按 8192 token 追踪，官方的条件在这样的部署上从来不满足，算子一次也没有运行（官方 `main@357d07bcb` 同样如此）。本分支只检查编译期不变的条件（2 维、宽 128、FP16、连续），内核接受任意行数，所以 decode、混合步和 prefill 图的每一行结果都相同。
 
-6. **MTP 通道的显存（2026-09-30，在 tag `1cat-vllm-heavily-modified-v1-0930` 之后）**
+6. **MTP 通道的显存（2026-09-30，版本 1001 新增）**
    - 移植官方 PR #707：PLE 的短卷积在 prefill 时原来同时占 6 块和整批输入一样大的缓冲，现在只占 2 块，结果逐位不变。开 MTP 时这一步另外按请求长度分组打包，不再把短请求补齐到最长请求的长度。改之前，开 MTP、4 条 8K prompt 并发会在这一步显存溢出；改之后不再溢出，每步 prefill 仍是 8192 token。
    - 移植官方 PR #664：开 MTP 时 KV 缓存可以用 8 位的 E4M3 格式存放（FP8 的一种：1 位符号、4 位指数、3 位尾数）。**默认不启用，KV 缓存仍是 FP16。** 启用要同时满足三点：启动参数 `--kv-cache-dtype fp8_e4m3`；环境变量 `VLLM_QWEN4EXP_QSA_E4M3_MTP=1`；模型目录里有标定出来的 26 个 scale（12 个 QSA 层和 MTP 层，每层 K、V 各一个）。scale 要在自己的模型上标定，工具在 `tools/qwen4_exp/`，整套流程见 [`sx_bench/as_run/e4m3_chain.sh`](sx_bench/as_run/e4m3_chain.sh)。实测见第 5 组：KV 缓存容量多 65%，但 4 并发的 decode 速度只有 FP16 的一半左右。怎样才生效、有哪些已知问题，见 README 开头的提示。
-7. **开着前缀缓存时及时释放换下来的状态块（2026-10-01，在 tag 之后）**：一步 prefill 跨多个状态块时，换下来的状态块原来要到请求结束才释放，现在处理完对应的 token 就释放。只改 KV 管理器，不改变分块方案、前缀命中和输出。CPU 模拟里（本分支的调度器和 KV 管理器，生产的缓存池大小），一条冷的 110K 请求在 decode 阶段占用的缓存块从 198 降到 146，KV 占用峰值从 36.5% 降到 27.8%。V100 上的实测数字待补。
+7. **开着前缀缓存时及时释放换下来的状态块（2026-10-01，版本 1001 新增）**：一步 prefill 跨多个状态块时，换下来的状态块原来要到请求结束才释放，现在处理完对应的 token 就释放。只改 KV 管理器，不改变分块方案、前缀命中和输出。CPU 模拟里（本分支的调度器和 KV 管理器，生产的缓存池大小），一条冷的 110K 请求在 decode 阶段占用的缓存块从 198 降到 146，KV 占用峰值从 36.5% 降到 27.8%。V100 上的实测数字待补。
 
 ## 实测测试对比
 
@@ -217,7 +217,10 @@ This is a heavily modified fork of 1Cat-vLLM (branch `1cat-vllm-heavily-modified
 
 - **适用范围**：只在 4 张 V100-SXM2-32GB、TP4、Swift 1.5 Qwen3.8-Flash-Next NVFP4（PLE 表以 FP8 存储）、不开 MTP 这一种组合上验证过。各项优化按这套硬件和模型的形状判断是否启用；其他组合会回到官方路径，能运行，但没有加速。没有针对 Qwen3.8-27B 加 DFlash2 做调优或验证。
 - **构建和运行环境**：原生内核只为 sm_70（V100 的 CUDA 架构）编译。需要 Python 3.12 和 torch 2.10.0+cu128；运行时还需要 CUDA 12.8 toolkit，因为部分内核在首次启动时编译，冷启动要 8–25 分钟。PLE 表需要约 48 GiB 可锁定的主机内存。
-- **版本标记**：git tag `1cat-vllm-heavily-modified-v1-0930` 指向改动第 1–5 项的代码（引擎代码同 2026-09-28），第 1–4 组实测用的是它。默认分支 `1cat-vllm-heavily-modified-v1` 在 tag 之后加了改动第 6、7 项，只改 Python 文件；不开 MTP 时输出不变（PLE prefill 的结果逐位相同，有 CPU 测试），这个组合没有在 V100 上重测。运行中的引擎在 `/version` 返回的是编译进去的包版本 `1.5.1+heavily.modified.v1`。
+- **版本标记**：默认分支是 `1cat-vllm-heavily-modified-v1`，版本用 git tag 标记。
+  - `1cat-vllm-heavily-modified-v1-1001`（最新）：改动第 1–7 项。比 0930 多出的第 6、7 项只改 Python 文件；不开 MTP 时输出不变（PLE prefill 的结果逐位相同，有 CPU 测试）。第 5 组实测用的是它的代码，当时还没有第 7 项。
+  - `1cat-vllm-heavily-modified-v1-0930`：改动第 1–5 项，引擎代码同 2026-09-28。第 1–4 组实测用的是它。
+  - 运行中的引擎在 `/version` 返回的是编译进去的包版本，0930 的构建是 `1.5.1+heavily.modified.v1`。
 
 启动参数（所有测量、两条线都用这一组）：
 
@@ -273,7 +276,7 @@ Flash-Next 的注意力（QSA）只支持下面两种 KV 缓存格式，没有�
 
 - **MTP 通道**：生产环境请保持关闭。开 MTP 时 KV 缓存只有约 131K token（FP16）或 217K token（E4M3），每条在跑的请求还固定占约 13% 的缓存池，4 条 32K 并发放不下；每张卡显存峰值 32,019–32,267 MiB，整卡 32,768 MiB；E4M3 KV 下 4 并发的 decode 速度减半。数据见实测第 5 组。
 - **只有 1 个 token 的 prompt**：全新请求的整个 prompt 只有 1 个 token 时，会读到没有清零的状态槽。官方也有同样的问题。聊天接口的 prompt 带模板，不会触发。
-- **开着前缀缓存时长 prompt 的 KV 占用偏高（tag `1cat-vllm-heavily-modified-v1-0930`；默认分支已修，见改动第 7 项）**：4 条 64K 并发时，KV 占用峰值是 86%，关掉前缀缓存是 64%。原因是一步 prefill 跨多个状态块时，换下来的状态块要到请求结束才释放，每个状态组多占“步数 − 2”个块（Flash-Next 有 4 个状态组）。一条冷的 110K 请求因此多占约 9% 的缓存池，这是用本分支的调度器和 KV 管理器模拟得到的估算值，不是实测。这只影响容量，不影响输出；长 prompt 并发多时，缓存池会更早用满，出现排队或抢占。修复在默认分支上，tag 里没有。
+- **开着前缀缓存时长 prompt 的 KV 占用偏高（版本 0930；版本 1001 已修，见改动第 7 项）**：4 条 64K 并发时，KV 占用峰值是 86%，关掉前缀缓存是 64%。原因是一步 prefill 跨多个状态块时，换下来的状态块要到请求结束才释放，每个状态组多占“步数 − 2”个块（Flash-Next 有 4 个状态组）。一条冷的 110K 请求因此多占约 9% 的缓存池，这是用本分支的调度器和 KV 管理器模拟得到的估算值，不是实测。这只影响容量，不影响输出；长 prompt 并发多时，缓存池会更早用满，出现排队或抢占。版本 1001 已包含修复。
 - **别的请求 prefill 时 decode 会停顿**：相邻两个 token 的间隔最长到 1.2–1.5 秒，数据见实测第 1 组。
 - **开着前缀缓存时第 1 条请求的首字晚约 1 秒**：prompt 末尾要多跑一步，用来留下缓存检查点。
 - **测试**：`sx_tests/` 下的测试需要 V100 和对应的镜像，每个文件里写了运行方法。
