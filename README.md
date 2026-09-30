@@ -4,6 +4,19 @@
 
 This is a heavily modified fork of 1Cat-vLLM (branch `1cat-vllm-heavily-modified-v1`, tag `1cat-vllm-heavily-modified-v1-0930`, based on upstream `main@02c87ab89`) tuned for concurrency and prefill of Swift 1.5 Qwen3.8-Flash-Next on 4x V100. See [HEAVILY_MODIFIED.md](HEAVILY_MODIFIED.md) for the changes, switches and measurements.
 
+## 和官方代码的关系
+
+本分支基于官方 `main@02c87ab89`。它**没有整体合并官方之后的代码**（官方最新是 `main@d30469863`，2026-09-29），而是逐项移植了下面这些官方修复：
+
+| 官方 PR / 提交 | 内容 | 官方状态（2026-10-01） | 在本分支 |
+|---|---|---|---|
+| PR #704 | Qwen3.8 gated RMSNorm 改用精确算子（质量修复） | 已合入官方 main | 改动第 5 项，不开 MTP 时默认启用 |
+| PR #707 | PLE 短卷积 prefill 的缓冲从 6 块减到 2 块（修开 MTP 时的显存溢出） | PR 还开着，没有合入官方 main | 改动第 6 项，默认启用 |
+| PR #664 | 开 MTP 时用标定过的 E4M3（8 位）存 KV 缓存 | PR 还开着，没有合入官方 main | 改动第 6 项，**默认不生效**，见下面的提示 |
+| 提交 `4ab186009`、`c0e0ee66f`、`b3c9ce45f`、`6f6fc4c52` 里 Dockerfile 和 setup.py 的部分 | SM70 wheel 的打包修复 | 已合入官方 main | 已移植 |
+
+官方 `02c87ab89` 之后的其他改动没有移植，例如 `VLLM_SM70_QWEN38_BATCH_FASTPATH` 和前缀缓存的稀疏保留。
+
 ## 提示：E4M3 KV（官方 PR #664）默认不生效
 
 > [!IMPORTANT]
