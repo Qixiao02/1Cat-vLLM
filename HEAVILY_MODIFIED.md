@@ -19,7 +19,7 @@ All switches default to on, and setting one to `0` restores the upstream code pa
 
 ## 改动（按提交顺序）
 
-1. **1.7.2 镜像覆盖**：Flash-V100 opt27-port v2 分组验证和 DFlash2 speculator。与内部 1.7.2 镜像一致。
+1. **Flash-V100 分组验证和 DFlash2 speculator**（提交 `d3400c869`）：Flash-V100 opt27-port v2 分组验证，以及配套的 DFlash2 speculator 改动。官方 `main@02c87ab89` 加上这一项，是后面各项改动和收益对比的起点。
 2. **第一批（Python/Triton）**
    - 采样器 top-k/top-p 去掉每步的同步
    - mamba align 模式的 prefill 可以跨多块分块
@@ -41,13 +41,13 @@ All switches default to on, and setting one to `0` restores the upstream code pa
    - Qwen3.8 的 gated RMSNorm 改用精确的原生 CUDA 算子（`_C::sm70_rmsnorm_gated_exact_out`），结果与 PyTorch eager 的 FP32 计算逐位相同
    - 目的：单请求和批量、decode 和混合步都用同一套算术，避免微小的舍入差异改变 MoE 路由、翻转 EOS
    - 不开 MTP 时默认启用（`VLLM_SM70_RMSNORM_GATED_EXACT`，设为 `0` 关闭）
-   - **与官方的区别**：官方在 Python 里只放行 1–192 行。vLLM 每个编译范围只追踪一次，按最大尺寸追踪，而且丢弃形状守卫，所以这个行数条件对整个范围只判断一次。Flash-Next 的 decode 图按 24 并发（288 行）追踪，主编译按 8192 token 追踪，官方条件在我们的部署上从来不满足，算子一次也没运行（官方镜像同样如此）。本分支只检查编译期不变的条件（2 维、宽 128、FP16、连续），内核接受任意行数，所以 decode、混合和 prefill 图的每一行结果都相同
+   - **与官方的区别**：官方在 Python 里只放行 1–192 行。vLLM 每个编译范围只追踪一次，按最大尺寸追踪，而且丢弃形状守卫，所以这个行数条件对整个范围只判断一次。Flash-Next 的 decode 图按 24 并发（288 行）追踪，主编译按 8192 token 追踪，官方条件在我们的部署上从来不满足，算子一次也没运行（官方 `main@357d07bcb` 同样如此）。本分支只检查编译期不变的条件（2 维、宽 128、FP16、连续），内核接受任意行数，所以 decode、混合和 prefill 图的每一行结果都相同
 
 ## 实测：Flash-Next，4× V100，不开 MTP
 
-对比对象是官方最新 `main@357d07bcb`（2026-09-28，干净构建，全部原生库和 FA2 都重编过）。两边的配置、压测和真实请求回放完全相同。本分支一列是 v1 的代码（2026-09-28 实测）。每项都只跑了一次，单次结果大约有 ±10% 的波动。
+对比对象是官方 `main@357d07bcb`（2026-09-28 时的最新提交，干净构建，全部原生库和 FA2 都重编过）。两边的配置、压测和真实请求回放完全相同。本分支一列是 v1 的代码（2026-09-28 实测）。每项都只跑了一次，单次结果大约有 ±10% 的波动。
 
-| 指标 | 本分支 v1 | 官方最新 |
+| 指标 | 本分支 v1 | 官方 `main@357d07bcb` |
 |---|---|---|
 | 每路 token/s：C1 / C4 / C8 / C24 | 91 / 62 / 41 / 25 | 81 / 17 / 13 / 11 |
 | 24 并发总吞吐 | 439 token/s | 210 token/s |
@@ -58,7 +58,7 @@ All switches default to on, and setting one to `0` restores the upstream code pa
 
 精确 gated RMSNorm 生效前后（第 5 项）：吞吐、首字和长文首字都没有可测的变化。同一组请求单独跑和 8 并发跑，逐 token 相同的是 21/24，和生效前一样。这个指标同一份代码两次测量在 17–21 之间波动，24 条样本分辨不出差异。
 
-相对官方 1.7.2 镜像，本分支的主要收益：
+相对起点（官方 `main@02c87ab89` 加第 1 项），本分支的主要收益：
 
 - prefill 快 1.4–1.7 倍
 - 采样 decode 每步快 18–37%
