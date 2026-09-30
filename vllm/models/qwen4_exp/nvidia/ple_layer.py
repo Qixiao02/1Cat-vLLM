@@ -90,16 +90,15 @@ _MADV_RANDOM = 1
 
 logger = init_logger(__name__)
 
-# SX_OPT_PLE_PREFILL_MAX_PACKED_ROWS (opt180dev1 validation fix, default 8192;
-# "0" = old behaviour). The dilated PLE short-conv prefill packs every prefill
-# request of a step into a zero-padded [num_prefills, max_len, hidden] buffer
-# (plus ~5 temporaries of the same size). With SX_OPT_ALIGN_MULTIBLOCK one
-# request can prefill ~7.8K tokens per step next to other prefills, so the
-# padding grew to num_prefills x ~7.8K rows and OOMed at gmu 0.90 (4 x 7056
-# rows, 276 MiB per temporary). When num_prefills x max_len exceeds the bound,
-# consecutive prefill requests are packed in groups whose padded rows stay
-# within it (a single request always forms a group of its own). Steps under the
-# bound, and every single-prefill step, run the unchanged code path.
+# SX_OPT_PLE_PREFILL_MAX_PACKED_ROWS (default 8192; "0" = one pack per step).
+# The dilated PLE short-conv prefill packs the prefill requests of a step into
+# zero-padded [num_prefills, hidden, max_len] buffers. With
+# SX_OPT_ALIGN_MULTIBLOCK one request can prefill ~7.8K tokens per step next to
+# other prefills, so the padding grew to num_prefills x ~7.8K rows and ran out
+# of memory (4 x 7056 rows, 276 MiB per buffer). When num_prefills x max_len
+# exceeds the bound, consecutive prefill requests are packed in groups whose
+# padded rows stay within it (a single request always forms a group of its
+# own). The bound applies with and without speculative decoding.
 try:
     _SX_PLE_PREFILL_MAX_PACKED_ROWS = int(
         os.environ.get("SX_OPT_PLE_PREFILL_MAX_PACKED_ROWS", "8192")
@@ -1850,7 +1849,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         if has_initial_states_p is None:
             raise ValueError("has_initial_states_p is required for prefill short-conv")
 
-        output = torch.empty_like(x_p)
         q_starts = query_start_loc_p.to(torch.int64)
         if state_indices_tensor_p.numel() < num_prefills:
             raise ValueError(
@@ -1865,12 +1863,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"need >= {num_prefills}."
             )
         if num_prefills == 0 or x_p.numel() == 0:
-            return output
+            return torch.empty_like(x_p)
         # Use the CPU-computed packing width from the metadata builder instead
         # of synchronizing on lengths.max().
         max_len = metadata.max_prefill_query_len
         if max_len <= 0:
-            return output
+            return torch.empty_like(x_p)
         lens_cpu = getattr(metadata, "prefill_query_lens_cpu", None)
         if (
             _SX_PLE_PREFILL_MAX_PACKED_ROWS > 0
@@ -1882,23 +1880,25 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         ):
             groups = _sx_ple_prefill_groups(lens_cpu, _SX_PLE_PREFILL_MAX_PACKED_ROWS)
             if len(groups) > 1:
+                output = torch.empty_like(x_p)
                 token_start = 0
                 for first, last in groups:
                     group_lens = lens_cpu[first:last]
                     group_tokens = sum(group_lens)
                     token_end = token_start + group_tokens
                     if group_tokens > 0:
-                        self._short_conv_dilated_prefill_packed(
-                            x_p[token_start:token_end],
-                            q_starts[first : last + 1] - token_start,
-                            has_initial_states_p[first:last],
-                            conv_state,
-                            conv_weights,
-                            state_indices_tensor_p[first:last],
-                            last - first,
-                            group_tokens,
-                            max(group_lens),
-                            output[token_start:token_end],
+                        output[token_start:token_end] = (
+                            self._short_conv_dilated_prefill_packed(
+                                x_p[token_start:token_end],
+                                q_starts[first : last + 1] - token_start,
+                                has_initial_states_p[first:last],
+                                conv_state,
+                                conv_weights,
+                                state_indices_tensor_p[first:last],
+                                last - first,
+                                group_tokens,
+                                max(group_lens),
+                            )
                         )
                     token_start = token_end
                 return output
@@ -1912,7 +1912,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             num_prefills,
             num_prefill_tokens,
             max_len,
-            output,
         )
 
     def _short_conv_dilated_prefill_packed(
@@ -1926,25 +1925,20 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         num_prefills: int,
         num_prefill_tokens: int,
         max_len: int,
-        output: torch.Tensor,
     ) -> torch.Tensor:
         """Pack prefill requests into [num_prefills, max_len] and convolve.
 
-        The original batched-prefill arithmetic, unchanged. ``q_starts`` are
-        the int64 request offsets into ``x_p`` (starting at 0) and ``output``
-        (same shape as ``x_p``, possibly a view) receives the result.
+        ``q_starts`` are the int64 request offsets into ``x_p`` (starting at
+        0). Returns a new tensor of the shape of ``x_p``.
         """
         lengths = q_starts[1:] - q_starts[:-1]
         hidden_size = x_p.shape[1]
+        state_len = self.conv_state_len
         positions = torch.arange(
             num_prefill_tokens, device=x_p.device, dtype=torch.int64
         )
         req_indices = torch.searchsorted(q_starts[1:], positions, right=True)
         col_indices = positions - q_starts[req_indices]
-
-        packed_tokens = x_p.new_zeros((num_prefills, max_len, hidden_size))
-        packed_tokens[req_indices, col_indices] = x_p
-        packed_tokens = packed_tokens.transpose(1, 2).contiguous()
 
         state_indices = state_indices_tensor_p[:num_prefills].to(
             device=conv_state.device, dtype=torch.int64
@@ -1956,65 +1950,65 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         has_initial = has_initial_states_p[:num_prefills].to(
             device=conv_state.device, dtype=torch.bool
         )
-        if self.conv_state_len > 0:
-            if conv_state.shape[0] == 0:
-                state = conv_state.new_zeros(
-                    (num_prefills, hidden_size, self.conv_state_len),
-                    dtype=x_p.dtype,
-                )
-            else:
-                state = conv_state.index_select(0, state_indices)[
-                    ..., : self.conv_state_len
-                ].to(x_p.dtype)
+
+        # Every [num_prefills, hidden, max_len] buffer here is as large as the
+        # whole packed group, and the profiling run that sizes the KV cache
+        # never takes this path. Keep at most two alive: pack the tokens
+        # straight into the channels-first history, take the next state before
+        # the convolution, and free each buffer as soon as it is spent.
+        history = x_p.new_zeros((num_prefills, hidden_size, state_len + max_len))
+        history[..., state_len:].transpose(1, 2)[req_indices, col_indices] = x_p
+        next_state = None
+        if state_len > 0 and conv_state.shape[0] > 0:
+            state = conv_state.index_select(0, state_indices)[..., :state_len].to(
+                x_p.dtype
+            )
             use_initial_mask = (valid_state & has_initial).view(num_prefills, 1, 1)
-            initial_state = torch.where(
+            history[..., :state_len] = torch.where(
                 use_initial_mask,
                 state,
                 torch.zeros_like(state),
             )
-            history = torch.cat((initial_state, packed_tokens), dim=-1)
-        else:
-            history = packed_tokens
-
-        conv_output = F.conv1d(
-            history,
-            conv_weights.unsqueeze(1).contiguous(),
-            groups=history.size(1),
-            dilation=self.short_conv_dilation,
-        )
-        conv_output = F.silu(conv_output).transpose(1, 2).contiguous()
-
-        token_positions = torch.arange(max_len, device=x_p.device, dtype=torch.int64)
-        valid_tokens = token_positions.view(1, max_len) < lengths.view(num_prefills, 1)
-        valid_output_mask = valid_tokens & valid_state.to(device=x_p.device).view(
-            num_prefills, 1
-        )
-        conv_output.masked_fill_(~valid_output_mask.unsqueeze(-1), 0)
-        output.copy_(conv_output[req_indices, col_indices])
-
-        if self.conv_state_len > 0 and conv_state.shape[0] > 0:
             state_starts = lengths.to(device=history.device, dtype=torch.int64).view(
                 num_prefills, 1, 1
             )
             state_offsets = torch.arange(
-                self.conv_state_len, device=history.device, dtype=torch.int64
-            ).view(1, 1, self.conv_state_len)
+                state_len, device=history.device, dtype=torch.int64
+            ).view(1, 1, state_len)
             next_state = history.gather(
                 dim=2,
-                index=(state_starts + state_offsets).expand(-1, history.size(1), -1),
+                index=(state_starts + state_offsets).expand(-1, hidden_size, -1),
             )
+
+        conv_output = F.conv1d(
+            history,
+            conv_weights.unsqueeze(1).contiguous(),
+            groups=hidden_size,
+            dilation=self.short_conv_dilation,
+        )
+        del history
+        F.silu(conv_output, inplace=True)
+        # Only whole rows of requests without a valid state are zeroed: padding
+        # columns past each request's length are never gathered below.
+        conv_output.masked_fill_(
+            ~valid_state.to(device=x_p.device).view(num_prefills, 1, 1), 0
+        )
+        output = conv_output.transpose(1, 2)[req_indices, col_indices]
+        del conv_output
+
+        if next_state is not None:
             # Write back without a host synchronization. Valid, non-empty rows
             # receive their new state; padding and zero-length rows keep the
             # current cache value.
             existing_state = conv_state.index_select(0, state_indices)
-            existing_base_state = existing_state[..., : self.conv_state_len]
+            existing_base_state = existing_state[..., :state_len]
             update_mask = valid_state & (lengths.to(device=conv_state.device) > 0)
             safe_next_state = torch.where(
                 update_mask.view(num_prefills, 1, 1),
                 next_state.to(conv_state.dtype),
                 existing_base_state,
             )
-            existing_state[..., : self.conv_state_len] = safe_next_state
+            existing_state[..., :state_len] = safe_next_state
             conv_state.index_copy_(0, state_indices, existing_state)
         return output
 
@@ -2241,7 +2235,12 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                         num_prefill_tokens=num_prefill_tokens,
                     )
                 )
-                conv_out_non_spec = torch.vstack(non_spec_parts)
+                # A single part is already the result; vstack would copy it.
+                conv_out_non_spec = (
+                    non_spec_parts[0]
+                    if len(non_spec_parts) == 1
+                    else torch.vstack(non_spec_parts)
+                )
             else:
                 conv_out_non_spec = self._short_conv_dilated_decode_batched(
                     x_d=x_non_spec,

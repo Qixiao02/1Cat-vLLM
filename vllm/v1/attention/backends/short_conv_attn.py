@@ -66,10 +66,10 @@ class PleShortConvAttentionMetadata(ShortConvAttentionMetadata):
     # packing buffer without a device->host sync (``lengths.max().item()``).
     # 0 when there are no prefill requests.
     max_prefill_query_len: int = 0
-    # SX_OPT (opt180dev1): host copy of the non-spec prefill query lengths, in
-    # prefill order. Lets the PLE dilated short-conv bound its padded packing
-    # buffer (num_prefills x max_len rows) without a device->host sync. None on
-    # the spec-decode builder path (the packing then behaves as before).
+    # SX_OPT: host copy of the non-spec prefill query lengths, in prefill
+    # order. Lets the PLE dilated short-conv bound its padded packing buffer
+    # (num_prefills x max_len rows) without a device->host sync. None when
+    # there are no prefill requests.
     prefill_query_lens_cpu: tuple[int, ...] | None = None
     query_start_loc: torch.Tensor | None = None
 
@@ -353,6 +353,13 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
             if num_prefills > 0
             else 0
         )
+        # Prefill lengths in the order the prefill rows are gathered below
+        # (``prefill_req_idx_cpu``). CPU tensor -> tuple: no device sync.
+        prefill_query_lens_cpu = (
+            tuple(int(v) for v in query_lens_cpu[prefill_mask_cpu].tolist())
+            if num_prefills > 0
+            else None
+        )
 
         # Original request indices grouped as
         # [spec | non-spec decode | non-spec prefill]; each group keeps the
@@ -607,6 +614,7 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
             num_actual_tokens=m.num_actual_tokens,
             spec_query_len=self.num_spec + 1,
             max_prefill_query_len=max_prefill_query_len,
+            prefill_query_lens_cpu=prefill_query_lens_cpu,
             query_start_loc=query_start_loc,
             state_indices_tensor=state_indices_tensor,
             has_initial_states_p=has_initial_states_p,
