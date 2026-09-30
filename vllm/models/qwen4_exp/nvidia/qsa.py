@@ -11,7 +11,8 @@ from typing import ClassVar, cast
 import torch
 from torch import nn
 
-from vllm.config import VllmConfig
+from vllm import envs
+from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
@@ -444,6 +445,33 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         return output
 
 
+def _verify_e4m3_kv_requirements(
+    vllm_config: VllmConfig,
+    model_config: ModelConfig,
+    cache_config: CacheConfig,
+) -> None:
+    """Gate for the QSA E4M3 main KV cache.
+
+    E4M3 is qualified on SM70 with FP16 activations and TP4 only. Speculative
+    decoding also quantizes the drafter's K/V and needs its own calibrated
+    scales, so it stays rejected unless envs.VLLM_QWEN4EXP_QSA_E4M3_MTP opts
+    in.
+    """
+    if cache_config.cache_dtype not in ("fp8", "fp8_e4m3"):
+        return
+    if not current_platform.is_device_capability(70):
+        raise NotImplementedError("Qwen4Exp QSA E4M3 phase 1 requires SM70")
+    if model_config.dtype != torch.float16:
+        raise NotImplementedError("Qwen4Exp QSA E4M3 phase 1 requires FP16 activations")
+    if vllm_config.parallel_config.tensor_parallel_size != 4:
+        raise NotImplementedError("Qwen4Exp QSA E4M3 phase 1 requires TP4")
+    if (
+        vllm_config.speculative_config is not None
+        and not envs.VLLM_QWEN4EXP_QSA_E4M3_MTP
+    ):
+        raise NotImplementedError("Qwen4Exp QSA E4M3 phase 1 requires MTP0")
+
+
 class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     """Merged Qwen full-attention owner with a QSA index side branch."""
 
@@ -481,17 +509,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise NotImplementedError(
                 "Qwen4Exp QSA requires FP16/BF16 or E4M3 main KV cache"
             )
-        e4m3_cache = cache_config.cache_dtype in ("fp8", "fp8_e4m3")
-        if e4m3_cache and not current_platform.is_device_capability(70):
-            raise NotImplementedError("Qwen4Exp QSA E4M3 phase 1 requires SM70")
-        if e4m3_cache and model_config.dtype != torch.float16:
-            raise NotImplementedError(
-                "Qwen4Exp QSA E4M3 phase 1 requires FP16 activations"
-            )
-        if e4m3_cache and vllm_config.parallel_config.tensor_parallel_size != 4:
-            raise NotImplementedError("Qwen4Exp QSA E4M3 phase 1 requires TP4")
-        if e4m3_cache and vllm_config.speculative_config is not None:
-            raise NotImplementedError("Qwen4Exp QSA E4M3 phase 1 requires MTP0")
+        _verify_e4m3_kv_requirements(vllm_config, model_config, cache_config)
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
         parallel_config = vllm_config.parallel_config
@@ -714,6 +732,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         sentinel and is marked finalized so nothing re-validates it.
         """
         set_default_quant_scales(self, register_buffer=False)
+        if hasattr(self, "k_scale"):
+            del self.k_scale
+        if hasattr(self, "v_scale"):
+            del self.v_scale
         self._qsa_kv_scales_finalized = True
 
     def validate_loaded_kv_scales(self) -> None:
