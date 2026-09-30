@@ -104,5 +104,5 @@ All switches default to on, and setting one to `0` restores the upstream code pa
 
 - **MTP 通道**：KV 只有约 131K token，负载下还可能显存溢出。请在生产上保持关闭。
 - **1 token prompt**：全新请求的 prompt 只有 1 个 token 时，状态槽没有清零。官方也有同样问题。聊天接口的 prompt 带模板，不会触发。
-- **开前缀缓存时长 prompt 的 KV 占用偏高**：4 条 64K prompt 并发时，KV 占用峰值是 86%，关前缀缓存是 64%。多出来的部分随 prompt 长度增加，请求结束后释放。长 prompt 并发多时，缓存池会更早用满。
+- **开前缀缓存时长 prompt 的 KV 占用偏高**：4 条 64K prompt 并发时，KV 占用峰值是 86%，关前缀缓存是 64%。原因是 prefill 一步跨多个状态块时，换下来的状态块要到请求结束才释放，每个状态组多占“步数 − 2”个块（Flash-Next 有 4 个状态组）。一条冷的 110K 请求因此多占约 9% 的缓存池。只影响容量，不影响输出；长 prompt 并发多时，缓存池会更早用满，出现排队或抢占。修复已有原型，还没有合入这个版本。
 - **测试环境**：`sx_tests/` 下的测试需要 V100 和对应镜像，每个文件里写了运行方法。
