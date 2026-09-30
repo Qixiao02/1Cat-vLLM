@@ -1,0 +1,16 @@
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+index 653e5f361..eed11dcee 100644
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -386,6 +386,11 @@ ENV DEEPGEMM_VENV_PREFIX=/opt/dgenv
+ RUN --mount=type=cache,target=/root/.cache/uv \
+     tools/setup_deepgemm_pythons.sh > /tmp/dg_pythons.txt
+ 
++# Local build only (not part of the repository): the third-party repositories CMake clones from GitHub are
++# taken from verified local mirrors, because the GitHub link of the build host was at 14 KB/s.
++COPY --from=gitmirror / /gitmirror
++RUN git config --global url."file:///gitmirror/".insteadOf "https://github.com/" \n    && git config --global protocol.file.allow always
++
+ # Build the vLLM wheel
+ # if USE_SCCACHE is set, use sccache to speed up compilation
+ # AWS credentials mounted at ~/.aws/credentials for sccache S3 auth (optional)
