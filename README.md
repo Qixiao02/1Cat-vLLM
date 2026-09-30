@@ -1,8 +1,8 @@
 # 1Cat-vLLM-heavily-modified
 
-**1cat-vllm-heavily-modified-v1-0930**：这是基于 1Cat 官方代码的魔改分支（默认分支 `1cat-vllm-heavily-modified-v1-0930`，基于官方 `main@02c87ab89`，即 v1.5.0 之后第 670 个提交）。它面向 4 张 V100 上的 Swift 1.5 Qwen3.8-Flash-Next，重点优化并发吞吐和 prefill。改动清单、开关和与官方 `main@357d07bcb` 的实测对比见 [HEAVILY_MODIFIED.md](HEAVILY_MODIFIED.md)。官方原版请看 [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)。
+**1cat-vllm-heavily-modified-v1**：这是基于 1Cat 官方代码的魔改分支（默认分支 `1cat-vllm-heavily-modified-v1`，发布 tag `1cat-vllm-heavily-modified-v1-0930`，基于官方 `main@02c87ab89`，即 v1.5.0 之后第 670 个提交）。它面向 4 张 V100 上的 Swift 1.5 Qwen3.8-Flash-Next，重点优化并发吞吐和 prefill。改动清单、开关和与官方 `main@357d07bcb` 的实测对比见 [HEAVILY_MODIFIED.md](HEAVILY_MODIFIED.md)。官方原版请看 [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)。
 
-This is a heavily modified fork of 1Cat-vLLM (branch `1cat-vllm-heavily-modified-v1-0930`, based on upstream `main@02c87ab89`) tuned for concurrency and prefill of Swift 1.5 Qwen3.8-Flash-Next on 4x V100. See [HEAVILY_MODIFIED.md](HEAVILY_MODIFIED.md) for the changes, switches and measurements.
+This is a heavily modified fork of 1Cat-vLLM (branch `1cat-vllm-heavily-modified-v1`, tag `1cat-vllm-heavily-modified-v1-0930`, based on upstream `main@02c87ab89`) tuned for concurrency and prefill of Swift 1.5 Qwen3.8-Flash-Next on 4x V100. See [HEAVILY_MODIFIED.md](HEAVILY_MODIFIED.md) for the changes, switches and measurements.
 
 ## 改动（按提交顺序）
 
@@ -182,7 +182,7 @@ This is a heavily modified fork of 1Cat-vLLM (branch `1cat-vllm-heavily-modified
 
 - **适用范围**：只在 4 张 V100-SXM2-32GB、TP4、Swift 1.5 Qwen3.8-Flash-Next NVFP4（PLE 表以 FP8 存储）、不开 MTP 这一种组合上验证过。各项优化按这套硬件和模型的形状判断是否启用；其他组合会回到官方路径，能运行，但没有加速。没有针对 Qwen3.8-27B 加 DFlash2 做调优或验证。
 - **构建和运行环境**：原生内核只为 sm_70（V100 的 CUDA 架构）编译。需要 Python 3.12 和 torch 2.10.0+cu128；运行时还需要 CUDA 12.8 toolkit，因为部分内核在首次启动时编译，冷启动要 8–25 分钟。PLE 表需要约 48 GiB 可锁定的主机内存。
-- **版本标记**：git tag `1cat-vllm-heavily-modified-v1-0930` 和默认分支同名，指向改动第 1–5 项的代码（引擎代码同 2026-09-28），第 1–4 组实测用的是它。默认分支在 tag 之后加了改动第 6 项，只改 Python 文件；不开 MTP 时输出不变（PLE prefill 的结果逐位相同，有 CPU 测试），这个组合没有在 V100 上重测。运行中的引擎在 `/version` 返回的是编译进去的包版本 `1.5.1+heavily.modified.v1`。
+- **版本标记**：git tag `1cat-vllm-heavily-modified-v1-0930` 指向改动第 1–5 项的代码（引擎代码同 2026-09-28），第 1–4 组实测用的是它。默认分支 `1cat-vllm-heavily-modified-v1` 在 tag 之后加了改动第 6 项，只改 Python 文件；不开 MTP 时输出不变（PLE prefill 的结果逐位相同，有 CPU 测试），这个组合没有在 V100 上重测。运行中的引擎在 `/version` 返回的是编译进去的包版本 `1.5.1+heavily.modified.v1`。
 
 启动参数（所有测量、两条线都用这一组）：
 

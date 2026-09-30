@@ -13,6 +13,7 @@ All switches default to on, and setting one to `0` restores the upstream code pa
 |---|---|
 | 版本名 | 1cat-vllm-heavily-modified-v1-0930 |
 | git tag | `1cat-vllm-heavily-modified-v1-0930` |
+| 默认分支 | `1cat-vllm-heavily-modified-v1`，在 tag 之后加了改动第 6 项 |
 | Python 包版本（PEP 440） | `1.5.1+heavily.modified.v1`。这个字符串编译在构建里，运行中的引擎在 `/version` 返回的就是它。从源码构建时设置 `SETUPTOOLS_SCM_PRETEND_VERSION=1.5.1+heavily.modified.v1` |
 | 官方基线 | `main@02c87ab89`（2026-09-14），即官方 v1.5.0 之后第 670 个提交 |
 
