@@ -370,6 +370,14 @@ def _sm70_qwen38_lane_qualified(cfg: "VllmConfig", *, is_sm70: bool) -> bool:
     ):
         return False
     parallel = cfg.parallel_config
+    kv_cache_dtypes: tuple[str, ...] = ("auto", "float16")
+    if cfg.speculative_config is not None and envs.VLLM_QWEN4EXP_QSA_E4M3_MTP:
+        # Only the QSA ops read the main KV cache, and they route E4M3 K/V on
+        # their own; what the MTP lane changes (projections, MoE, scheduling,
+        # graph shapes) does not depend on the KV dtype. Rejecting E4M3 here
+        # would drop the lane's defaults and verify capture sizes while its
+        # contract-gated parts stay on.
+        kv_cache_dtypes += ("fp8", "fp8_e4m3")
     return not (
         cfg.model_config.quantization != "modelopt_fp4"
         or cfg.lora_config is not None
@@ -377,7 +385,7 @@ def _sm70_qwen38_lane_qualified(cfg: "VllmConfig", *, is_sm70: bool) -> bool:
         or parallel.enable_dbo
         or parallel.data_parallel_size != 1
         or parallel.nnodes_within_dp != 1
-        or cfg.cache_config.cache_dtype not in ("auto", "float16")
+        or cfg.cache_config.cache_dtype not in kv_cache_dtypes
         or cfg.cache_config.mamba_ssm_cache_dtype not in ("auto", "float32")
     )
 
