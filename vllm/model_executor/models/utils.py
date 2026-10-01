@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -36,6 +37,12 @@ from vllm.utils.torch_utils import (
 )
 
 logger = init_logger(__name__)
+
+# SX_OPT_LOAD_CAN_SKIP (default on, "0" = the two any() expressions in
+# AutoWeightsLoader._can_skip). The loader asks _can_skip for every checkpoint
+# tensor at every nesting level; plain loops give the same answer without
+# creating two generators per call.
+_SX_LOAD_CAN_SKIP = os.environ.get("SX_OPT_LOAD_CAN_SKIP", "1").strip() != "0"
 
 
 @dataclass
@@ -208,6 +215,16 @@ class AutoWeightsLoader:
         return ".".join((prefix, rest))
 
     def _can_skip(self, qualname: str) -> bool:
+        if _SX_LOAD_CAN_SKIP:
+            # Same order and short-circuiting as the expression below: the
+            # prefixes first, then the substrings, the first hit decides.
+            for prefix in self.skip_prefixes:
+                if qualname.startswith(prefix):
+                    return True
+            for substr in self.skip_substrs:
+                if substr in qualname:
+                    return True
+            return False
         return any(qualname.startswith(p) for p in self.skip_prefixes) or any(
             substr in qualname for substr in self.skip_substrs
         )

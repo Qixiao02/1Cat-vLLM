@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import itertools
 import logging
 import os
 import sys
@@ -101,18 +102,29 @@ class _Logger(logging.Logger):
     info = warning = warning_once = info_once = debug_once = debug
 
 
+_COUNTER = itertools.count()
+
+
 def exec_source(source: str, filename: str, **namespace: Any) -> dict[str, Any]:
-    """Execute ``source`` with a prelude of common imports; return its globals."""
-    ns: dict[str, Any] = {
-        "__name__": "sx_load_cut",
-        "Any": Any,
-        "Iterable": Iterable,
-        "Mapping": Mapping,
-        "Sequence": Sequence,
-        "torch": torch,
-        "logger": _Logger("sx_load_cut"),
-        "os": os,
-    }
+    """Execute ``source`` with a prelude of common imports; return its globals.
+
+    The namespace is a registered module (``dataclasses`` and ``typing`` look
+    their defining module up in ``sys.modules``).
+    """
+    module = types.ModuleType(f"sx_load_cut_{next(_COUNTER)}")
+    sys.modules[module.__name__] = module
+    ns = module.__dict__
+    ns.update(
+        {
+            "Any": Any,
+            "Iterable": Iterable,
+            "Mapping": Mapping,
+            "Sequence": Sequence,
+            "torch": torch,
+            "logger": _Logger("sx_load_cut"),
+            "os": os,
+        }
+    )
     ns.update(namespace)
     exec(compile(source, filename, "exec"), ns)  # noqa: S102
     return ns

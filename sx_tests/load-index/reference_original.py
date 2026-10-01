@@ -68,3 +68,48 @@ def load_weights_original(
                         self.layer_name,
                     )
                     yield param_name
+
+
+# _remap_qsa_cache_scale_name (vllm/models/qwen4_exp/nvidia/model.py)
+def remap_qsa_cache_scale_name_original(
+    name: str,
+    qsa_layer_ids: frozenset[int],
+) -> str:
+    """Map serialized main-cache scales onto the merged QSA owner.
+
+    Regular attention keeps cache scales below its ``attn`` child. QSA owns
+    that cache directly, so only QSA layers need the final path component
+    moved to the owner's invalid-until-loaded ``k_scale``/``v_scale`` slots.
+    """
+
+    scale_suffixes = {
+        "k_proj.k_scale": "k_scale",
+        "k_proj.output_scale": "k_scale",
+        "attn.k_scale": "k_scale",
+        "attn._k_scale": "k_scale",
+        "k_scale": "k_scale",
+        "_k_scale": "k_scale",
+        "v_proj.v_scale": "v_scale",
+        "v_proj.output_scale": "v_scale",
+        "attn.v_scale": "v_scale",
+        "attn._v_scale": "v_scale",
+        "v_scale": "v_scale",
+        "_v_scale": "v_scale",
+    }
+    for layer_id in qsa_layer_ids:
+        marker = f"layers.{layer_id}.self_attn."
+        marker_start = name.find(marker)
+        if marker_start < 0 or (marker_start > 0 and name[marker_start - 1] != "."):
+            continue
+        suffix = name[marker_start + len(marker) :]
+        mapped_suffix = scale_suffixes.get(suffix)
+        if mapped_suffix is not None:
+            return f"{name[: marker_start + len(marker)]}{mapped_suffix}"
+    return name
+
+
+# AutoWeightsLoader._can_skip (vllm/model_executor/models/utils.py)
+def can_skip_original(self, qualname: str) -> bool:
+    return any(qualname.startswith(p) for p in self.skip_prefixes) or any(
+        substr in qualname for substr in self.skip_substrs
+    )
