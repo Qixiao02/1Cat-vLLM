@@ -44,6 +44,14 @@ Asserted (SX_OPT_MTP_SHARED_BATCH):
   and forwards the packed copy inside them;
 * the loader tags (method + hook) only the [320, 2560] shared gate/up of the
   admitted lane; packing happens only for tagged layers with the native op.
+
+Asserted (SX_OPT_MTP_GDN_INPUT_BATCH, opt-in):
+* switch parsing: default off, SX switch or upstream alias turn it on;
+* packing keeps every QKVZ / b/a bit (b/a zero padded to 32 rows);
+* runtime admission and precedence against the SX_OPT_ROWS GDN-input kernel;
+* dispatch: the native op writes qkv/z/b/a directly when admitted, the old
+  routes run otherwise; the loader tags both projections only in the
+  admitted lane with the switch on; the GDN layer passes both packed copies.
 """
 
 from __future__ import annotations
@@ -78,6 +86,8 @@ SWITCHES = (
     "SX_OPT_MTP_BATCH_OVER_ROWS",
     "SX_OPT_MTP_SHARED_BATCH",
     "VLLM_SM70_MTP_SHARED_BATCH",
+    "SX_OPT_MTP_GDN_INPUT_BATCH",
+    "VLLM_SM70_QWEN38_GDN_INPUT_BATCH",
 )
 PRECISION = (
     "allow_fp16_reduced_precision_reduction",
@@ -855,6 +865,201 @@ def test_registered_shared_op_fake_shapes():
         x = torch.empty(m, 2560, dtype=torch.float16, device="meta")
         for args in ((x, w), (x, w, packed), (x, w, None)):
             assert torch.ops.vllm.qwen38_sm70_shared_up(*args).shape == (m, 160)
+
+
+# ---------------------------------------------------------------------------
+# GDN input batch (opt-in)
+# ---------------------------------------------------------------------------
+QKVZ = "model.layers.0.linear_attn.in_proj_qkvz"
+BA = "model.layers.0.linear_attn.in_proj_ba"
+
+
+@pytest.mark.parametrize(
+    "env,enabled",
+    [
+        ({}, False),
+        ({"SX_OPT_MTP_GDN_INPUT_BATCH": "1"}, True),
+        ({"VLLM_SM70_QWEN38_GDN_INPUT_BATCH": "1"}, True),
+        ({"SX_OPT_MTP_GDN_INPUT_BATCH": "0", "VLLM_SM70_QWEN38_GDN_INPUT_BATCH": "1"},
+         False),
+    ],
+)
+def test_gdn_switches(monkeypatch, env, enabled):
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    _reset_env_cache()
+    assert gemv._sx_mtp_batch_config().gdn_input == enabled
+
+
+@pytest.mark.parametrize("n", (24, 4096))
+def test_gdn_pack_preserves_half_bits(n):
+    raw = torch.randint(-(2**15), 2**15, (n, 2560), dtype=torch.int16)
+    packed = gemv._pack_gdn_input_weight(raw.view(torch.float16))
+    assert packed.shape == ((1 if n == 24 else 128), 160, 2, 32, 8)
+    restored = packed.permute(0, 3, 1, 2, 4).contiguous().view(-1, 2560)
+    assert torch.equal(restored[:n].view(torch.int16), raw)
+    if n == 24:
+        assert not torch.count_nonzero(restored[n:].view(torch.int16))
+    for shape, dtype in (((25, 2560), torch.float16), ((24, 2560), torch.float32)):
+        with pytest.raises(ValueError):
+            gemv._pack_gdn_input_weight(torch.empty(shape, dtype=dtype))
+
+
+@pytest.mark.parametrize(
+    "tile,over_rows,admitted", [(0, "0", True), (5, "0", False), (5, "1", True)]
+)
+def test_gdn_runtime_admission_and_precedence(monkeypatch, tile, over_rows, admitted):
+    monkeypatch.setenv("SX_OPT_MTP_GDN_INPUT_BATCH", "1")
+    monkeypatch.setenv("SX_OPT_MTP_BATCH_OVER_ROWS", over_rows)
+    monkeypatch.setattr(gemv.current_platform, "is_device_capability", lambda _: True)
+    _reset_env_cache()
+    x = _fake_cuda(torch.zeros(10, 2560, dtype=torch.float16))
+    pq = _fake_cuda(torch.zeros(128, 160, 2, 32, 8, dtype=torch.float16))
+    pb = _fake_cuda(torch.zeros(1, 160, 2, 32, 8, dtype=torch.float16))
+    with _verify_capture():
+        assert gemv._can_use_packed_gdn_input(x, pq, pb, tile) == admitted
+        assert not gemv._can_use_packed_gdn_input(x, None, pb, 0)
+        assert not gemv._can_use_packed_gdn_input(x, pq, None, 0)
+        assert not gemv._can_use_packed_gdn_input(x, pb, pq, 0)
+        assert not gemv._can_use_packed_gdn_input(x[:4], pq, pb, 0)
+        assert not gemv._can_use_packed_gdn_input(x.as_subclass(torch.Tensor), pq, pb)
+        monkeypatch.setattr(
+            gemv.current_platform, "is_device_capability", lambda _: False
+        )
+        assert not gemv._can_use_packed_gdn_input(x, pq, pb, 0)
+    assert not gemv._can_use_packed_gdn_input(x, pq, pb, 0)  # outside the capture
+
+
+def test_gdn_default_off_never_admits(monkeypatch):
+    monkeypatch.setattr(gemv.current_platform, "is_device_capability", lambda _: True)
+    x = _fake_cuda(torch.zeros(10, 2560, dtype=torch.float16))
+    pq = _fake_cuda(torch.zeros(128, 160, 2, 32, 8, dtype=torch.float16))
+    pb = _fake_cuda(torch.zeros(1, 160, 2, 32, 8, dtype=torch.float16))
+    with _verify_capture():
+        assert not gemv._can_use_packed_gdn_input(x, pq, pb, 0)
+
+
+@pytest.mark.parametrize("admit", [True, False])
+@pytest.mark.parametrize("rows_tile", [0, 5])
+def test_gdn_dispatch(monkeypatch, admit, rows_tile):
+    seen = []
+
+    def can_use(x, pq, pb, tile):
+        seen.append(tile)
+        return admit
+
+    monkeypatch.setattr(gemv, "_can_use_packed_gdn_input", can_use)
+    monkeypatch.setattr(gemv, "_sx_gdn_rows_tile", lambda *a: rows_tile)
+    rows_calls = []
+    monkeypatch.setattr(
+        gemv,
+        "_sx_rows_gdn_input",
+        lambda x, q, b, tile: rows_calls.append(tile) or ("rows",) * 4,
+    )
+    native = _NativeC("qwen38_gdn_input_batch_sm70_out")
+    meta = dict(dtype=torch.float16, device="meta")
+    x = torch.empty(10, 2560, **meta)
+    q, b = torch.empty(4096, 2560, **meta), torch.empty(24, 2560, **meta)
+    pq = torch.empty(128, 160, 2, 32, 8, **meta)
+    pb = torch.empty(1, 160, 2, 32, 8, **meta)
+    _swap_native(monkeypatch, native)
+    outputs = gemv._qwen38_sm70_fp16_gdn_input(x, q, b, pq, pb)
+    assert seen == [rows_tile]
+    if admit:
+        ((name, args),) = native.calls
+        assert args[:4] == outputs and args[4] is x and args[5] is pq and args[6] is pb
+        assert [tuple(o.shape) for o in outputs] == [(10, n) for n in (2560, 1536, 12, 12)]
+    else:
+        assert not native.calls
+        if rows_tile:
+            assert outputs == ("rows",) * 4 and rows_calls == [rows_tile]
+
+
+def _gdn_layer() -> torch.nn.Module:
+    layer = torch.nn.Module()
+    layer.in_proj_qkvz = _Dense(QKVZ, (4096, 2560))
+    layer.in_proj_ba = _Dense(BA, (24, 2560))
+    layer.gqa_interleaved_layout = False
+    layer.disable_tp_for_ba_proj = False
+    return layer
+
+
+@pytest.mark.parametrize(
+    "config,switch,tagged",
+    [(4, "1", True), (4, None, False), (3, "1", False), (None, "1", False)],
+)
+def test_gdn_loader_tags_only_the_opted_in_lane(monkeypatch, config, switch, tagged):
+    monkeypatch.setattr(gemv, "LinearBase", _Dense)
+    monkeypatch.setattr(gemv.current_platform, "is_device_capability", lambda _: True)
+    monkeypatch.setenv("VLLM_SM70_QWEN38_FP16_GEMV", "1")
+    monkeypatch.setenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0")
+    monkeypatch.setenv("VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16", "1")
+    if switch is not None:
+        monkeypatch.setenv("SX_OPT_MTP_GDN_INPUT_BATCH", switch)
+    _reset_env_cache()
+    model = torch.nn.Module()
+    model.gdn = _gdn_layer()
+    gemv.enable_qwen38_sm70_fp16_gemv(model, torch.float16, boot.lane_config(config))
+    assert model.gdn.sm70_qwen38_fp16_fused_input
+    for proj in (model.gdn.in_proj_qkvz, model.gdn.in_proj_ba):
+        assert getattr(proj, "_sm70_qwen38_prepare_gdn_batch", False) == tagged
+
+
+@pytest.mark.parametrize("shape", [(4096, 2560), (24, 2560)])
+@pytest.mark.parametrize("op_present", [True, False])
+def test_gdn_process_weights(monkeypatch, shape, op_present):
+    layer = torch.nn.Module()
+    raw = torch.randint(-(2**15), 2**15, shape, dtype=torch.int16)
+    layer.weight = torch.nn.Parameter(_fake_cuda(raw.view(torch.float16)),
+                                      requires_grad=False)
+    layer._sm70_qwen38_prepare_gdn_batch = True
+    native = _NativeC(*(["qwen38_gdn_input_batch_sm70_out"] if op_present else []))
+    _swap_native(monkeypatch, native)
+    gemv.Qwen38SM70FP16LinearMethod().process_weights_after_loading(layer)
+    assert hasattr(layer, "_sm70_qwen38_gdn_packed") == op_present
+    if op_present:
+        expected = gemv._pack_gdn_input_weight(raw.view(torch.float16))
+        assert torch.equal(
+            layer._sm70_qwen38_gdn_packed.as_subclass(torch.Tensor).view(torch.int16),
+            expected.view(torch.int16),
+        )
+        assert "_sm70_qwen38_gdn_packed" not in layer.state_dict()
+
+
+def test_registered_gdn_op_accepts_the_packs():
+    meta = dict(dtype=torch.float16, device="meta")
+    q, b = torch.empty(4096, 2560, **meta), torch.empty(24, 2560, **meta)
+    pq = torch.empty(128, 160, 2, 32, 8, **meta)
+    pb = torch.empty(1, 160, 2, 32, 8, **meta)
+    for m in (1, 5, 10, 17):
+        x = torch.empty(m, 2560, **meta)
+        for args in ((x, q, b), (x, q, b, pq, pb), (x, q, b, None, None)):
+            outputs = torch.ops.vllm.qwen38_sm70_fp16_gdn_input(*args)
+            assert [tuple(o.shape) for o in outputs] == [
+                (m, n) for n in (2560, 1536, 12, 12)
+            ]
+
+
+def test_gdn_layer_passes_both_packed_copies():
+    import ast
+
+    path = os.path.join(
+        boot.REPO, "vllm", "model_executor", "layers", "mamba", "gdn",
+        "qwen_gdn_linear_attn.py",
+    )  # fmt: skip
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "torch.ops.vllm.qwen38_sm70_fp16_gdn_input"
+    ]
+    assert len(calls) == 1
+    args = [ast.unparse(a) for a in calls[0].args]
+    assert args[3:] == [
+        "getattr(self.in_proj_qkvz, '_sm70_qwen38_gdn_packed', None)",
+        "getattr(self.in_proj_ba, '_sm70_qwen38_gdn_packed', None)",
+    ]
 
 
 if __name__ == "__main__":

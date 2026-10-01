@@ -5,11 +5,12 @@
 //
 // SX port of upstream 1Cat main@d30469863's packed m8n8k4 batch kernels for
 // the native-MTP M5/M10 verify (sm70_fp16_gemv.py, "SX MTP batch routes"):
-// the E512 router projection (3b7365925) and the shared-expert gate/up
-// projection with its SiLU-and-multiply (69eac6d8e). Upstream's no-MTP dense
-// batch kernel (BATCH_FASTPATH) is not part of this build, nor is its
-// shared-gate sigmoid/multiply epilogue: the fork's exact multi-row shared
-// gate (SX_OPT_SHARED_GATE_ROWS) already serves those rows.
+// the fused GDN QKVZ/b/a input projection (45248dc8d, native entry as of
+// 1ae340320), the E512 router projection (3b7365925) and the shared-expert
+// gate/up projection with its SiLU-and-multiply (69eac6d8e). Upstream's
+// no-MTP dense batch kernel (BATCH_FASTPATH) is not part of this build, nor
+// is its shared-gate sigmoid/multiply epilogue: the fork's exact multi-row
+// shared gate (SX_OPT_SHARED_GATE_ROWS) already serves those rows.
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -26,6 +27,90 @@ namespace {
       : "+f"(C[0]), "+f"(C[1]), "+f"(C[2]), "+f"(C[3]), "+f"(C[4]), \
         "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                          \
       : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
+
+template <bool Packed, bool PairRows = false>
+__global__ __launch_bounds__(128, 4) void gdn_input_batch_kernel(
+    const half* x, const half* qw, const half* bw, half* qkv, half* z,
+    half* b_out, half* a_out, int m) {
+  constexpr int groups = PairRows ? 2 : 1;
+  __shared__ float partial[4][groups * 8][32];
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const bool is_ba = blockIdx.x == 128;
+  const int row_group = blockIdx.y;
+  // The small b/a projection retains its four contiguous 640-element K
+  // partitions. QKVZ retains the original single ordered K reduction.
+  if (!is_ba && warp != 0) return;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
+  const int quad = (lane >> 2) & 3;
+  const int col = quad * 8 + r;
+  const half* w = is_ba ? bw : qw + static_cast<size_t>(blockIdx.x) * 2560 * 32;
+  const int start = is_ba ? warp * 40 : 0;
+  const int end = is_ba ? (warp + 1) * 40 : 160;
+  float acc[groups][8] = {};
+#pragma unroll 32
+  for (int g = start; g < end; ++g) {
+    uint4 lo = make_uint4(0, 0, 0, 0), hi = lo;
+    if constexpr (Packed) {
+      lo = *reinterpret_cast<const uint4*>(w + (g * 64 + col) * 8);
+      hi = *reinterpret_cast<const uint4*>(w + (g * 64 + 32 + col) * 8);
+    } else if (!is_ba || col < 24) {
+      // Same fragments and K order, but read the original checkpoint layout.
+      // This variant needs no second model-sized weight allocation.
+      lo = *reinterpret_cast<const uint4*>(w + col * 2560 + g * 16);
+      hi = *reinterpret_cast<const uint4*>(w + col * 2560 + g * 16 + 8);
+    }
+#pragma unroll
+    for (int p = 0; p < groups; ++p) {
+      const int row = (row_group + p) * 8 + r;
+      uint4 a = make_uint4(0, 0, 0, 0), b = a;
+      if (row < m) {
+        const half* input = x + static_cast<size_t>(row) * 2560 + g * 16;
+        a = *reinterpret_cast<const uint4*>(input);
+        b = *reinterpret_cast<const uint4*>(input + 8);
+      }
+      GDN_MMA(acc[p], a.x, a.y, lo.x, lo.y);
+      GDN_MMA(acc[p], a.z, a.w, lo.z, lo.w);
+      GDN_MMA(acc[p], b.x, b.y, hi.x, hi.y);
+      GDN_MMA(acc[p], b.z, b.w, hi.z, hi.w);
+    }
+  }
+#pragma unroll
+  for (int p = 0; p < groups; ++p) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int rr = p * 8 + ((i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1));
+      const int cc =
+          quad * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
+      if (is_ba) {
+        partial[warp][rr][cc] = acc[p][i];
+      } else if (row_group * 8 + rr < m) {
+        const int outcol = blockIdx.x * 32 + cc;
+        const half value = __float2half_rn(acc[p][i]);
+        if (outcol < 2560)
+          qkv[(row_group * 8 + rr) * 2560 + outcol] = value;
+        else
+          z[(row_group * 8 + rr) * 1536 + outcol - 2560] = value;
+      }
+    }
+  }
+  if (is_ba) {
+    __syncthreads();
+    for (int i = threadIdx.x; i < groups * 8 * 24; i += 128) {
+      const int rr = i / 24, cc = i % 24;
+      // cuBLASLt FP32 workspace reduction: preserve left-to-right order.
+      // Balanced alternatives produce measurable FP16 bit differences.
+      const float value =
+          ((partial[0][rr][cc] + partial[1][rr][cc]) + partial[2][rr][cc]) +
+          partial[3][rr][cc];
+      if (row_group * 8 + rr < m) {
+        if (cc < 12)
+          b_out[(row_group * 8 + rr) * 12 + cc] = __float2half_rn(value);
+        else
+          a_out[(row_group * 8 + rr) * 12 + cc - 12] = __float2half_rn(value);
+      }
+    }
+  }
+}
 
 // The high-precision small-batch cuBLAS router projection uses four
 // contiguous FP32 K640 partitions. Each independent m8n8k4 quad pair owns one
@@ -128,6 +213,53 @@ __global__ void shared_up_reduce_silu_kernel(const half* partial, half* out,
 
 #undef GDN_MMA
 
+void gdn_input_batch(torch::Tensor qkv, torch::Tensor z, torch::Tensor b,
+                     torch::Tensor a, torch::Tensor x, torch::Tensor qw,
+                     torch::Tensor bw) {
+  TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(1) == 2560 &&
+                  x.size(0) >= 2 && x.size(0) <= 16,
+              "Qwen3.8 batched GDN requires CUDA [2..16, 2560] input");
+  const c10::cuda::CUDAGuard guard(x.device());
+  const auto* properties = at::cuda::getCurrentDeviceProperties();
+  TORCH_CHECK(properties->major == 7 && properties->minor == 0,
+              "Qwen3.8 batched GDN is SM70 only");
+  for (const auto& t : {qkv, z, b, a, x, qw, bw}) {
+    TORCH_CHECK(t.is_cuda() && t.device() == x.device() && t.is_contiguous() &&
+                    t.scalar_type() == at::kHalf,
+                "Qwen3.8 batched GDN requires same-device contiguous FP16");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
+                "Qwen3.8 batched GDN requires 16-byte aligned storage");
+  }
+  // The packed tiles are what the model dispatcher passes. The row-major
+  // variant reads the checkpoint layout (upstream's rejected no-copy screen:
+  // exact but slower); it is kept so the native entry matches upstream.
+  const bool packed = qw.sizes() == at::IntArrayRef({128, 160, 2, 32, 8}) &&
+                      bw.sizes() == at::IntArrayRef({1, 160, 2, 32, 8});
+  const bool row_major = qw.sizes() == at::IntArrayRef({4096, 2560}) &&
+                         bw.sizes() == at::IntArrayRef({24, 2560});
+  TORCH_CHECK(packed || row_major, "Invalid Qwen3.8 GDN weight geometry");
+  const int m = x.size(0);
+  TORCH_CHECK(qkv.sizes() == at::IntArrayRef({m, 2560}) &&
+                  z.sizes() == at::IntArrayRef({m, 1536}) &&
+                  b.sizes() == at::IntArrayRef({m, 12}) &&
+                  a.sizes() == at::IntArrayRef({m, 12}),
+              "Invalid Qwen3.8 GDN output geometry");
+  const bool paired = row_major && m > 8;
+  const auto kernel = packed ? gdn_input_batch_kernel<true>
+                             : (paired ? gdn_input_batch_kernel<false, true>
+                                       : gdn_input_batch_kernel<false>);
+  kernel<<<dim3(129, paired ? 1 : (m + 7) / 8), 128, 0,
+           at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const half*>(x.data_ptr()),
+      reinterpret_cast<const half*>(qw.data_ptr()),
+      reinterpret_cast<const half*>(bw.data_ptr()),
+      reinterpret_cast<half*>(qkv.data_ptr()),
+      reinterpret_cast<half*>(z.data_ptr()),
+      reinterpret_cast<half*>(b.data_ptr()),
+      reinterpret_cast<half*>(a.data_ptr()), m);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void router_batch(torch::Tensor output, torch::Tensor x, torch::Tensor packed) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(0) >= 2 &&
                   x.size(0) <= 16 && x.size(1) == 2560,
@@ -189,8 +321,12 @@ TORCH_LIBRARY_FRAGMENT(_C, m) {
   m.def(
       "qwen38_router_batch_sm70_out(Tensor(a!) out, Tensor x, Tensor packed) "
       "-> ()");
+  m.def(
+      "qwen38_gdn_input_batch_sm70_out(Tensor(a!) qkv, Tensor(b!) z, "
+      "Tensor(c!) b, Tensor(d!) a, Tensor x, Tensor qw, Tensor bw) -> ()");
 }
 TORCH_LIBRARY_IMPL(_C, CUDA, m) {
   m.impl("qwen38_shared_up_batch_sm70_out", &shared_up_batch);
   m.impl("qwen38_router_batch_sm70_out", &router_batch);
+  m.impl("qwen38_gdn_input_batch_sm70_out", &gdn_input_batch);
 }

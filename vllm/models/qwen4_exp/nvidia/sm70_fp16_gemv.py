@@ -103,6 +103,17 @@ wins over the upstream alias, whose name keeps working):
     Upstream's shared-gate sigmoid/multiply epilogue is not ported: the
     fork's exact multi-row shared gate (SX_OPT_SHARED_GATE_ROWS, qwen2_moe.py)
     already fuses gate dot + sigmoid + multiply for those rows.
+``SX_OPT_MTP_GDN_INPUT_BATCH=0`` (alias ``VLLM_SM70_QWEN38_GDN_INPUT_BATCH``)
+    Opt-in. Packed-MMA fused GDN QKVZ/b/a input projection
+    (qwen38_gdn_input_batch_sm70_out): one ordered K2560 reduction per QKVZ
+    output, the b/a projection's four contiguous K640 FP32 partitions summed
+    left to right, FP16 outputs written straight into qkv/z/b/a. Upstream
+    measured -0.81 ms per MTP4 round against cuBLAS at M5; here M5 already
+    runs the SX_OPT_ROWS GDN-input kernel, so by default only M10 (cuBLAS
+    today) changes. Costs +725.6 MiB/rank of packed copies for the 36 GDN
+    layers (upstream: KV cache 153,910 -> 122,631 tokens), hence off by
+    default. Upstream's alias also admits no-MTP M2..16; here it only
+    enables this MTP-lane M5/M10 route.
 ``SX_OPT_MTP_BATCH_OVER_ROWS=0``
     Where an SX_OPT_ROWS multi-row kernel already serves a role at that
     width (router and fused GDN input at M5 with the default table), it keeps
@@ -363,6 +374,7 @@ class _SxMtpBatchConfig(NamedTuple):
     hc_full_unroll: bool
     router: bool
     shared: bool
+    gdn_input: bool
     over_rows: bool
 
 
@@ -388,6 +400,9 @@ def _sx_mtp_batch_config() -> _SxMtpBatchConfig:
         ),
         shared=_sx_mtp_switch(
             "SX_OPT_MTP_SHARED_BATCH", "VLLM_SM70_MTP_SHARED_BATCH", "1"
+        ),
+        gdn_input=_sx_mtp_switch(
+            "SX_OPT_MTP_GDN_INPUT_BATCH", "VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "0"
         ),
         over_rows=os.environ.get("SX_OPT_MTP_BATCH_OVER_ROWS", "0").strip()
         not in ("", "0"),
@@ -493,13 +508,63 @@ def _router_batch_runtime_ok(
 
 
 _SHARED_BATCH_PACKED_SHAPE = (10, 160, 2, 32, 8)
+_GDN_QKVZ_PACKED_SHAPE = (128, 160, 2, 32, 8)
+_GDN_BA_PACKED_SHAPE = (1, 160, 2, 32, 8)
+
+
+def _pack_gdn_input_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Copy FP16 bits into N32/K16 tiles; keep originals for M1/prefill."""
+    if weight.dtype != torch.float16 or weight.shape not in ((4096, 2560), (24, 2560)):
+        raise ValueError("Unsupported packed GDN input weight")
+    weight = weight.detach()
+    if weight.shape[0] == 24:
+        weight = torch.cat((weight, weight.new_zeros((8, 2560))))
+    return weight.reshape(-1, 32, 160, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
+
+
+def _can_use_packed_gdn_input(
+    x: torch.Tensor,
+    packed_qkvz: torch.Tensor | None,
+    packed_ba: torch.Tensor | None,
+    rows_tile: int = 0,
+) -> bool:
+    # The packed copies exist only where the loader admitted the MTP lane.
+    return bool(
+        packed_qkvz is not None
+        and packed_ba is not None
+        and _sx_mtp_batch_config().gdn_input
+        # M5/M10 verify capture; the packed MMA keeps the FP32 accumulation
+        # contract, so an explicit FP16-accumulation request falls back.
+        and _sx_mtp_batch_rows_ok(x)
+        and x.shape[1] == 2560
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and tuple(packed_qkvz.shape) == _GDN_QKVZ_PACKED_SHAPE
+        and tuple(packed_ba.shape) == _GDN_BA_PACKED_SHAPE
+        and all(
+            w.device == x.device
+            and w.dtype == x.dtype
+            and w.is_contiguous()
+            and w.data_ptr() % 16 == 0
+            for w in (packed_qkvz, packed_ba)
+        )
+        and current_platform.is_device_capability(70)
+        and _sx_mtp_batch_takes_width(rows_tile)
+    )
 
 
 def _pack_shared_batch_weight(weight: torch.Tensor) -> torch.Tensor:
     """N32/K16 tiles of the TP4 shared-expert gate/up [320, 2560] shard."""
     if weight.dtype != torch.float16 or weight.shape != (320, 2560):
         raise ValueError("Shared expert batch packing requires FP16 [320, 2560]")
-    return weight.detach().reshape(10, 32, 160, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
+    return (
+        weight.detach()
+        .reshape(10, 32, 160, 2, 8)
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+    )
 
 
 def _shared_batch_runtime_ok(x: torch.Tensor, packed: torch.Tensor | None) -> bool:
@@ -1307,6 +1372,8 @@ def _qwen38_sm70_fp16_gdn_input(
     x: torch.Tensor,
     qkvz_weight: torch.Tensor,
     ba_weight: torch.Tensor,
+    packed_qkvz: torch.Tensor | None = None,
+    packed_ba: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if not (
         qkvz_weight.shape == (4096, 2560)
@@ -1315,6 +1382,18 @@ def _qwen38_sm70_fp16_gdn_input(
         and _runtime_ok(x, ba_weight)
     ):
         tile = _sx_gdn_rows_tile(x, qkvz_weight, ba_weight)
+        # SX_OPT_MTP_GDN_INPUT_BATCH: the MTP lane's M5/M10 verify batches.
+        if _can_use_packed_gdn_input(x, packed_qkvz, packed_ba, tile):
+            assert packed_qkvz is not None and packed_ba is not None
+            qkv, z, b, a = (x.new_empty((x.shape[0], n)) for n in (2560, 1536, 12, 12))
+            torch.ops._C.qwen38_gdn_input_batch_sm70_out(
+                qkv, z, b, a, x, packed_qkvz, packed_ba
+            )
+            logger.info_once(
+                "SM70 Qwen3.8 MTP checkpoint-FP16 batched GDN input enabled "
+                "(SX_OPT_MTP_GDN_INPUT_BATCH)."
+            )
+            return qkv, z, b, a
         if tile:
             logger.info_once(
                 "SM70 Qwen3.8 exact multi-row fused GDN input route enabled "
@@ -1357,8 +1436,10 @@ def _qwen38_sm70_fp16_gdn_input_fake(
     x: torch.Tensor,
     qkvz_weight: torch.Tensor,
     ba_weight: torch.Tensor,
+    packed_qkvz: torch.Tensor | None = None,
+    packed_ba: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    del qkvz_weight, ba_weight
+    del qkvz_weight, ba_weight, packed_qkvz, packed_ba
     batch_shape = x.shape[:-1]
     return (
         x.new_empty((*batch_shape, 2560)),
@@ -1422,6 +1503,14 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
                 "qwen38_shared_up_batch_sm70_out",
                 _pack_shared_batch_weight,
                 "SX_OPT_MTP_SHARED_BATCH",
+            )
+        if getattr(layer, "_sm70_qwen38_prepare_gdn_batch", False):
+            _sx_prepare_packed(
+                layer,
+                "_sm70_qwen38_gdn_packed",
+                "qwen38_gdn_input_batch_sm70_out",
+                _pack_gdn_input_weight,
+                "SX_OPT_MTP_GDN_INPUT_BATCH",
             )
 
     def apply(
@@ -1564,6 +1653,7 @@ def enable_qwen38_sm70_fp16_gemv(
             router_tagged += 1
         replaced += 1
 
+    gdn_batch = bool(mtp_batch and _sx_mtp_batch_config().gdn_input)
     fused_gdn_inputs = 0
     if envs.VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16:
         for child in module.modules():
@@ -1589,6 +1679,9 @@ def enable_qwen38_sm70_fp16_gemv(
             ):
                 continue
             child.sm70_qwen38_fp16_fused_input = True
+            if gdn_batch:
+                qkvz._sm70_qwen38_prepare_gdn_batch = True
+                ba._sm70_qwen38_prepare_gdn_batch = True
             fused_gdn_inputs += 1
 
     if replaced:
@@ -1621,6 +1714,12 @@ def enable_qwen38_sm70_fp16_gemv(
             "SX_OPT_MTP_SHARED_BATCH: %d shared experts will carry packed "
             "gate/up copies (1.5625 MiB each) for the M5/M10 MTP verify.",
             shared_tagged,
+        )
+    if gdn_batch and fused_gdn_inputs:
+        logger.info_once(
+            "SX_OPT_MTP_GDN_INPUT_BATCH: %d GDN layers will carry packed "
+            "QKVZ/b/a copies (20.16 MiB each) for the M5/M10 MTP verify.",
+            fused_gdn_inputs,
         )
 
 
