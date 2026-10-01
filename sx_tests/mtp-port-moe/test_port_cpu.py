@@ -10,7 +10,8 @@ skip; ``--noconftest`` keeps tests/conftest.py, which imports vLLM, out):
 
     PYTHONPATH=sx_tests/mtp-port-moe python -m pytest -q --noconftest \\
         -p port_boot \\
-        tests/quantization/test_sm70_nvfp4_grouped_decode_dispatch.py
+        tests/quantization/test_sm70_nvfp4_grouped_decode_dispatch.py \\
+        tests/kernels/moe/test_sm70_mtp_moe_fp16.py
 
 Inside the image (vLLM installed, the group's files bind-mounted) the real
 modules are used and the same commands work.
@@ -31,6 +32,20 @@ Asserted here, item 1 (grouped MTP5 experts, SX_OPT_MTP_MOE_GROUPED_MTP5):
   split, interleaved flag passed through) and the batch-reduce W2 on the
   layer-owned group metadata, writes the layer's output buffer and calls
   nothing else; W10 keeps the v2 grouped route.
+Item 2 (exact FP16 draft MoE projections, SX_OPT_MTP_MOE_FP16_EXACT):
+* arming: only the native-MTP lane drafter with the switch on and
+  VLLM_SM70_MTP_MOE_FP16_EXACT unset; an explicit "1"/"0" decides globally;
+* the native op runs for M1/M5 W13 and W2 with upstream's operand order, and
+  is refused (nothing launched) for M2/M10, any other tile, sorted
+  assignment, quantized/biased/blocked experts, BF16 compute, missing
+  weights, int64 ids, the legacy-config warmup,
+  VLLM_SM70_MTP_MOE_TUNED_CONFIG=0, batch invariance, a non-SM70 device or a
+  build without the op;
+* dispatch_fused_moe_kernel launches exactly one of native / Triton;
+* TritonExperts tries the native op first with the same operands and keeps
+  its Triton calls (W13 still without routing weights); the drafter arms
+  the op only under _is_sm70_qwen38_mtp_lane_contract (SX_OPT_MTP_LANE=0,
+  other methods, k > 7, TP2 and partial configs refuse).
 Expected: all pass.
 """
 
@@ -384,3 +399,244 @@ def test_apply_w10_keeps_v2_grouped(monkeypatch):
     assert not calls
     assert [name for name, _ in v2_calls] == ["w13_v2", "w2_v2"]
     assert v2_calls[0][1][9] == 4  # SX_OPT_MTP_MOE_GROUPED_SPLIT_SMALL
+
+
+# ----------------------------------------------------------------------------
+# item 2: exact FP16 draft MoE projections (SX_OPT_MTP_MOE_FP16_EXACT)
+fused_moe = MODULES["fused_moe"]
+FP16_EXACT_ENV = "VLLM_SM70_MTP_MOE_FP16_EXACT"
+TILE = dict(BLOCK_SIZE_M=2, BLOCK_SIZE_N=128, BLOCK_SIZE_K=64, GROUP_SIZE_M=1,
+            SPLIT_K=1, num_warps=4, num_stages=3)
+
+
+@pytest.fixture
+def draft_moe(monkeypatch):
+    """SM70 platform, a recording native op, nothing armed, envs unset."""
+    for name in (FP16_EXACT_ENV, "VLLM_BATCH_INVARIANT",
+                 "VLLM_SM70_MTP_MOE_TUNED_CONFIG"):
+        monkeypatch.delenv(name, raising=False)
+    getattr(envs, "disable_envs_cache", lambda: None)()
+    monkeypatch.setattr(fused_moe, "_SX_OPT_MTP_MOE_FP16_EXACT", True)
+    monkeypatch.setattr(fused_moe, "_sx_mtp_moe_fp16_exact_armed", False)
+    monkeypatch.setattr(fused_moe, "_force_sm70_mtp_moe_legacy_config", False)
+    monkeypatch.setattr(fused_moe, "current_platform",
+                        NS(is_device_capability=lambda cap, *a, **k: cap == 70))
+    calls = []
+    monkeypatch.setattr(torch.ops._C, "sm70_mtp_moe_fp16_out",
+                        lambda *args: calls.append(args), raising=False)
+    return calls
+
+
+def _meta(*shape, dtype=torch.float16):
+    return fake_cuda(torch.empty(*shape, device="meta", dtype=dtype))
+
+
+def draft_args(m: int, down: bool, **over):
+    """Positional/keyword arguments of sm70_mtp_moe_fp16_dispatch for the
+    drafter's TritonExperts call (naive block assignment)."""
+    n, k = (2560, 160) if down else (320, 2560)
+    args = dict(
+        A=_meta(m * 10 if down else m, k),
+        B=_meta(512, n, k),
+        C=_meta(m, 10, n),
+        A_scale=None,
+        B_scale=None,
+        B_zp=None,
+        topk_weights=_meta(m, 10, dtype=torch.float32),
+        sorted_token_ids=None,
+        expert_ids=_meta(m * 10, dtype=torch.int32),
+        num_tokens_post_padded=_meta(1, dtype=torch.int32),
+        mul_routed_weight=down,
+        top_k=1 if down else 10,
+        config=dict(TILE),
+        compute_type=fused_moe.tl.float16,
+        use_fp8_w8a8=False,
+        use_int8_w8a8=False,
+        use_int8_w8a16=False,
+        use_int4_w4a16=False,
+        block_shape=None,
+        B_bias=None,
+    )
+    args.update(over)
+    return args
+
+
+def test_fp16_exact_arm(monkeypatch, draft_moe):
+    assert fused_moe.arm_sm70_mtp_draft_moe_fp16(True)
+    assert not fused_moe.arm_sm70_mtp_draft_moe_fp16(False)  # not the lane
+    monkeypatch.setattr(fused_moe, "_SX_OPT_MTP_MOE_FP16_EXACT", False)
+    assert not fused_moe.arm_sm70_mtp_draft_moe_fp16(True)
+    monkeypatch.setattr(fused_moe, "_SX_OPT_MTP_MOE_FP16_EXACT", True)
+    for value in ("0", "1"):  # an explicit value decides globally
+        monkeypatch.setenv(FP16_EXACT_ENV, value)
+        assert not fused_moe.arm_sm70_mtp_draft_moe_fp16(True)
+
+
+@pytest.mark.parametrize("m", [1, 5])
+@pytest.mark.parametrize("down", [False, True])
+def test_fp16_exact_lane_admits_m1_m5(draft_moe, m, down):
+    args = draft_args(m, down)
+    assert not fused_moe.sm70_mtp_moe_fp16_dispatch(**args)  # not armed
+    assert not draft_moe
+    fused_moe.arm_sm70_mtp_draft_moe_fp16(True)
+    assert fused_moe.sm70_mtp_moe_fp16_dispatch(**args)
+    (call,) = draft_moe
+    assert call[0] is args["C"] and call[1] is args["A"] and call[2] is args["B"]
+    assert call[3] is args["expert_ids"] and call[4] is args["topk_weights"]
+    assert call[5] is args["num_tokens_post_padded"] and call[6] is down
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["m2", "m10", "tile_bm16", "tile_bk32", "tile_w8", "sorted", "fp8",
+     "int4", "a_scale", "bias", "block_shape", "bf16_compute", "no_weights",
+     "ids_int64", "legacy_config", "tuned_off", "batch_invariant", "platform",
+     "no_op"],
+)
+def test_fp16_exact_refusals(monkeypatch, draft_moe, case):
+    fused_moe.arm_sm70_mtp_draft_moe_fp16(True)
+    m, down, over = 5, False, {}
+    if case == "m2":
+        m = 2
+    elif case == "m10":
+        m = 10
+    elif case.startswith("tile_"):
+        key, value = {"tile_bm16": ("BLOCK_SIZE_M", 16),
+                      "tile_bk32": ("BLOCK_SIZE_K", 32),
+                      "tile_w8": ("num_warps", 8)}[case]
+        over["config"] = dict(TILE, **{key: value})
+    elif case == "sorted":
+        over["sorted_token_ids"] = _meta(64, dtype=torch.int32)
+    elif case == "fp8":
+        over["use_fp8_w8a8"] = True
+    elif case == "int4":
+        over["use_int4_w4a16"] = True
+    elif case == "a_scale":
+        over["A_scale"] = _meta(1, dtype=torch.float32)
+    elif case == "bias":
+        over["B_bias"] = _meta(512, 320)
+    elif case == "block_shape":
+        over["block_shape"] = [128, 128]
+    elif case == "bf16_compute":
+        over["compute_type"] = fused_moe.tl.bfloat16
+    elif case == "no_weights":
+        over["topk_weights"] = None
+    elif case == "ids_int64":
+        over["expert_ids"] = _meta(50, dtype=torch.int64)
+    elif case == "legacy_config":
+        monkeypatch.setattr(fused_moe, "_force_sm70_mtp_moe_legacy_config", True)
+    elif case == "tuned_off":
+        monkeypatch.setenv("VLLM_SM70_MTP_MOE_TUNED_CONFIG", "0")
+    elif case == "batch_invariant":
+        monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    elif case == "platform":
+        monkeypatch.setattr(fused_moe, "current_platform",
+                            NS(is_device_capability=lambda cap, *a, **k: False))
+    else:
+        monkeypatch.delattr(torch.ops._C, "sm70_mtp_moe_fp16_out")
+    getattr(envs, "disable_envs_cache", lambda: None)()
+    args = draft_args(m, down, **over)
+    assert not fused_moe.sm70_mtp_moe_fp16_dispatch(**args)
+    assert not draft_moe
+
+
+@pytest.mark.parametrize("value,expected", [("1", True), ("0", False)])
+def test_fp16_exact_explicit_env_is_global(monkeypatch, draft_moe, value, expected):
+    monkeypatch.setenv(FP16_EXACT_ENV, value)
+    getattr(envs, "disable_envs_cache", lambda: None)()
+    fused_moe.arm_sm70_mtp_draft_moe_fp16(True)  # the lane does not override
+    assert fused_moe.sm70_mtp_moe_fp16_dispatch(**draft_args(1, False)) is expected
+
+
+def test_fp16_exact_dispatch_fused_moe_kernel(monkeypatch, draft_moe):
+    triton_calls = []
+    monkeypatch.setattr(fused_moe, "invoke_fused_moe_triton_kernel",
+                        lambda *a, **k: triton_calls.append(a))
+    fused_moe.arm_sm70_mtp_draft_moe_fp16(True)
+    for m, expected in ((1, 1), (5, 1), (2, 0)):
+        draft_moe.clear()
+        triton_calls.clear()
+        args = draft_args(m, True)
+        fused_moe.dispatch_fused_moe_kernel(**args, per_channel_quant=False)
+        assert len(draft_moe) == expected and len(triton_calls) == 1 - expected
+
+
+def _function(path: str, name: str, cls: str | None = None):
+    import ast
+
+    tree = ast.parse(open(os.path.join(port_boot.REPO, path), encoding="utf-8").read())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{path}: {name} not found")
+
+
+@pytest.mark.parametrize("fn,weights_arg", [("_base_w13_fn", None),
+                                            ("_base_w2_fn", "topk_weights")])
+def test_triton_experts_try_native_first(fn, weights_arg):
+    """TritonExperts (upstream 6bcffbb79): the exact dispatch is tried first
+    with the routing weights; the unchanged Triton call follows it, W13 still
+    without routing weights."""
+    import ast
+
+    node = _function("vllm/model_executor/layers/fused_moe/experts/triton_moe.py", fn)
+    first, second = node.body[0], node.body[1]
+    assert isinstance(first, ast.If)
+    assert first.test.func.id == "sm70_mtp_moe_fp16_dispatch"
+    assert first.test.args[6].id == "topk_weights"
+    assert isinstance(first.body[0], ast.Return) and not first.orelse
+    assert second.value.func.id == "invoke_fused_moe_triton_kernel"
+    arg = second.value.args[5]
+    if weights_arg is None:
+        assert isinstance(arg, ast.Constant) and arg.value is None
+    else:
+        assert arg.id == weights_arg
+    # Same operands for both calls (A, B, C, scales; assignment metadata).
+    native, triton = first.test.args, second.value.args
+    assert [ast.unparse(a) for a in native[:5]] == [ast.unparse(a) for a in triton[:5]]
+    assert [ast.unparse(a) for a in native[7:12]] == [
+        ast.unparse(a) for a in triton[6:11]
+    ]
+
+
+def test_mtp_draft_arms_fp16_exact_in_lane_only():
+    import ast
+
+    node = _function("vllm/models/qwen4_exp/nvidia/mtp.py", "_sx_prepare_mtp_draft_sm70")
+    calls = [ast.unparse(n) for n in ast.walk(node) if isinstance(n, ast.Call)]
+    assert "arm_sm70_mtp_draft_moe_fp16(_sx_mtp_lane_contract(vllm_config))" in calls
+    source = ast.unparse(_function("vllm/models/qwen4_exp/nvidia/mtp.py",
+                                   "_sx_mtp_lane_contract"))
+    namespace: dict = {}
+    exec(source, namespace)  # noqa: S102
+    lane = namespace["_sx_mtp_lane_contract"]
+    torch_fp16 = torch.float16
+    text = NS(hidden_size=2560, num_hidden_layers=48, num_experts=512,
+              num_experts_per_tok=10, moe_intermediate_size=640, hc_count=4,
+              hc_lowrank=320, num_attention_heads=24, num_key_value_heads=2,
+              indexer_head_dim=128, indexer_budget=2048, indexer_compress_ratio=4)
+    target = NS(hf_text_config=text, architectures=["Qwen4ExpForCausalLM"],
+                multimodal_config=None, dtype=torch_fp16)
+    parallel = NS(tensor_parallel_size=4, pipeline_parallel_size=1)
+
+    def spec(method="mtp", k=4):
+        return NS(method=method, num_speculative_tokens=k,
+                  use_qwen4_exp_mtp=lambda: True,
+                  num_speculative_state_tokens=lambda: k,
+                  parallel_drafting=False, rejection_sample_method="standard",
+                  target_model_config=target)
+
+    assert lane(NS(model_config=target, speculative_config=spec(),
+                   parallel_config=parallel))
+    assert not lane(NS(model_config=target, speculative_config=spec("eagle"),
+                       parallel_config=parallel))
+    assert not lane(NS(model_config=target, speculative_config=spec(k=8),
+                       parallel_config=parallel))
+    assert not lane(NS(model_config=target, speculative_config=spec(),
+                       parallel_config=NS(tensor_parallel_size=2,
+                                          pipeline_parallel_size=1)))
+    assert not lane(NS())  # partial config fails closed
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("SX_OPT_MTP_LANE", "0")
+        assert not lane(NS(model_config=target, speculative_config=spec(),
+                           parallel_config=parallel))
