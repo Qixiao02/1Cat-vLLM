@@ -401,6 +401,26 @@ def _sm70_rmsnorm_gated_exact_available() -> bool:
     return hasattr(torch.ops._C, "sm70_rmsnorm_gated_exact_out")
 
 
+# SX MTP port of upstream main@d30469863 (single-request MTP4 work). The
+# native-MTP lane (_is_sm70_qwen38_mtp_lane_contract) receives these upstream
+# switches as defaults; each item has its own switch (read when the lane
+# defaults are applied; default on, "0" = previous MTP-lane behaviour) and an
+# explicit value of the upstream variable always wins:
+#   SX_OPT_MTP_RMSNORM_GATED_EXACT  VLLM_SM70_RMSNORM_GATED_EXACT=1. Upstream
+#       auto-enables the exact native gated RMSNorm only without MTP, but its
+#       qualified MTP4 runs set it (36-layer M5 norm chain 0.899 -> 0.069 ms,
+#       sm70_flash_next_mtp4_batch_gdn.md). The op takes any row count, so the
+#       FULL verify graphs, PW-1 mixed/prefill graphs and eager steps all use
+#       it; the MTP drafter has no GDN layer. Needs a _C that carries the op.
+def _sx_mtp_lane_port_defaults() -> dict[str, str]:
+    defaults: dict[str, str] = {}
+    if _sx_env_on("SX_OPT_MTP_RMSNORM_GATED_EXACT") and (
+        _sm70_rmsnorm_gated_exact_available()
+    ):
+        defaults["VLLM_SM70_RMSNORM_GATED_EXACT"] = "1"
+    return defaults
+
+
 def _apply_sm70_qwen38_nomtp_defaults(
     cfg: "VllmConfig", *, is_sm70: bool
 ) -> tuple[str, ...]:
@@ -425,6 +445,8 @@ def _apply_sm70_qwen38_nomtp_defaults(
         # MTP lane only (the lane contract admitted it): exact verify widths
         # for the target and exact request counts for the draft decode.
         defaults["VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS"] = "1"
+        # SX MTP port of upstream d30469863 (see _sx_mtp_lane_port_defaults).
+        defaults.update(_sx_mtp_lane_port_defaults())
     elif _sm70_rmsnorm_gated_exact_available():
         # Upstream 1Cat #704: pin the native FP32 gated-norm arithmetic across
         # independently compiled C1/batch graphs. Tiny fusion-dependent

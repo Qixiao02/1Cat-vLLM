@@ -16,9 +16,12 @@ Asserts:
     rejection, parallel drafting, TP2/PP2/other shapes, SX_OPT_MTP_LANE=0,
     and the legacy SimpleNamespace(method="mtp") fixtures of older tests.
   * _apply_sm70_qwen38_nomtp_defaults: no-MTP lane unchanged (5 defaults, no
-    split flag); MTP lane gets the same 5 + VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS,
-    explicit overrides win, unqualified deployments and SX_OPT_MTP_LANE=0
-    get nothing.
+    split flag); MTP lane gets the same 5 + VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS
+    + the upstream d30469863 port defaults (PORT_KEYS, each only when the
+    loaded _C carries its op and its SX_OPT_MTP_* switch is on), explicit
+    overrides win, unqualified deployments and SX_OPT_MTP_LANE=0 get nothing.
+    The _C capability probes are pinned (absent by default) so the expected
+    lists do not depend on the image's _C.
   * MTP-K5 verify widths B*(k+1) for k in 1..4 and max_num_seqs 1..64,
     SX_OPT_MTP_GRAPH_MAX_REQS / SX_OPT_MTP_GRAPH_REQS, the untouched legacy
     helper (cap 16 for other models), and the auto-list override decision
@@ -72,6 +75,11 @@ DEFAULT_KEYS = (
     "VLLM_SM70_MOE_ADD_ALLREDUCE",
 )
 SPLIT_KEY = "VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS"
+# MTP-lane defaults of the upstream d30469863 port (_sx_mtp_lane_port_defaults)
+# and the _C capability probe each one needs.
+PORT_KEYS = ("VLLM_SM70_RMSNORM_GATED_EXACT",)
+PORT_PROBES = ("_sm70_rmsnorm_gated_exact_available",)
+PORT_SWITCHES = ("SX_OPT_MTP_RMSNORM_GATED_EXACT",)
 SX_KEYS = (
     "SX_OPT_MTP_LANE",
     "SX_OPT_MTP_ROWS",
@@ -82,6 +90,7 @@ SX_KEYS = (
     "SX_OPT_PIECEWISE_MIXED",
     "SX_OPT_PIECEWISE_MAX_TOKENS",
     "SX_OPT_PIECEWISE_SIZES",
+    *PORT_SWITCHES,
 )
 
 
@@ -108,6 +117,8 @@ def sx_env(**values):
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     monkeypatch.setattr(cfg_mod, "_sx_piecewise_platform_ok", lambda: True)
+    for probe in PORT_PROBES:
+        monkeypatch.setattr(cfg_mod, probe, lambda: False)
     saved_installed = dg.sm70_mtp_lane_installed()
     with sx_env(
         **{key: None for key in SX_KEYS},
@@ -266,13 +277,16 @@ def test_lane_contract_union():
 # auto defaults
 # ----------------------------------------------------------------------------
 def test_defaults_nomtp_unchanged():
-    with sx_env(**{key: None for key in (*DEFAULT_KEYS, SPLIT_KEY)}):
+    with sx_env(**{key: None for key in (*DEFAULT_KEYS, SPLIT_KEY, *PORT_KEYS)}):
         applied = cfg_mod._apply_sm70_qwen38_nomtp_defaults(
             serving_config(), is_sm70=True
         )
         assert applied == DEFAULT_KEYS
         assert SPLIT_KEY not in os.environ
-    with sx_env(**{key: None for key in (*DEFAULT_KEYS, SPLIT_KEY)}, SX_OPT_MTP_LANE="0"):
+    with sx_env(
+        **{key: None for key in (*DEFAULT_KEYS, SPLIT_KEY, *PORT_KEYS)},
+        SX_OPT_MTP_LANE="0",
+    ):
         applied = cfg_mod._apply_sm70_qwen38_nomtp_defaults(
             serving_config(), is_sm70=True
         )
@@ -281,7 +295,7 @@ def test_defaults_nomtp_unchanged():
 
 @pytest.mark.parametrize("k", K_VALUES)
 def test_defaults_mtp_lane(k):
-    with sx_env(**{key: None for key in (*DEFAULT_KEYS, SPLIT_KEY)}):
+    with sx_env(**{key: None for key in (*DEFAULT_KEYS, SPLIT_KEY, *PORT_KEYS)}):
         applied = cfg_mod._apply_sm70_qwen38_nomtp_defaults(
             serving_config(mtp_spec(k=k)), is_sm70=True
         )
@@ -339,6 +353,38 @@ def test_defaults_mtp_quantization_rejected():
     cfg.model_config.quantization = "awq"
     with sx_env(**{key: None for key in (*DEFAULT_KEYS, SPLIT_KEY)}):
         assert cfg_mod._apply_sm70_qwen38_nomtp_defaults(cfg, is_sm70=True) == ()
+
+
+@pytest.mark.parametrize("k", K_VALUES)
+def test_defaults_mtp_lane_port(monkeypatch, k):
+    """Upstream d30469863 port: lane-only defaults, own switches, _C probes."""
+    for probe in PORT_PROBES:
+        monkeypatch.setattr(cfg_mod, probe, lambda: True)
+    keys = (*DEFAULT_KEYS, SPLIT_KEY, *PORT_KEYS)
+    with sx_env(**{key: None for key in keys}):
+        applied = cfg_mod._apply_sm70_qwen38_nomtp_defaults(
+            serving_config(mtp_spec(k=k)), is_sm70=True
+        )
+        assert applied == (*DEFAULT_KEYS, SPLIT_KEY, *PORT_KEYS)
+        assert all(os.environ[key] == "1" for key in PORT_KEYS)
+    for key, switch in zip(PORT_KEYS, PORT_SWITCHES, strict=True):
+        with sx_env(**{key: None for key in keys}, **{switch: "0"}):
+            applied = cfg_mod._apply_sm70_qwen38_nomtp_defaults(
+                serving_config(mtp_spec(k=k)), is_sm70=True
+            )
+            assert key not in applied and key not in os.environ
+        with sx_env(**{**{name: None for name in keys}, key: "0"}):
+            applied = cfg_mod._apply_sm70_qwen38_nomtp_defaults(
+                serving_config(mtp_spec(k=k)), is_sm70=True
+            )
+            assert key not in applied and os.environ[key] == "0"
+    # The no-MTP lane keeps exactly its previous list: the exact gated norm
+    # (already a no-MTP default when _C has it) and nothing else of the port.
+    with sx_env(**{key: None for key in keys}):
+        applied = cfg_mod._apply_sm70_qwen38_nomtp_defaults(
+            serving_config(), is_sm70=True
+        )
+        assert applied == (*DEFAULT_KEYS, "VLLM_SM70_RMSNORM_GATED_EXACT")
 
 
 # ----------------------------------------------------------------------------
