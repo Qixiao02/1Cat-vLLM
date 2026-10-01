@@ -29,6 +29,10 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.expert_map_manager import (
     ExpertMapManager,
 )
+from vllm.model_executor.layers.fused_moe.expert_mapping_index import (
+    get_expert_mapping_index,
+    moe_load_index_enabled,
+)
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
@@ -1150,9 +1154,24 @@ class FusedMoE(PluggableLayer):
                 "`self.expert_mapping` must be provided to "
                 "load weights using `self.load_weights`."
             )
+        # SX_OPT_MOE_LOAD_INDEX (default on, "0" = the plain scan below): look
+        # the entries up through a token index instead of testing every one of
+        # the 512 x 3 mapping entries against every tensor name. The index
+        # returns exactly the entries the scan would process, in mapping
+        # order, or the whole mapping when none matches, so the loop body and
+        # its substring test are unchanged. See expert_mapping_index.py.
+        index = (
+            get_expert_mapping_index(self, expert_mapping)
+            if moe_load_index_enabled()
+            else None
+        )
         for expert_name, loaded_weight in weights:
             qual_name = f"{self.layer_name}.{expert_name}"
-            for param_name, weight_name, expert_id, shard_id in expert_mapping:
+            for param_name, weight_name, expert_id, shard_id in (
+                expert_mapping
+                if index is None
+                else index.matches(qual_name, expert_mapping)
+            ):
                 if weight_name not in qual_name:
                     continue
                 weight_name = qual_name.replace(weight_name, param_name)
