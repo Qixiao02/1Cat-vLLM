@@ -42,9 +42,14 @@ entry at all, which the Qwen4Exp loading path does not produce.
 
 The mapping is treated as immutable once assigned: ``FusedMoE`` stores it in
 its constructor or the model assigns it once before loading, and nothing in the
-tree appends to or edits a mapping that a layer already holds. The cached
-index is dropped when ``self.expert_mapping`` is rebound to another object or
-its length changes.
+tree appends to or edits a mapping that a layer already holds (the one
+``.extend()`` on a mapping, in the Transformers backend, runs on a local list
+before it is handed to the layer). The cached index is dropped when
+``self.expert_mapping`` is rebound to another object or its length changes
+between two ``load_weights`` calls; an edit made while a ``load_weights``
+generator is running is not seen by that generator (the original loop would
+see it). The index costs about 0.45 MiB of host memory per layer for 512
+experts.
 """
 
 from __future__ import annotations

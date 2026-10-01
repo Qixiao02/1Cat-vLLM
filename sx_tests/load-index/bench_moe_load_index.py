@@ -127,7 +127,8 @@ def main() -> None:
     for label, old_us, new_us in rows:
         print(f"  {label:45s} old {old_us:8.2f}   new {new_us:7.2f}   x{old_us / new_us:7.1f}")
     old_us, new_us = rows[0][1], rows[0][2]
-    print(f"  total for {len(quals)} names: old ~{old_us * len(quals) / 1e6:.1f} s (extrapolated), "
+    how = "measured" if n_old >= len(quals) else "extrapolated"
+    print(f"  total for {len(quals)} names: old {old_us * len(quals) / 1e6:.1f} s ({how}), "
           f"new {new_us * len(quals) / 1e6:.2f} s")
 
     # The whole generator, no-op weight_loader, tiny tensors.
@@ -150,8 +151,9 @@ def main() -> None:
     off_us, on_us = t_off / n_old * 1e6, t_on_all / len(weights) * 1e6
     print(f"\ngenerator (no-op weight_loader), us per tensor  [off: first {n_old}; on: {len(weights)}]")
     print(f"  switch off {off_us:8.2f}   switch on {on_us:7.2f}   x{off_us / on_us:6.1f}")
-    print(f"  total for {len(weights)} tensors: off ~{off_us * len(weights) / 1e6:.1f} s "
-          f"(extrapolated), on {on_us * len(weights) / 1e6:.2f} s")
+    how = "measured" if n_old >= len(weights) else "extrapolated"
+    print(f"  total for {len(weights)} tensors: off {off_us * len(weights) / 1e6:.1f} s "
+          f"({how}), on {on_us * len(weights) / 1e6:.2f} s")
 
 
 if __name__ == "__main__":
