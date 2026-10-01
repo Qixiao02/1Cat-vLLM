@@ -654,6 +654,77 @@ def test_generator_partial_progress_before_a_bad_entry_matches(monkeypatch) -> N
     assert logs[0] == logs[1] == logs[2] and logs[0]
 
 
+# ------------------------------------------- a real nn.Module (repo test case)
+
+
+def _fused_experts_module(layer_name: str = "model.layers.0.mlp.experts"):
+    """tests/models/qwen4_exp/test_weight_loading.py::
+    test_fused_mtp_expert_checkpoint_loads_every_expert, with the cut-out
+    FusedMoE.load_weights / make_expert_params_mapping."""
+    import torch.nn as nn
+
+    class FakeFusedExperts(nn.Module):
+        load_weights = load_weights_new
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.layer_name = layer_name
+            self.w13_weight = nn.Parameter(torch.empty(1))
+            self.w2_weight = nn.Parameter(torch.empty(1))
+            self.calls: list = []
+            self.expert_mapping = make_mapping(self, "gate_proj", "down_proj",
+                                               "up_proj", 2, 0, True)
+
+        def weight_loader(self, *, param, loaded_weight, weight_name, shard_id,
+                          expert_id, return_success):
+            assert return_success
+            param_name = "w13" if param is self.w13_weight else "w2"
+            self.calls.append((param_name, shard_id, expert_id, loaded_weight.clone()))
+            return True
+
+    return FakeFusedExperts()
+
+
+@pytest.mark.parametrize("env", ["1", "0"])
+def test_repo_case_fused_mtp_checkpoint_on_a_real_module(monkeypatch, env) -> None:
+    monkeypatch.setenv(ENV, env)
+    experts = _fused_experts_module()
+    gate_up = torch.arange(2 * 6 * 2).reshape(2, 6, 2)
+    down = torch.arange(2 * 2 * 3).reshape(2, 2, 3)
+    loaded = list(experts.load_weights([("gate_up_proj", gate_up), ("down_proj", down)]))
+    assert loaded == ["w13_weight"] * 4 + ["w2_weight"] * 2
+    assert [(n, s, e) for n, s, e, _ in experts.calls] == [
+        ("w13", "w1", 0), ("w13", "w1", 1), ("w13", "w3", 0), ("w13", "w3", 1),
+        ("w2", "w2", 0), ("w2", "w2", 1),
+    ]
+    torch.testing.assert_close(experts.calls[0][3], gate_up[0, :3])
+    torch.testing.assert_close(experts.calls[3][3], gate_up[1, 3:])
+    torch.testing.assert_close(experts.calls[5][3], down[1])
+    if env == "1":  # the index was built on the module and survives a deepcopy
+        import copy
+
+        assert experts.expert_mapping and experts._sx_expert_mapping_index[2] is not None
+        clone = copy.deepcopy(experts)
+        cached = clone._sx_expert_mapping_index
+        assert cached[0] is clone.expert_mapping and cached[0] is not experts.expert_mapping
+        assert list(clone.load_weights([("down_proj", down)])) == ["w2_weight"] * 2
+        assert clone._sx_expert_mapping_index is cached  # reused, not rebuilt
+
+
+def test_mapping_of_the_repo_test_is_what_the_helper_builds() -> None:
+    assert build_mapping("gate", 2, 0, True) == [
+        ("experts.w13_weight", "experts.gate_up_proj", 0, "w1"),
+        ("experts.w13_weight", "experts.gate_up_proj", 1, "w3"),
+        ("experts.w2_weight", "experts.down_proj", 0, "w2"),
+        ("experts.w13_", "experts.0.gate_proj.", 0, "w1"),
+        ("experts.w2_", "experts.0.down_proj.", 0, "w2"),
+        ("experts.w13_", "experts.0.up_proj.", 0, "w3"),
+        ("experts.w13_", "experts.1.gate_proj.", 1, "w1"),
+        ("experts.w2_", "experts.1.down_proj.", 1, "w2"),
+        ("experts.w13_", "experts.1.up_proj.", 1, "w3"),
+    ]
+
+
 # ---------------------------------------------------------------- speed
 
 
