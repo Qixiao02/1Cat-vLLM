@@ -324,7 +324,7 @@ V100 实测（4 条冷 prompt 同时发出，KV 占用峰值，见实测第 2 �
 
 - 脚本：[`sx_bench/as_run/arm_compose.py`](sx_bench/as_run/arm_compose.py)（两边的完整启动参数和环境变量）、[`run_all.sh`](sx_bench/as_run/run_all.sh)、[`mtp_bench.py`](sx_bench/as_run/mtp_bench.py)。原始结果在 [`sx_bench/results/2026-10-01-fork-vs-official-best/`](sx_bench/results/2026-10-01-fork-vs-official-best/)。
 - 并发扫描用贪心（temperature 0），长输入用服务端默认的采样参数，都固定生成指定数量的 token（`ignore_eos`），不思考。
-- 两边各自重启后测，第一条请求前先预热。官方默认关闭编译缓存，每次启动都重新编译。
+- 两边各自重启后测，第一条请求前先预热。两边的引擎都会自动关闭 torch.compile 缓存（官方说明是复用缓存会让贪心输出的 token 漂移），所以每次启动都重新编译。
 - 官方开的 MTP 开关：`VLLM_SM70_QWEN38_GDN_INPUT_BATCH`、`VLLM_SM70_NVFP4_MOE_GROUPED_MTP5`、`VLLM_SM70_RMSNORM_GATED_EXACT`、`VLLM_SM70_MTP_MOE_FP16_EXACT`、`VLLM_SM70_MTP_HC_BATCH`、`VLLM_SM70_MTP_HC_COOPERATIVE`、`VLLM_SM70_MTP_ROUTER_BATCH`、`VLLM_SM70_FUSED_SIGMOID_MIXED_QKV`、`VLLM_SM70_MTP_HC_FULL_UNROLL`、`VLLM_SM70_QSA_MTP_TOPK`、`VLLM_SM70_MTP_ROUTER_TOP16`、`VLLM_SM70_MTP_SHARED_BATCH`、`VLLM_SM70_MTP_PLE_CONV`，都设为 `1`。
 - 输出对照：长文里找 8 个验证码（8.7K、34K、68K token）加 4 道短题，贪心。不开 MTP 的 4 种配置（本分支和官方，各自开、关前缀缓存）答案逐字相同：验证码 24/24，短题 3/4。
 - 相邻两个 token 的间隔（4 条长 prompt 同时到达）：最长间隔本分支 1.2–1.5 秒，官方 1.4–3.1 秒，官方开前缀缓存 0.6–1.0 秒；中位数本分支 16–18 ms，官方 20–21 ms。
