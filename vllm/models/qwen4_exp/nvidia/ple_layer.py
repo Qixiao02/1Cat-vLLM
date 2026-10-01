@@ -80,6 +80,7 @@ from ..common.ple import (
     plan_ple_placement,
     total_host_bytes,
 )
+from .exact_pin import allocate_host_table
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -796,11 +797,13 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             dtype=self._meta_weight_dtype,
             device=device,
         )
-        host_storage = torch.empty(
+        # SX_OPT_PLE_EXACT_PIN (default "1"): page-lock exactly these bytes
+        # instead of letting the caching host allocator round the block up to
+        # the next power of two (11.92 GiB -> 16 GiB pinned per rank). "0" and
+        # any failure of the exact path use torch.empty(pin_memory=True).
+        host_storage = allocate_host_table(
             (placement.host_rows, self.embedding_dim),
-            dtype=self._meta_weight_dtype,
-            device="cpu",
-            pin_memory=placement.host_rows > 0,
+            self._meta_weight_dtype,
         )
         # Publish only a complete allocation so a host allocation failure
         # cannot leave the idempotent path pointing at a half-built table.
