@@ -5,8 +5,9 @@ Run (CPU is enough, no vLLM install needed; see ``port_boot.py``):
 
     python -m pytest -q sx_tests/mtp-port-moe/test_port_cpu.py
 
-The same stubs run the ported upstream CPU tests unchanged (their GPU cases
-skip; ``--noconftest`` keeps tests/conftest.py, which imports vLLM, out):
+The same stubs run the ported upstream tests (CPU cases; their GPU cases
+skip) and the fork's router32 CPU tests (``--noconftest`` keeps
+tests/conftest.py, which imports vLLM, out):
 
     PYTHONPATH=sx_tests/mtp-port-moe python -m pytest -q --noconftest \\
         -p port_boot \\
@@ -15,8 +16,8 @@ skip; ``--noconftest`` keeps tests/conftest.py, which imports vLLM, out):
         tests/kernels/moe/test_sm70_router_key_dispatch.py \\
         sx_tests/moe-router/test_router32.py
 
-Inside the image (vLLM installed, the group's files bind-mounted) the real
-modules are used and the same commands work.
+Inside the image (vLLM installed) the real modules are used and the same
+commands work; the GPU cases of those files then run as well.
 
 Asserted here, item 1 (grouped MTP5 experts, SX_OPT_MTP_MOE_GROUPED_MTP5):
 * load-time admission: only lane layers built for k = 4 whose W5 verify is
@@ -251,6 +252,29 @@ def test_grouped_mtp5_dispatch_verify_only():
         xw, idw = xi(width)
         with forward_context(verify_metadata(qsl(width, 5), width, 5)):
             assert not moe._use_grouped_mtp5(layer, xw, idw), width
+
+
+def test_grouped_mtp5_explicit_qpn_mtp5_env_is_shape_only(monkeypatch):
+    """With VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE=1 set explicitly the
+    QPN-MTP5 admission, and so the grouped route behind it, is shape-only
+    (as upstream): five tokens in a mixed or context-free forward take it
+    too. Row-wise bit-equal to the QPN-MTP5 route they already take there.
+    The lane default (variable absent) needs a uniform verify forward."""
+    x, ids = xi(5)
+    layer = lane_layer()
+    with forward_context(verify_metadata(qsl(10, 5), 10, 5, prefills=1)):
+        assert not moe._use_grouped_mtp5(layer, x, ids)  # lane default
+    assert not moe._use_grouped_mtp5(layer, x, ids)
+    monkeypatch.setenv(MTP5_ENV, "1")
+    envs.disable_envs_cache()
+    layer.sx_mtp_qpn_mtp5 = False  # not stamped when the variable is set
+    with forward_context(verify_metadata(qsl(10, 5), 10, 5, prefills=1)):
+        assert moe._use_grouped_mtp5(layer, x, ids)
+    assert moe._use_grouped_mtp5(layer, x, ids)
+    assert moe._use_grouped_mtp5(nomtp_layer(sm70_nvfp4_grouped_mtp5=True), x, ids)
+    for width in (4, 6, 10):
+        xw, idw = xi(width)
+        assert not moe._use_grouped_mtp5(layer, xw, idw)
 
 
 def test_grouped_mtp5_tensor_contract():
@@ -545,7 +569,10 @@ def test_fp16_exact_refusals(monkeypatch, draft_moe, case):
         monkeypatch.setattr(fused_moe, "current_platform",
                             NS(is_device_capability=lambda cap, *a, **k: False))
     else:
-        monkeypatch.delattr(torch.ops._C, "sm70_mtp_moe_fp16_out")
+        # A build without the op. delattr on torch.ops._C would not hide a
+        # registered op (the namespace resolves it again), so stub the
+        # namespace; nothing else in the dispatch reads torch.ops.
+        monkeypatch.setattr(torch, "ops", NS(_C=NS()))
     getattr(envs, "disable_envs_cache", lambda: None)()
     args = draft_args(m, down, **over)
     assert not fused_moe.sm70_mtp_moe_fp16_dispatch(**args)
@@ -614,7 +641,9 @@ def test_triton_experts_try_native_first(fn, weights_arg):
 def test_mtp_draft_arms_fp16_exact_in_lane_only():
     import ast
 
-    node = _function("vllm/models/qwen4_exp/nvidia/mtp.py", "_sx_prepare_mtp_draft_sm70")
+    node = _function(
+        "vllm/models/qwen4_exp/nvidia/mtp.py", "_sx_prepare_mtp_draft_sm70"
+    )
     calls = [ast.unparse(n) for n in ast.walk(node) if isinstance(n, ast.Call)]
     assert "arm_sm70_mtp_draft_moe_fp16(_sx_mtp_lane_contract(vllm_config))" in calls
     source = ast.unparse(_function("vllm/models/qwen4_exp/nvidia/mtp.py",

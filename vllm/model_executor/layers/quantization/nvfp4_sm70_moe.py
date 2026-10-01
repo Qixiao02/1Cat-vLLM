@@ -118,8 +118,8 @@ SX_OPT_MTP_MOE_ROUTES / SX_OPT_MTP_LANE as batch 3a above):
 
 SX_OPT_MTP_MOE_GROUPED_MTP5 (default "1"), upstream 45248dc8d
     (VLLM_SM70_NVFP4_MOE_GROUPED_MTP5): lane layers with k = 4 whose W5
-    verify takes the QPN-MTP5 route (SX_OPT_MTP_MOE_DIRECT) run exactly five
-    verify rows, in a uniform verify forward only, through the legacy
+    verify takes the QPN-MTP5 route (SX_OPT_MTP_MOE_DIRECT) run exactly those
+    five rows through the legacy
     grouped W13 at the MTP5 split 4 and the grouped W2 with the fused,
     ordered FP32 weighted reduce (nvfp4_grouped_w2_batch_reduce_sm70_out:
     FP16 W2 outputs kept in CTA shared memory, one launch, no routed
@@ -130,11 +130,16 @@ SX_OPT_MTP_MOE_GROUPED_MTP5 (default "1"), upstream 45248dc8d
     captured routes); routes that pick the same expert share its weight
     loads. W10 and wider keep their routes (grouped v2 from
     SX_OPT_MTP_MOE_GROUPED_MIN_TOKENS); upstream screens this op for
-    M5/M8/M16 but admits only W5. Needs a rebuilt vllm._C (the sidecar does
-    not carry the op); without it the lane logs a warning and keeps the
-    QPN-MTP5 route. An explicitly set VLLM_SM70_NVFP4_MOE_GROUPED_MTP5 keeps
-    upstream's global meaning (shape-only W5 admission together with
-    VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE=1 or the lane's MTP5 default;
+    M5/M8/M16 but admits only W5. The route is taken exactly where the
+    QPN-MTP5 route is (_use_qwen38_qpn_mtp5_decode): with the lane's MTP5
+    default (VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE absent) in a
+    uniform verify forward only; with that variable set to 1 explicitly the
+    admission is shape-only, as before this port, so five-token prefill or
+    mixed forwards take it too (row-wise bit-equal to the QPN-MTP5 route they
+    took). Needs a rebuilt vllm._C (the sidecar does not carry the op);
+    without it the lane logs a warning and keeps the QPN-MTP5 route. An
+    explicitly set VLLM_SM70_NVFP4_MOE_GROUPED_MTP5 keeps upstream's global
+    meaning (it also needs the QPN-MTP5 route, from either source above, and
     a missing op raises); the lane default only applies when it is absent.
 """
 
@@ -1191,7 +1196,12 @@ def _use_qwen38_qpn_mtp5_decode(
 
 
 def _use_grouped_mtp5(layer, x: torch.Tensor, topk_ids: torch.Tensor) -> bool:
-    """Keep MTP's admitted split4 arithmetic while sharing expert weights."""
+    """Keep MTP's admitted split4 arithmetic while sharing expert weights.
+
+    Exactly the QPN-MTP5 admission of _use_qwen38_qpn_mtp5_decode: a uniform
+    verify forward with the lane's MTP5 default, shape-only when
+    VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE=1 is set explicitly.
+    """
     return bool(
         getattr(layer, "sm70_nvfp4_grouped_mtp5", False)
         and x.shape[0] == 5  # cheap pre-check; the MTP5 admission is exact

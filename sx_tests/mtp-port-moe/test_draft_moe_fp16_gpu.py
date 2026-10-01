@@ -23,7 +23,8 @@ Asserts:
     when armed and never when not armed; the whole MoE output is bitwise
     equal to the Triton projections over changing activations (six scales),
     routes and an invalid expert id, also under CUDA-graph replay;
-  * every other draft width (2, 3, 4, 8, 10, 15, 20, 40) never calls it;
+  * every other draft width (2, 3, 4, 8, 10, 15, 20, 40) never calls it
+    (valid expert ids only there: widths above 12 use moe_align_block_size);
   * an explicit VLLM_SM70_MTP_MOE_FP16_EXACT=0 keeps the lane off it.
 Prints (-s, -k bench): one draft round's MoE (M5 + 3 x M1) in a CUDA graph,
 Triton vs native.
@@ -114,12 +115,22 @@ def hits(monkeypatch):
     return calls
 
 
-def _inputs(m: int, seed: int, scale: float):
+def _inputs(m: int, seed: int, scale: float, invalid: bool = False):
+    """Activations, routing weights and expert ids of one draft call.
+
+    ``invalid`` puts an invalid expert id (-1; the native kernel and Triton
+    both write zeros for it) into the routes. Only for M <= 12 (naive block
+    assignment, M * 10 * 4 <= 512): wider calls go through
+    moe_align_block_size, which does not accept ids outside [0, E) and would
+    write out of bounds.
+    """
+    assert not invalid or m * 10 * 4 <= 512, m
     x = C.make_hidden(m, seed, scale=1.0)
     x = x * scale if scale else torch.zeros_like(x)
     weights, ids = C.make_routing(m, seed)
     ids = ids.to(torch.int32).contiguous()
-    ids.view(-1)[0] = -1  # invalid expert slot (writes zeros, as Triton)
+    if invalid:
+        ids.view(-1)[0] = -1
     return x.contiguous(), weights.float().contiguous(), ids
 
 
@@ -132,7 +143,7 @@ def _bits(t):
 def test_fused_experts_m1_m5_bitwise(experts, hits, m):
     w1, w2 = experts
     for trial, scale in enumerate(SCALES):
-        x, weights, ids = _inputs(m, 100 + trial, scale)
+        x, weights, ids = _inputs(m, 100 + trial, scale, invalid=True)
         with lane(False):
             hits.clear()
             ref = C.run_moe(x, w1, w2, weights, ids)
@@ -223,7 +234,7 @@ def test_modular_experts_lane_graph(experts, hits, m):
 @torch.inference_mode()
 def test_other_draft_widths_keep_triton(experts, hits, m):
     w1, w2 = experts
-    x, weights, ids = _inputs(m, 300 + m, 1.0)
+    x, weights, ids = _inputs(m, 300 + m, 1.0)  # valid ids: M15+ is sorted
     with lane(True):
         C.run_moe(x, w1, w2, weights, ids)
     assert hits == []

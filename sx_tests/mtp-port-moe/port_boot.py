@@ -274,7 +274,9 @@ def install() -> dict[str, types.ModuleType]:
         f"{MOE_PKG}.router.fused_topk_router",
         os.path.join(moe_dir, "router", "fused_topk_router.py"),
     )
-    fused_moe = _load_file(f"{MOE_PKG}.fused_moe", os.path.join(moe_dir, "fused_moe.py"))
+    fused_moe = _load_file(
+        f"{MOE_PKG}.fused_moe", os.path.join(moe_dir, "fused_moe.py")
+    )
 
     _module(QUANT_PKG, permissive=True)
     _module(
