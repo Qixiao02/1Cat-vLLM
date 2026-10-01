@@ -243,6 +243,8 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER: bool = False
     VLLM_SM70_DFLASH2_VERIFY_FASTPATH: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_METADATA: bool = False
+    VLLM_SM70_MTP4_SHARED_GDN_METADATA: bool = True
+    VLLM_SM70_MTP4_FUSED_GDN_METADATA: bool = True
     VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW: bool = False
     VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY: bool = False
@@ -363,6 +365,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_PROFILE: bool = False
     VLLM_SM70_MTP_PROFILE_INTERVAL: int = 16
     VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS: bool = False
+    VLLM_SM70_MTP_PLE_CONV: bool = False
     VLLM_SM70_MTP_CONCURRENCY_WARMUP: bool = False
     VLLM_SM70_MTP_CONTEXT_BUCKETS: str | None = None
     VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS: str | None = None
@@ -2243,6 +2246,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "0"))
     ),
+    # Upstream d30469863 (98b81ea69 / cfe8490a8) rollback switches for native
+    # MTP GDN metadata (any draft depth; the MTP4 prefix is historical). The
+    # fork uses them only together, as kill switches of the fused all-group
+    # write of the SM70 Qwen3.8 native-MTP lane (SX_OPT_MTP_GDN_FUSED_META in
+    # gdn_attn.py): either "0" restores the per-group builds.
+    "VLLM_SM70_MTP4_SHARED_GDN_METADATA": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP4_SHARED_GDN_METADATA", "1"))
+    ),
+    "VLLM_SM70_MTP4_FUSED_GDN_METADATA": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP4_FUSED_GDN_METADATA", "1"))
+    ),
     # Debug-only oracle: materialize the legacy advanced-indexing contract and
     # compare it with the fused persistent buffers before graph replay.
     "VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW": lambda: bool(
@@ -2798,6 +2812,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS": lambda: bool(
         int(os.getenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "0"))
+    ),
+    # Fuse the MTP4 PLE rollback, depthwise convolution, SiLU and state commit
+    # (upstream 763189d9a). The SM70 Qwen3.8 native-MTP lane sets it by default
+    # (SX_OPT_MTP_PLE_CONV, vllm/config/vllm.py).
+    "VLLM_SM70_MTP_PLE_CONV": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_PLE_CONV", "0"))
     ),
     # Compile alternate single/concurrent MTP helper signatures at startup.
     # Default-off until matched cold-start and steady-state evidence is complete.
@@ -3656,9 +3676,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FLASHQLA_DECODE_WARMUP": lambda: bool(
         int(os.getenv("VLLM_SM70_FLASHQLA_DECODE_WARMUP", "1"))
     ),
-    # Experimental packed-qkv GDN decode route from 0.0.3. The low-level
-    # function exists for strict op validation, but model-level routing remains
-    # default-off until token/quality/throughput gates pass.
+    # Experimental packed-QKV GDN decode loader, also reused by the small
+    # SM70 fused MTP verifier (upstream 8a99ccb4e). Model routing remains
+    # default-off until its token/quality/throughput gates pass. The SM70
+    # Qwen3.8 native-MTP lane requests only the verifier route on its own
+    # (SX_OPT_MTP_GDN_MIXED_QKV in qwen_gdn_linear_attn.py).
     "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV": lambda: bool(
         int(os.getenv("VLLM_SM70_FUSED_SIGMOID_MIXED_QKV", "0"))
     ),

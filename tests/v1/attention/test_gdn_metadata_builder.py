@@ -31,6 +31,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     _sm70_qwen_gdn_spec_core_enabled,
     qwen_gdn_attention_core_spec_commit,
 )
+from vllm.v1.attention.backends import gdn_attn
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
@@ -38,6 +39,7 @@ from vllm.v1.attention.backends.gdn_attn import (
     gdn_spec_metadata_tensors,
     get_registered_gdn_spec_metadata_tensors,
     prepare_dflash2_gdn_group_metadata,
+    sx_prepare_mtp_fused_gdn_metadata,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -265,6 +267,7 @@ def _create_gdn_builder(
     mamba_cache_mode: str = "none",
     max_cudagraph_capture_size: int = 4,
     device: torch.device = DEVICE,
+    speculative_method: str = "ngram",
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
     vllm_config = create_vllm_config(model_name=model_name, block_size=BLOCK_SIZE)
@@ -284,6 +287,10 @@ def _create_gdn_builder(
             method="ngram",
             num_speculative_tokens=num_speculative_tokens,
         )
+        # MTP construction normally needs the target/draft model configs. The
+        # metadata-only fixture has no draft model, but the builder only needs
+        # its method and width.
+        vllm_config.speculative_config.method = speculative_method
     mamba_spec = MambaSpec(
         block_size=BLOCK_SIZE,
         shapes=((16, 64),),
@@ -679,6 +686,69 @@ def test_common_gdn_metadata_matches_full_graph_padding(local_gdn_model):
     _assert_gdn_metadata_equal(actual, expected)
 
 
+@pytest.mark.parametrize("num_spec", [1, 2, 3, 4])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_mtp_shared_gdn_metadata_matches_legacy(local_gdn_model, num_spec, mixed):
+    """Shared native-MTP batch metadata matches per-group builds at any depth.
+
+    Ported from upstream main@d30469863 (cfe8490a8). The fork feeds shared
+    metadata to the builders only together with the fused write
+    (SX_OPT_MTP_GDN_FUSED_META); this keeps the builder's common branch exact.
+    """
+    if mixed:
+        seq_lens = [17, 32, 17]
+        query_lens = [num_spec + 1, 1, num_spec + 1]
+        drafts = [num_spec, -1, num_spec]
+        graph_tokens = 16
+    else:
+        seq_lens, query_lens, drafts, graph_tokens = [17], [num_spec + 1], [num_spec], 8
+    builders = [
+        _create_gdn_builder(
+            local_gdn_model,
+            num_speculative_tokens=num_spec,
+            use_full_cuda_graph=True,
+            mamba_cache_mode="align",
+            max_cudagraph_capture_size=16,
+            speculative_method="mtp",
+        )
+        for _ in range(2)
+    ]
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=seq_lens, query_lens=query_lens), BLOCK_SIZE, DEVICE
+    ).replace(
+        block_table_tensor=torch.arange(
+            len(seq_lens) * 6, dtype=torch.int32, device=DEVICE
+        ).reshape(len(seq_lens), 6),
+        num_actual_tokens=graph_tokens,
+    )
+    draft_cpu = torch.tensor(drafts, dtype=torch.int32)
+    accepted = torch.ones(len(drafts), dtype=torch.int32, device=DEVICE)
+    expected = builders[0].build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=accepted,
+        num_decode_draft_tokens_cpu=draft_cpu,
+    )
+    common_metadata = compute_common_gdn_attn_metadata(
+        num_decode_draft_tokens_cpu=draft_cpu,
+        query_start_loc=common.query_start_loc,
+        query_start_loc_cpu=common.query_start_loc_cpu,
+        num_spec_state_tokens=num_spec,
+        legacy_mixed_decode_routing=(
+            qwen_gdn.envs.VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING
+        ),
+    )
+    assert common_metadata is not None
+    actual = builders[1].build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=accepted,
+        num_decode_draft_tokens_cpu=draft_cpu,
+        common_gdn_metadata=common_metadata,
+    )
+    _assert_gdn_metadata_equal(actual, expected)
+
+
 def test_prepared_dflash2_metadata_belongs_to_exact_builder(local_gdn_model):
     builder = _create_gdn_builder(
         local_gdn_model,
@@ -1040,6 +1110,150 @@ def test_dflash2_fused_gdn_group_metadata_align_replay(
         torch.testing.assert_close(
             state[2:], torch.full_like(state[2:], PAD_SLOT_ID), rtol=0, atol=0
         )
+
+
+@pytest.mark.parametrize("sx_step", [False, True], ids=["upstream", "sx_step"])
+@pytest.mark.parametrize("cache_mode", ["none", "align"])
+@pytest.mark.parametrize(
+    ("num_spec", "query_len"),
+    [(num_spec, q) for num_spec in (1, 2, 3, 4) for q in range(2, num_spec + 2)],
+)
+def test_mtp_fused_gdn_group_metadata_matches_legacy_replay(
+    monkeypatch, local_gdn_model, cache_mode, num_spec, query_len, sx_step
+):
+    """Fused native-MTP state rows match per-group builds at any depth.
+
+    Ported from upstream main@d30469863 (98b81ea69 / cfe8490a8). The fork
+    admits the fused write only in the SM70 Qwen3.8 native-MTP lane, which the
+    fixture model is not, so the lane contract is patched for the fused
+    builders; the per-group reference builders are built without it and keep
+    their own graph buffers. ``sx_step`` drives the fork's step helper
+    (host-only classification plus the fused write) instead of upstream's
+    common metadata.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the fused GDN metadata kernel")
+    device = torch.device("cuda")
+    if torch.cuda.get_device_capability(device) != (7, 0):
+        pytest.skip("the fused GDN metadata kernel is SM70-only")
+
+    monkeypatch.setenv("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", "0")
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "0")
+    monkeypatch.delenv("VLLM_SM70_MTP4_FUSED_GDN_METADATA", raising=False)
+    monkeypatch.delenv("VLLM_SM70_MTP4_SHARED_GDN_METADATA", raising=False)
+    monkeypatch.delenv("SX_OPT_MTP_GDN_FUSED_META", raising=False)
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW", "1")
+    qwen_gdn.envs.disable_envs_cache()
+
+    def make_builder():
+        return _create_gdn_builder(
+            local_gdn_model,
+            num_speculative_tokens=num_spec,
+            use_full_cuda_graph=True,
+            mamba_cache_mode=cache_mode,
+            max_cudagraph_capture_size=32,
+            device=device,
+            speculative_method="mtp",
+        )
+
+    legacy_builders = [make_builder() for _ in range(3)]
+    assert all(b._ddtree_fast_common_buffers is None for b in legacy_builders)
+    monkeypatch.setattr(gdn_attn, "_sx_mtp_gdn_lane_contract", lambda cfg: True)
+    fused_builders = [make_builder() for _ in range(3)]
+    assert all(b._ddtree_fast_common_buffers is not None for b in fused_builders)
+    seq_lens = torch.tensor([16, 17, 63], dtype=torch.int32, device=device)
+    query_start_loc = torch.arange(
+        0, 4 * query_len, query_len, dtype=torch.int32, device=device
+    )
+    query_start_loc_cpu = query_start_loc.cpu()
+    draft_cpu = torch.full((3,), query_len - 1, dtype=torch.int32)
+    accepted = torch.tensor(
+        [1, min(3, query_len), query_len], dtype=torch.int32, device=device
+    )
+    common_metadata = compute_common_gdn_attn_metadata(
+        num_decode_draft_tokens_cpu=draft_cpu,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc_cpu,
+        num_spec_state_tokens=num_spec,
+        legacy_mixed_decode_routing=False,
+    )
+    assert common_metadata is not None
+    tables = tuple(
+        torch.arange(3 * 8, dtype=torch.int32, device=device).reshape(3, 8)
+        + group_id * 100
+        for group_id in range(3)
+    )
+    descriptor = None
+    for new_seq_lens, new_accepted in (
+        ([16, 17, 63], [1, min(3, query_len), query_len]),
+        ([31, 32, 48], [query_len, 1, min(4, query_len)]),
+    ):
+        seq_lens.copy_(torch.tensor(new_seq_lens, dtype=torch.int32, device=device))
+        accepted.copy_(torch.tensor(new_accepted, dtype=torch.int32, device=device))
+        expected = []
+        for builder, table in zip(legacy_builders, tables, strict=True):
+            common = create_common_attn_metadata(
+                BatchSpec(seq_lens=new_seq_lens, query_lens=[query_len] * 3),
+                BLOCK_SIZE,
+                device,
+            ).replace(block_table_tensor=table, num_actual_tokens=16)
+            expected.append(
+                builder.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common,
+                    num_accepted_tokens=accepted,
+                    num_decode_draft_tokens_cpu=draft_cpu,
+                )
+            )
+        if sx_step:
+            sx_result = sx_prepare_mtp_fused_gdn_metadata(
+                builders_by_group=list(enumerate(fused_builders)),
+                block_tables=tables,
+                num_decode_draft_tokens_cpu=draft_cpu,
+                query_start_loc=query_start_loc,
+                query_start_loc_cpu=query_start_loc_cpu,
+                num_accepted_tokens=accepted,
+                num_actual_tokens=16,
+                descriptor=descriptor,
+                seq_lens=seq_lens if cache_mode == "align" else None,
+            )
+            assert sx_result is not None
+            sx_common, actual_by_builder, new_descriptor = sx_result
+            for field in (
+                "num_prefills",
+                "num_decodes",
+                "num_spec_decodes",
+                "num_spec_decode_tokens",
+            ):
+                assert getattr(sx_common, field) == getattr(common_metadata, field)
+            assert torch.equal(
+                sx_common.spec_query_start_loc, common_metadata.spec_query_start_loc
+            )
+            assert torch.equal(
+                sx_common.spec_token_indx, common_metadata.spec_token_indx
+            )
+        else:
+            result = prepare_dflash2_gdn_group_metadata(
+                builders_by_group=list(enumerate(fused_builders)),
+                block_tables=tables,
+                common_gdn_metadata=common_metadata,
+                num_accepted_tokens=accepted,
+                num_actual_tokens=16,
+                descriptor=descriptor,
+                seq_lens=seq_lens if cache_mode == "align" else None,
+                enable_mtp4=True,
+            )
+            assert result is not None
+            actual_by_builder, new_descriptor = result
+        if descriptor is not None:
+            assert new_descriptor is descriptor
+        descriptor = new_descriptor
+        for builder, expected_metadata in zip(fused_builders, expected, strict=True):
+            _assert_gdn_metadata_equal(
+                actual_by_builder[id(builder)], expected_metadata
+            )
+        for table in tables:
+            table.add_(1000)
 
 
 def test_full_cuda_graph_capture_single_token_decode_is_not_spec(local_gdn_model):

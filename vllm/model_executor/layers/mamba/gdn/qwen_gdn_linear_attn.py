@@ -717,6 +717,41 @@ def _sm70_current_device_is_volta() -> bool:
     )
 
 
+# SX MTP port of upstream main@d30469863 (8a99ccb4e): mixed-QKV fused GDN
+# target verification. Ordinary MTP verification materializes three contiguous
+# Q/K/V splits of the conv output before the fused sigmoid recurrence; the
+# mixed-QKV loader of the same kernel (same BV32/four-warp schedule, FP32 state,
+# accepted-state selection and FP16 output, so every output and stored state
+# bit is unchanged) reads them from the packed row instead. Upstream requests
+# it with VLLM_SM70_FUSED_SIGMOID_MIXED_QKV, which also reroutes non-spec
+# decode and still works here; the native-MTP lane
+# (_is_sm70_qwen38_mtp_lane_contract) requests the verify branch alone:
+#   SX_OPT_MTP_GDN_MIXED_QKV  default "1"; "0" = the split-copy verify route.
+# Upstream's geometry gate is unchanged (pure verify batch, SM70, 4 QK / 12 V
+# heads per rank, D128, FP16 input, FP32 state, 2..16 rows); wider verify
+# batches keep the previous route. Upstream component timing of the 36-layer
+# copy chain: 1.098 -> 0.615 ms at M5, 1.257 -> 0.785 ms at M10
+# (sm70_flash_next_mtp4_batch_gdn.md).
+_SX_OPT_MTP_GDN_MIXED_QKV = os.environ.get("SX_OPT_MTP_GDN_MIXED_QKV", "1") != "0"
+
+
+def _sx_mtp_mixed_qkv_verify_lane(vllm_config: object) -> bool:
+    """SX_OPT_MTP_GDN_MIXED_QKV admission: native-MTP lane on a Volta device."""
+    if not _SX_OPT_MTP_GDN_MIXED_QKV:
+        return False
+    try:
+        from vllm.config.vllm import _is_sm70_qwen38_mtp_lane_contract
+
+        admitted = _is_sm70_qwen38_mtp_lane_contract(
+            getattr(vllm_config, "model_config", None),
+            getattr(vllm_config, "speculative_config", None),
+            getattr(vllm_config, "parallel_config", None),
+        )
+    except Exception:  # noqa: BLE001 - partial configs fail closed
+        return False
+    return bool(admitted) and _sm70_current_device_is_volta()
+
+
 def _sm70_qwen_gdn_full_forward_enabled(
     layer_name: LayerNameType,
     *,
@@ -2453,6 +2488,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.enable_sm70_fused_sigmoid_mixed_qkv = (
             envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV
         )
+        # SX MTP port (8a99ccb4e): mixed-QKV verify only, native-MTP lane.
+        self.enable_sx_mtp_mixed_qkv_verify = _sx_mtp_mixed_qkv_verify_lane(
+            vllm_config
+        )
+        if self.enable_sx_mtp_mixed_qkv_verify:
+            logger.info_once(
+                "SM70 MTP-lane mixed-QKV fused GDN verification armed "
+                "(SX_OPT_MTP_GDN_MIXED_QKV)."
+            )
         self.enable_sm70_dflash2_fused_gdn_verify = bool(
             envs.VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY
             and current_platform.is_device_capability(70)
@@ -5330,6 +5374,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.num_k_heads % self.tp_size == 0
             and self.num_v_heads % self.tp_size == 0
         )
+        # SX MTP port (8a99ccb4e): the native-MTP lane requests the mixed-QKV
+        # loader for target verification only (_SX_OPT_MTP_GDN_MIXED_QKV);
+        # non-spec decode keeps the routes chosen above and below.
+        mixed_qkv_verify_requested = mixed_qkv_decode_requested or bool(
+            getattr(self, "enable_sx_mtp_mixed_qkv_verify", False)
+            and mixed_qkv.is_cuda
+            and mixed_qkv.dtype == torch.float16
+            and mixed_qkv.is_contiguous()
+            and self.num_k_heads % self.tp_size == 0
+            and self.num_v_heads % self.tp_size == 0
+        )
         if (
             self.enable_packed_recurrent_decode
             and not mixed_qkv_decode_requested
@@ -5655,7 +5710,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ssm_state=ssm_state,
             attn_metadata=attn_metadata,
         )
-        if use_dflash2_packed_gdn_verify:
+        # Upstream 8a99ccb4e geometry gate, unchanged; only the request differs
+        # (see mixed_qkv_verify_requested).
+        use_sm70_mixed_qkv_verify = (
+            mixed_qkv_verify_requested
+            and not use_dflash2_packed_gdn_verify
+            and spec_sequence_masks is not None
+            and ddtree_parent_ids is None
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes == 0
+            and attn_metadata.num_spec_decodes > 0
+            and current_platform.is_device_capability(70)
+            and self.num_k_heads // self.tp_size == 4
+            and self.num_v_heads // self.tp_size == 12
+            and self.head_k_dim == self.head_v_dim == 128
+            and ssm_state.dtype == torch.float32
+            and mixed_qkv_spec is not None
+            and mixed_qkv_spec.is_contiguous()
+            and 1 < mixed_qkv_spec.shape[0] <= 16
+        )
+        if use_dflash2_packed_gdn_verify or use_sm70_mixed_qkv_verify:
             query_spec, key_spec, value_spec = None, None, None
         else:
             query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
@@ -5825,6 +5899,36 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     num_spec_decodes=attn_metadata.num_spec_decodes,
                 )
                 last_recurrent_state = ssm_state
+            elif use_sm70_mixed_qkv_verify:
+                assert mixed_qkv_spec is not None
+                assert spec_query_start_loc is not None
+                # Reuse the decode loader with the original fused verifier's
+                # gating, BV32 reduction and FP32 state. Avoid materializing
+                # three contiguous splits and concatenating them again.
+                core_attn_out_spec, last_recurrent_state = (
+                    fused_sigmoid_gating_delta_rule_update_mixed_qkv(
+                        A_log=self.A_log,
+                        a=a_spec,
+                        b=b_spec,
+                        dt_bias=self.dt_bias,
+                        mixed_qkv=mixed_qkv_spec,
+                        num_q_heads=self.num_k_heads // self.tp_size,
+                        num_v_heads=self.num_v_heads // self.tp_size,
+                        head_k_dim=self.head_k_dim,
+                        head_v_dim=self.head_v_dim,
+                        initial_state=ssm_state,
+                        inplace_final_state=True,
+                        cu_seqlens=spec_query_start_loc[
+                            : attn_metadata.num_spec_decodes + 1
+                        ],
+                        ssm_state_indices=spec_state_indices_tensor,
+                        num_accepted_tokens=spec_state_slot_selectors,
+                        use_qk_l2norm_in_kernel=True,
+                    )
+                )
+                _log_runtime_route_once(
+                    "SM70 mixed-QKV fused GDN target-verification route hit."
+                )
             else:
                 assert query_spec is not None
                 assert key_spec is not None
