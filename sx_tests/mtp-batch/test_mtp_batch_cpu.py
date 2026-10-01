@@ -30,7 +30,7 @@ kernel unless OVER_ROWS=1; upstream-named switches parse like upstream
 (int(), an invalid value raises); SX_OPT_* variables enter the compile key.
 
 Asserted (SX_OPT_MTP_ROUTER_BATCH, SX_OPT_MTP_BATCH_OVER_ROWS):
-* switch parsing (router default on, OVER_ROWS default off);
+* switch parsing (the HC, router, shared and GDN-input batch routes default off, OVER_ROWS default off);
 * packing keeps every router weight bit, bad geometries are rejected;
 * runtime admission: packed copy, CUDA FP16 aligned [M5/M10, 2560] inside
   the verify capture, and precedence: an admitted SX_OPT_ROWS kernel keeps
@@ -115,12 +115,17 @@ def _reset_env_cache() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _clean(monkeypatch):
+def _clean(monkeypatch, request):
     for key in SWITCHES:
         monkeypatch.delenv(key, raising=False)
     for key in ("VLLM_BATCH_INVARIANT", "SX_OPT_MTP_LANE", *ROWS_SWITCHES):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("VLLM_SM70_QWEN38_DUAL_COMPILE", "1")
+    # The HC, router and shared-expert batch routes are opt-in (their packed copies cost 525 MiB/rank of KV
+    # cache); the tests below that exercise a route enable it here, test_batch_routes_are_opt_in the defaults.
+    if not getattr(request, "param_opt_in_defaults", False):
+        for key in ("VLLM_SM70_MTP_HC_BATCH", "VLLM_SM70_MTP_ROUTER_BATCH", "VLLM_SM70_MTP_SHARED_BATCH"):
+            monkeypatch.setenv(key, "1")
     matmul = torch.backends.cuda.matmul
     saved = [getattr(matmul, name) for name in PRECISION]
     installed = dg.sm70_mtp_lane_installed()
@@ -1233,3 +1238,17 @@ def test_sx_opt_switches_enter_the_compile_key(monkeypatch):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_batch_routes_are_opt_in(monkeypatch):
+    """Without any switch the HC, router, shared-expert and GDN-input batch routes are all off."""
+    for key in ("SX_OPT_MTP_HC_BATCH", "SX_OPT_MTP_ROUTER_BATCH", "SX_OPT_MTP_SHARED_BATCH"):
+        monkeypatch.delenv(key, raising=False)
+    for key in ("VLLM_SM70_MTP_HC_BATCH", "VLLM_SM70_MTP_ROUTER_BATCH", "VLLM_SM70_MTP_SHARED_BATCH"):
+        monkeypatch.delenv(key, raising=False)
+    _reset_env_cache()
+    config = gemv._sx_mtp_batch_config()
+    assert not (config.hc or config.router or config.shared or config.gdn_input)
+    monkeypatch.setenv("SX_OPT_MTP_ROUTER_BATCH", "1")
+    _reset_env_cache()
+    assert gemv._sx_mtp_batch_config().router

@@ -90,7 +90,9 @@ own, and only when it is on in the admitted lane):
     SX_OPT_MTP_SHARED_BATCH    75.0 MiB  (48 shared experts x 1.5625 MiB)
     SX_OPT_MTP_GDN_INPUT_BATCH 725.625 MiB (36 layers x 20.15625 MiB; off)
 
-Default-on total 525.0 MiB. Independently of the switches every TP4 SM70
+The HC, router and shared-expert batch routes are OFF by default (2026-10-01 measurement, 4x V100, MTP k=4,
+32K context, util 0.87: together +3-4% single-request decode, but 525.0 MiB/rank of packed copies cut the KV
+cache from 88,870 to 59,081 tokens). Switching all three on costs 525.0 MiB. Independently of the switches every TP4 SM70
 deployment's custom all-reduce push buffer is 364.5 KiB larger (two batch HC
 channels, csrc/custom_all_reduce.cuh).
 
@@ -415,10 +417,14 @@ def _sx_mtp_switch(name: str, alias: str, default: str) -> bool:
     return default != "0"
 
 
+# Measured 2026-10-01 on 4x V100 (MTP k=4, 32K context, util 0.87): the HC, router and shared-expert batch routes
+# together add 3-4% single-request decode speed but cost about 525 MiB/rank of packed weights, which shrinks the
+# KV cache from 88,870 to 59,081 tokens (-34%) and makes four 8K requests no longer fit. They are therefore
+# opt-in (default 0); SX_OPT_MTP_GDN_INPUT_BATCH (725 MiB/rank) stays opt-in for the same reason.
 @functools.lru_cache(maxsize=1)
 def _sx_mtp_batch_config() -> _SxMtpBatchConfig:
     config = _SxMtpBatchConfig(
-        hc=_sx_mtp_switch("SX_OPT_MTP_HC_BATCH", "VLLM_SM70_MTP_HC_BATCH", "1"),
+        hc=_sx_mtp_switch("SX_OPT_MTP_HC_BATCH", "VLLM_SM70_MTP_HC_BATCH", "0"),
         hc_cooperative=_sx_mtp_switch(
             "SX_OPT_MTP_HC_COOPERATIVE", "VLLM_SM70_MTP_HC_COOPERATIVE", "1"
         ),
@@ -426,10 +432,10 @@ def _sx_mtp_batch_config() -> _SxMtpBatchConfig:
             "SX_OPT_MTP_HC_FULL_UNROLL", "VLLM_SM70_MTP_HC_FULL_UNROLL", "1"
         ),
         router=_sx_mtp_switch(
-            "SX_OPT_MTP_ROUTER_BATCH", "VLLM_SM70_MTP_ROUTER_BATCH", "1"
+            "SX_OPT_MTP_ROUTER_BATCH", "VLLM_SM70_MTP_ROUTER_BATCH", "0"
         ),
         shared=_sx_mtp_switch(
-            "SX_OPT_MTP_SHARED_BATCH", "VLLM_SM70_MTP_SHARED_BATCH", "1"
+            "SX_OPT_MTP_SHARED_BATCH", "VLLM_SM70_MTP_SHARED_BATCH", "0"
         ),
         gdn_input=_sx_mtp_switch(
             "SX_OPT_MTP_GDN_INPUT_BATCH", "VLLM_SM70_QWEN38_GDN_INPUT_BATCH", "0"
