@@ -60,6 +60,33 @@ traced by the decode compiler, so W <= role maximum takes the rows kernels
 above (each row bitwise equal to the M=1 kernel on that row) and wider verify
 steps keep cuBLAS; prefill/mixed/eager steps never reach them.
 ``SX_OPT_MTP_ROWS=0`` disables only the multi-row kernels in that lane.
+
+SX MTP batch routes (upstream 1Cat main@d30469863 MTP4 kernels)
+---------------------------------------------------------------
+Packed tensor-core kernels that upstream qualified for its native-MTP
+single/two-request verify: the native-MTP lane above with k = 4 only, and
+only at the target's verify widths M5 / M10 inside the FULL verify-graph
+capture (``_sx_mtp_batch_rows_ok``). Each kernel reproduces the arithmetic
+of the cuBLAS path it replaces at those widths (same K partitions, FP16
+partial / output boundaries and FP32 reduction order, under the MTP lane's
+``allow_fp16_reduced_precision_reduction=True`` and
+``allow_fp16_accumulation=False``; any other precision policy falls back).
+Packed weight copies are made in ``process_weights_after_loading`` only when
+the switch is on and the lane contract holds (``_sx_mtp_batch_contract``);
+the checkpoint weights keep serving M1, prefill and every other width. The
+no-MTP lane, other speculative methods and k != 4 never allocate or run any
+of this. Switches (``os.environ``, read once per process;
+``_sx_mtp_batch_config.cache_clear()`` re-reads them; an ``SX_OPT_*`` value
+wins over the upstream alias, whose name keeps working):
+
+``SX_OPT_MTP_HC_BATCH=1`` (alias ``VLLM_SM70_MTP_HC_BATCH``)
+    TP4-sharded packed-MMA HyperConnection (sm70_fp16_hc.py) through the
+    custom all-reduce's batch channels: +330 MiB/rank for the 96 HC pairs.
+``SX_OPT_MTP_HC_COOPERATIVE=1`` (alias ``VLLM_SM70_MTP_HC_COOPERATIVE``)
+    One cooperative launch for down / gather+SiLU / up+mix / gather instead
+    of four launches (identical arithmetic and transport).
+``SX_OPT_MTP_HC_FULL_UNROLL=1`` (alias ``VLLM_SM70_MTP_HC_FULL_UNROLL``)
+    Fully unrolled K loops of the cooperative kernel (same K order).
 """
 
 from __future__ import annotations
@@ -293,6 +320,98 @@ def _sx_rows_tile(x: torch.Tensor, weight: torch.Tensor, key: str | None) -> int
     if not _sx_rows_inputs_ok(x, weight) or not _sx_decode_graph_active():
         return 0
     return _sx_split_rows(m, _sx_rows_config().gemv_tile)
+
+
+# ---------------------------------------------------------------------------
+# SX MTP batch admission (see "SX MTP batch routes" in the module docstring).
+# ---------------------------------------------------------------------------
+
+# Upstream qualified these kernels for MTP4 (k = 4) only: one / two requests
+# give the M5 / M10 verify batches. Never widened to other widths.
+_SX_MTP_BATCH_NUM_SPEC = 4
+_SX_MTP_BATCH_ROWS = (5, 10)
+
+
+class _SxMtpBatchConfig(NamedTuple):
+    hc: bool
+    hc_cooperative: bool
+    hc_full_unroll: bool
+
+
+def _sx_mtp_switch(name: str, alias: str, default: str) -> bool:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        raw = os.environ.get(alias, "").strip()
+    return (raw or default) != "0"
+
+
+@functools.lru_cache(maxsize=1)
+def _sx_mtp_batch_config() -> _SxMtpBatchConfig:
+    config = _SxMtpBatchConfig(
+        hc=_sx_mtp_switch("SX_OPT_MTP_HC_BATCH", "VLLM_SM70_MTP_HC_BATCH", "1"),
+        hc_cooperative=_sx_mtp_switch(
+            "SX_OPT_MTP_HC_COOPERATIVE", "VLLM_SM70_MTP_HC_COOPERATIVE", "1"
+        ),
+        hc_full_unroll=_sx_mtp_switch(
+            "SX_OPT_MTP_HC_FULL_UNROLL", "VLLM_SM70_MTP_HC_FULL_UNROLL", "1"
+        ),
+    )
+    logger.info("SX MTP batch route configuration: %r", config)
+    return config
+
+
+def _sx_mtp_batch_contract(vllm_config=None) -> bool:
+    """Load-time admission: the native-MTP lane target with k = 4.
+
+    _exact_runtime_contract admits a speculative config only for the SM70
+    Qwen3.8 TP4 native-MTP lane with the dual-compile target, so this is
+    False for the no-MTP lane, every other speculative method and k != 4.
+    """
+    if envs.VLLM_BATCH_INVARIANT:
+        return False
+    try:
+        config = vllm_config or get_current_vllm_config()
+        speculative = config.speculative_config
+        ubatching = bool(getattr(config.parallel_config, "use_ubatching", False))
+    except (AssertionError, AttributeError, RuntimeError):
+        return False
+    return bool(
+        speculative is not None
+        and getattr(speculative, "method", None) == "mtp"
+        and getattr(speculative, "num_speculative_tokens", None)
+        == _SX_MTP_BATCH_NUM_SPEC
+        and not ubatching
+        and _exact_runtime_contract(config)
+    )
+
+
+def _sx_mtp_batch_rows_ok(x: torch.Tensor) -> bool:
+    """Runtime admission inside the opaque ops: an M5/M10 FULL verify capture.
+
+    The MTP lane's cuBLAS contract that the kernels reproduce bit for bit is
+    reduced-precision split-K reduction allowed and FP32 accumulation; any
+    other policy keeps the original projections.
+    """
+    matmul = torch.backends.cuda.matmul
+    return bool(
+        x.ndim == 2
+        and x.shape[0] in _SX_MTP_BATCH_ROWS
+        and not envs.VLLM_BATCH_INVARIANT
+        and sm70_mtp_lane_installed()
+        and is_sm70_decode_graph_compiling()
+        and matmul.allow_fp16_reduced_precision_reduction
+        and not matmul.allow_fp16_accumulation
+    )
+
+
+def _sx_tp4_custom_ar():
+    """The TP group's custom all-reduce communicator, or None."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        return getattr(get_tp_group().device_communicator, "ca_comm", None)
+    except (AssertionError, AttributeError, RuntimeError, ValueError):
+        return None
 
 
 @triton.jit
@@ -1087,7 +1206,18 @@ direct_register_custom_op(
 
 
 class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
-    """Use the row-GEMV custom op for admitted single-token projections."""
+    """Use the row-GEMV custom op for admitted single-token projections.
+
+    Layers tagged by the SX MTP batch loaders also get their packed copies
+    here, after the checkpoint weights are final.
+    """
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        if getattr(layer, "_sm70_qwen38_hc_batch_role", None) is not None:
+            from .sm70_fp16_hc import _prepare_hc_batch_weight
+
+            _prepare_hc_batch_weight(layer)
 
     def apply(
         self,

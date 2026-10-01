@@ -134,11 +134,39 @@ constexpr int kSm70Qwen38HcUpFusedBlocks = 160;
 constexpr size_t kSm70Qwen38HcUpFusedPacketOffset =
     kSm70Qwen38HcUpFusedEpochOffset +
     kSm70Qwen38HcUpFusedBlocks * sizeof(uint32_t);
-constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+// [SX_OPT_MTP_HC_BATCH] Upstream 1Cat batch HC (sm70_qwen38_hc_batch.cuh):
+// the native-MTP M5/M10 verify gathers its TP4 down shard ([M, 88] FP16) and
+// output shard ([M, 640] FP16) as half+tag packets of up to 16 rows. Each
+// channel starts with 256 bytes of per-CTA epoch counters, followed by two
+// epochs x four ranks of payload. Separate channels preserve half bits and
+// isolate batch HC from M1 HC and the auxiliary MoE collectives; the zero
+// fill at registration (from kSm70Qwen38HcUpFusedEpochOffset onwards) makes
+// every counter epoch 0 and every packet empty. Upstream's third, tile-major
+// fused output channel belongs to its no-MTP chain and is not carried here.
+constexpr size_t kSm70Qwen38HcBatchCounterBytes = 256;
+constexpr int kSm70Qwen38HcBatchMaxRows = 16;
+constexpr size_t kSm70Qwen38HcBatchDownOffset =
     kSm70Qwen38HcUpFusedPacketOffset +
     kSm70Tp4PushAllreduceEpochs * 4 * 640 * sizeof(uint32_t);
+constexpr size_t kSm70Qwen38HcBatchOutputOffset =
+    kSm70Qwen38HcBatchDownOffset + kSm70Qwen38HcBatchCounterBytes +
+    kSm70Tp4PushAllreduceEpochs * 4 * kSm70Qwen38HcBatchMaxRows * 88 *
+        sizeof(uint32_t);
+constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+    kSm70Qwen38HcBatchOutputOffset + kSm70Qwen38HcBatchCounterBytes +
+    kSm70Tp4PushAllreduceEpochs * 4 * kSm70Qwen38HcBatchMaxRows * 640 *
+        sizeof(uint32_t);
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
+// 16-byte packet stores; the largest gather grids (32-thread cooperative
+// CTAs at M16: 6 down / 40 output) fit the 64 epoch counters of a channel.
+static_assert(kSm70Qwen38HcBatchDownOffset % 16 == 0 &&
+                  kSm70Qwen38HcBatchOutputOffset % 16 == 0 &&
+                  kSm70Qwen38HcBatchCounterBytes % 16 == 0,
+              "batch HC channels must keep 16-byte packet alignment");
+static_assert((kSm70Qwen38HcBatchMaxRows * 80 + 31) / 32 <=
+                  kSm70Qwen38HcBatchCounterBytes / sizeof(uint32_t),
+              "batch HC gather grid exceeds the per-CTA epoch counters");
 
 // [SX_OPT_PUSH_AR_WIDE] Every Qwen3.8 FP16 row multiple [M, 2560] with
 // M in [2, 32] (10..160 KiB, 5-KiB steps), for the regular and the sum2 push

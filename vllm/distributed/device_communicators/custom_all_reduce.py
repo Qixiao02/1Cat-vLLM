@@ -565,6 +565,54 @@ class CustomAllreduce:
         ops.all_reduce_sum2(self._ptr, inp_a, inp_b, out)
         return out
 
+    def can_sm70_qwen38_hc_batch(self, branches: torch.Tensor) -> bool:
+        # [SX_OPT_MTP_HC_BATCH] The native op takes [2..16, 10240]; the model
+        # dispatcher (sm70_fp16_hc.py) admits only the MTP M5/M10 verify.
+        return bool(
+            not self.disabled
+            and self.world_size == 4
+            and self.fully_connected
+            and self.sm70_tp4_push_buffer_ptrs is not None
+            and branches.is_cuda
+            and branches.dtype == torch.float16
+            and branches.ndim == 2
+            and 2 <= branches.shape[0] <= 16
+            and branches.shape[1] == 10240
+            and branches.is_contiguous()
+            and ops.supports_sm70_qwen38_hc_batch()
+        )
+
+    def sm70_qwen38_hc_batch(
+        self,
+        branches,
+        packed_down,
+        packed_up,
+        partials,
+        lora,
+        local_output,
+        output,
+        injection,
+        round_down_partials: bool = False,
+        cooperative: bool = False,
+        full_unroll: bool = False,
+        fused_chain: bool = False,
+    ) -> None:
+        ops.sm70_qwen38_hc_batch(
+            self._ptr,
+            branches,
+            packed_down,
+            packed_up,
+            partials,
+            lora,
+            local_output,
+            output,
+            injection,
+            round_down_partials,
+            cooperative,
+            full_unroll,
+            fused_chain,
+        )
+
     def can_sm70_qwen38_hc_shard(self, branches: torch.Tensor) -> bool:
         return bool(
             not self.disabled

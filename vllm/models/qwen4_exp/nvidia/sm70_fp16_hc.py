@@ -12,6 +12,29 @@ which 1Cat validated bitwise against the production M=1 TP4-sharded route.
 Switches: SX_OPT_ROWS / SX_OPT_ROWS_MAX_M / SX_OPT_ROWS_TABLE ("hc" role),
 SX_OPT_ROWS_FUSED_REDUCE, SX_OPT_ROWS_HC_DOWN_TILE, SX_OPT_ROWS_HC_DOWN_NW,
 SX_OPT_ROWS_HC_UP_TILE and SX_OPT_ROWS_HC_NORM (see sm70_fp16_gemv.py).
+
+SX MTP batch HC (upstream 1Cat main@d30469863: 7b0b303a6, 3b7365925,
+732e18417, 1ef9f45a5 on the batch HC of 1ae340320 / c39d4b7a4)
+------------------------------------------------------------------------
+In the native-MTP lane with k = 4, the target's M5 / M10 verify batches run
+a TP4-sharded packed tensor-core HC instead of the replicated cuBLAS chain
+(F.linear down -> FP16 -> /4 SiLU, F.linear up -> FP16 gate -> sigmoid mix):
+every rank computes its 80 LoRA rows (rank 3 also the four injection rows)
+as twenty K512 m8n8k4 partials, each rounded to FP16 like the MTP cuBLAS
+split-K, reduces them left to right in FP32, applies the FP16 / SiLU
+epilogue, gathers the [M, 320] LoRA as lossless half+tag packets, computes
+its 640 hidden columns of the four-branch gate (one ordered K320 MMA, FP16
+gate, sigmoid, branch-ordered FMA, /4) and gathers the [M, 2560] block.
+Upstream measured it bit-exact against that replicated chain for all 96 real
+pairs, four ranks, M5/M10 and changing graph inputs, at 33.6 -> 21.1 us (M5)
+/ 34.6 -> 23.6 us (M10) per HC pair with the cooperative fully unrolled
+launch. Packed copies: down [3, 640, 2, 32, 8] (this rank's 88 rows, zero
+padded to 96) and up [80, 20, 2, 4, 8, 8] (this rank's 640 hidden columns of
+all four branches), 3.4375 MiB per pair, i.e. 330 MiB/rank for the 96 pairs;
+the checkpoint weights stay for M1/prefill. The custom all-reduce's push
+buffer grows by two batch channels (~365 KiB/rank of IPC memory).
+Switches: SX_OPT_MTP_HC_BATCH, SX_OPT_MTP_HC_COOPERATIVE and
+SX_OPT_MTP_HC_FULL_UNROLL (see sm70_fp16_gemv.py).
 """
 
 from __future__ import annotations
@@ -29,13 +52,18 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .sm70_fp16_gemv import (
+    Qwen38SM70FP16LinearMethod,
     _exact_runtime_contract,
     _sx_decode_graph_active,
+    _sx_mtp_batch_config,
+    _sx_mtp_batch_contract,
+    _sx_mtp_batch_rows_ok,
     _sx_rows_config,
     _sx_rows_max_m,
     _sx_rows_reduce,
     _sx_rows_x,
     _sx_split_rows,
+    _sx_tp4_custom_ar,
 )
 
 logger = init_logger(__name__)
@@ -48,6 +76,125 @@ _HC_HIDDEN = _HC_COUNT * _HC_DIM
 # Set when enable_qwen38_sm70_fp16_fused_hc marks at least one module; the
 # MR9a combine-norm tile switch in ops/hc.py is confined to such models.
 _SX_HC_FUSED_MODULES = 0
+
+_HC_BATCH_DOWN_SHAPE = (3, 640, 2, 32, 8)
+_HC_BATCH_UP_SHAPE = (80, 20, 2, 4, 8, 8)
+
+
+def _pack_hc_batch_weight(weight: torch.Tensor, role: str, rank: int) -> torch.Tensor:
+    """Lossless TP4 packs; keep checkpoint layout for M1 and prefill."""
+    if weight.dtype != torch.float16 or not 0 <= rank < 4:
+        raise ValueError("HC batch packing requires FP16 and a TP4 rank")
+    weight = weight.detach()
+    if role == "down" and weight.shape == (336, 10240):
+        padded = weight.new_zeros((96, 10240))
+        padded[:88].copy_(weight[rank * 80 : rank * 80 + 88])
+        return padded.reshape(3, 32, 640, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
+    if role == "up" and weight.shape == (10240, 320):
+        shard = weight.reshape(4, 2560, 320)[:, rank * 640 : (rank + 1) * 640]
+        return (
+            shard.contiguous()
+            .reshape(4, 80, 8, 20, 2, 8)
+            .permute(1, 3, 4, 0, 2, 5)
+            .contiguous()
+        )
+    raise ValueError("Unsupported HC batch weight role/geometry")
+
+
+def _prepare_hc_batch_weight(layer: nn.Module) -> None:
+    """Attach this rank's packed copy (called after the weights are final)."""
+    weight = layer.weight
+    if not weight.is_cuda or weight.dtype != torch.float16:
+        return
+    from vllm import _custom_ops as ops
+
+    custom_ar = _sx_tp4_custom_ar()
+    probe = weight.new_empty((5, _HC_HIDDEN))
+    if not (
+        ops.supports_sm70_qwen38_hc_batch()
+        and custom_ar is not None
+        and custom_ar.can_sm70_qwen38_hc_batch(probe)
+    ):
+        # An older extension, a disabled custom all-reduce or no registered
+        # TP4 push buffers: the route could never run, so allocate nothing.
+        logger.warning_once(
+            "SX_OPT_MTP_HC_BATCH: the TP4 batch HC op or its registered "
+            "communicator is unavailable; keeping the replicated M5/M10 HC."
+        )
+        return
+    layer.register_buffer(
+        "_sm70_qwen38_hc_batch_packed",
+        _pack_hc_batch_weight(
+            weight, layer._sm70_qwen38_hc_batch_role, int(custom_ar.rank)
+        ),
+        persistent=False,
+    )
+
+
+def _batch_runtime_ok(
+    x: torch.Tensor,
+    packed_down: torch.Tensor | None,
+    packed_up: torch.Tensor | None,
+) -> bool:
+    # Packed copies exist only where the loader admitted the MTP lane, so
+    # every other deployment stops at the first two checks.
+    return bool(
+        packed_down is not None
+        and packed_up is not None
+        and _sx_mtp_batch_config().hc
+        and _sx_mtp_batch_rows_ok(x)
+        and x.shape[1] == _HC_HIDDEN
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and tuple(packed_down.shape) == _HC_BATCH_DOWN_SHAPE
+        and tuple(packed_up.shape) == _HC_BATCH_UP_SHAPE
+        and all(
+            w.device == x.device
+            and w.dtype == x.dtype
+            and w.is_contiguous()
+            and w.data_ptr() % 16 == 0
+            for w in (packed_down, packed_up)
+        )
+    )
+
+
+def _sx_hc_batch_forward(
+    x: torch.Tensor,
+    packed_down: torch.Tensor,
+    packed_up: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """TP4 batch HC for an admitted M5/M10 verify batch: (block, injection)."""
+    custom_ar = _sx_tp4_custom_ar()
+    if custom_ar is None or not custom_ar.can_sm70_qwen38_hc_batch(x):
+        return None
+    config = _sx_mtp_batch_config()
+    m = x.shape[0]
+    partials = x.new_empty((20, m, 96), dtype=torch.float32)
+    lora, local_block, block, injection = (
+        x.new_empty((m, n)) for n in (_HC_RANK, _HC_DIM // 4, _HC_DIM, _HC_COUNT)
+    )
+    custom_ar.sm70_qwen38_hc_batch(
+        x,
+        packed_down,
+        packed_up,
+        partials,
+        lora,
+        local_block,
+        block,
+        injection,
+        round_down_partials=True,
+        cooperative=config.hc_cooperative,
+        full_unroll=config.hc_full_unroll,
+    )
+    logger.info_once(
+        "SM70 Qwen3.8 MTP TP4 batch HC enabled for M5/M10 (SX_OPT_MTP_HC_BATCH, "
+        "cooperative=%s, full_unroll=%s).",
+        config.hc_cooperative,
+        config.hc_full_unroll,
+    )
+    return block, injection
 
 
 @triton.jit
@@ -966,7 +1113,17 @@ def _qwen38_sm70_fp16_fused_hc(
     x: torch.Tensor,
     down_weight: torch.Tensor,
     up_weight: torch.Tensor,
+    packed_down: torch.Tensor | None = None,
+    packed_up: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # SX_OPT_MTP_HC_BATCH: the MTP lane's M5/M10 verify batches (packed
+    # copies exist only when the loader admitted the lane); every other
+    # width keeps the routes below unchanged.
+    if _batch_runtime_ok(x, packed_down, packed_up):
+        assert packed_down is not None and packed_up is not None
+        batch = _sx_hc_batch_forward(x, packed_down, packed_up)
+        if batch is not None:
+            return batch
     if not _runtime_ok(x, down_weight, up_weight):
         # SX MR3: exact multi-row replicated chain for admitted decode widths
         # inside the FULL decode graph (rows == M=1 route, bitwise).
@@ -1085,8 +1242,10 @@ def _qwen38_sm70_fp16_fused_hc_fake(
     x: torch.Tensor,
     down_weight: torch.Tensor,
     up_weight: torch.Tensor,
+    packed_down: torch.Tensor | None = None,
+    packed_up: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del down_weight, up_weight
+    del down_weight, up_weight, packed_down, packed_up
     return (
         x.new_empty((*x.shape[:-1], _HC_DIM)),
         x.new_empty((*x.shape[:-1], _HC_COUNT)),
@@ -1117,7 +1276,13 @@ def maybe_apply_qwen38_sm70_fp16_fused_hc(
         _HC_HIDDEN,
     ) or up_weight.shape != (_HC_HIDDEN, _HC_RANK):
         return None
-    return torch.ops.vllm.qwen38_sm70_fp16_fused_hc(x, down_weight, up_weight)
+    return torch.ops.vllm.qwen38_sm70_fp16_fused_hc(
+        x,
+        down_weight,
+        up_weight,
+        getattr(down_layer, "_sm70_qwen38_hc_batch_packed", None),
+        getattr(up_layer, "_sm70_qwen38_hc_batch_packed", None),
+    )
 
 
 def enable_qwen38_sm70_fp16_fused_hc(
@@ -1133,6 +1298,13 @@ def enable_qwen38_sm70_fp16_fused_hc(
     ):
         return
 
+    # SX_OPT_MTP_HC_BATCH: tag both projections for packing once the
+    # checkpoint is loaded (Qwen38SM70FP16LinearMethod.process_weights_after_
+    # loading). The up projection has no M1 plan; its apply() still runs the
+    # unquantized path outside decode semantics and is bypassed inside them.
+    batch_hc = bool(
+        _sx_mtp_batch_contract(vllm_config) and _sx_mtp_batch_config().hc
+    )
     enabled_count = 0
     for child in module.modules():
         if not (
@@ -1145,6 +1317,18 @@ def enable_qwen38_sm70_fp16_fused_hc(
         ):
             continue
         child._sm70_qwen38_fp16_fused_hc = True
+        if batch_hc:
+            from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+            for role, layer in (
+                ("down", child.input_mix_weight_down_block_inject),
+                ("up", child.input_mix_weight_up),
+            ):
+                if type(layer.quant_method) is UnquantizedLinearMethod:
+                    layer.quant_method = Qwen38SM70FP16LinearMethod()
+                if not isinstance(layer.quant_method, Qwen38SM70FP16LinearMethod):
+                    raise RuntimeError("Batched HC requires checkpoint-FP16 linears")
+                layer._sm70_qwen38_hc_batch_role = role
         enabled_count += 1
 
     global _SX_HC_FUSED_MODULES
@@ -1152,6 +1336,12 @@ def enable_qwen38_sm70_fp16_fused_hc(
     if enabled_count:
         logger.info_once(
             "Prepared %d Qwen3.8 SM70 fused checkpoint-FP16 HC modules.",
+            enabled_count,
+        )
+    if enabled_count and batch_hc:
+        logger.info_once(
+            "SX_OPT_MTP_HC_BATCH: %d HC pairs will carry TP4 packed copies "
+            "(3.4375 MiB/pair/rank) for the M5/M10 MTP verify.",
             enabled_count,
         )
 
