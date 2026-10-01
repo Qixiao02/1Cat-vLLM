@@ -216,6 +216,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE: bool = False
     VLLM_SM70_NVFP4_QPN_M1_LIBRARY: str | None = None
     VLLM_SM70_QWEN38_ROUTER_TOPK: bool = True
+    VLLM_SM70_MTP_ROUTER_TOP16: bool = False
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
     VLLM_SM70_AWQ_WARMUP: bool = True
     VLLM_SM70_AWQ_WARMUP_MAX_M: int = 16
@@ -2123,6 +2124,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Next. All other shapes and scoring modes retain the generic CUDA op.
     "VLLM_SM70_QWEN38_ROUTER_TOPK": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN38_ROUTER_TOPK", "1"))
+    ),
+    # Select only the first 16 lossless keys before the unchanged top-10 norm.
+    # (Upstream 1Cat 1ef9f45a5; FP16 M5/M10. MTP-lane routers of the fork
+    # default it through SX_OPT_MTP_ROUTER_TOP16 when this is unset.)
+    "VLLM_SM70_MTP_ROUTER_TOP16": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_ROUTER_TOP16", "0"))
     ),
     "VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE", "0"))

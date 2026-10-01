@@ -41,6 +41,26 @@
 #   SX_OPT_MTP_LANE=0 (the batch-3a MTP-lane master of vllm/config/vllm.py,
 #   also honoured by the QSA / GEMV / model lane items) disables this group's
 #   items as well, so that one switch restores the 1.8.0-dev2 MTP lane.
+#
+# Upstream 1Cat ports (group "mtp-port-moe"), routers built in the MTP lane
+# above only (target verify and MTP draft routers; FP16 logits; both Triton
+# kernels). Decided once per router at construction:
+# SX_OPT_MTP_ROUTER_PACKED_KEY (default "1"), upstream 8a99ccb4e: the
+#   lossless packed 32-bit sort key (16 FP16 logit bits + 9 expert-ID bits,
+#   no logit is quantized) for M2..16 as well, not only M1. Expert IDs, FP32
+#   weights and rank-major source rows are bitwise those of the 64-bit sort
+#   (upstream: all 65,536 FP16 payloads at M1/2/4/5/8/10/16); eight warps
+#   keep the FP32 normalization reduction. M17..32 keep the 64-bit key.
+# SX_OPT_MTP_ROUTER_TOP16 (default "1", needs SX_OPT_MTP_ROUTER_PACKED_KEY),
+#   upstream 1ef9f45a5 (VLLM_SM70_MTP_ROUTER_TOP16): at FP16 M5/M10 only,
+#   select the first 16 packed keys with tl.topk instead of sorting all 512
+#   (the key carries the expert ID, so the order is total); the top-10
+#   softmax normalization is unchanged. An explicitly set
+#   VLLM_SM70_MTP_ROUTER_TOP16 keeps upstream's global meaning (any router,
+#   FP16 M5/M10, with the packed key there) and the lane default only
+#   applies when it is absent.
+# Outside the lane (no-MTP included) routers keep the packed key at M1 only
+# and the full sort (SELECT_TOP16 is a compile-time False there).
 import os
 from collections.abc import Callable
 from typing import Any
@@ -70,6 +90,15 @@ _SM70_QWEN38_ROUTER_TOPK_LEGACY_MAX_M = 16
 _SM70_QWEN38_ROUTER_TOPK_RUNTIME_M_MAX_M = 32
 # Verify rows per request (1 + k) admitted by the MTP-lane contract.
 _SX_MTP_LANE_MAX_VERIFY_Q = 8
+# Upstream-port switches (see the top): lane routers' sort key.
+_SX_OPT_MTP_ROUTER_PACKED_KEY = (
+    os.environ.get("SX_OPT_MTP_ROUTER_PACKED_KEY", "1") != "0"
+)
+_SX_OPT_MTP_ROUTER_TOP16 = os.environ.get("SX_OPT_MTP_ROUTER_TOP16", "1") != "0"
+_SM70_MTP_ROUTER_TOP16_ENV = "VLLM_SM70_MTP_ROUTER_TOP16"
+# Widths upstream qualified: packed key M1..16, top-16 selection M5/M10.
+_SM70_QWEN38_ROUTER_PACKED_KEY_MAX_M = 16
+_SM70_QWEN38_ROUTER_TOP16_ROWS = (5, 10)
 
 
 def sx_sm70_qwen38_mtp_verify_q(config: Any) -> int:
@@ -181,6 +210,62 @@ def _sm70_qwen38_router_runtime_m_for_current_config() -> bool:
     return tp_size is None or int(tp_size) == 4
 
 
+def _sx_mtp_router_key_args_for_current_config() -> tuple:
+    """Extra launcher arguments (packed-key rows, top-16) of a lane router.
+
+    ``()`` outside the SM70 Qwen3.8 native-MTP lane: the launchers then keep
+    their defaults (packed key at M1 only; top-16 selection only with an
+    explicit VLLM_SM70_MTP_ROUTER_TOP16=1, upstream's meaning). Inside the
+    lane: (16 or 1, top-16) from SX_OPT_MTP_ROUTER_PACKED_KEY /
+    SX_OPT_MTP_ROUTER_TOP16, an explicit VLLM_SM70_MTP_ROUTER_TOP16 taking
+    precedence for the latter. Evaluated once per router at construction.
+    """
+    try:
+        from vllm.config.vllm import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+    except Exception:  # pragma: no cover - defensive import guard
+        config = None
+    if (
+        config is None
+        or getattr(config, "speculative_config", None) is None
+        or sx_sm70_qwen38_mtp_verify_q(config) <= 0
+    ):
+        return ()
+    packed_rows = (
+        _SM70_QWEN38_ROUTER_PACKED_KEY_MAX_M if _SX_OPT_MTP_ROUTER_PACKED_KEY else 1
+    )
+    if _SM70_MTP_ROUTER_TOP16_ENV in os.environ:
+        top16 = bool(envs.VLLM_SM70_MTP_ROUTER_TOP16)
+    else:
+        top16 = bool(_SX_OPT_MTP_ROUTER_PACKED_KEY and _SX_OPT_MTP_ROUTER_TOP16)
+    return (packed_rows, top16)
+
+
+def _sm70_qwen38_router_key_mode(
+    gating_output: torch.Tensor,
+    packed_key_max_rows: int = 1,
+    select_top16: bool | None = None,
+) -> tuple[bool, bool]:
+    """(PACKED_HALF_KEY, SELECT_TOP16) of one launch of either router kernel.
+
+    The packed key covers FP16 M1 and, for lane routers, M <=
+    ``packed_key_max_rows`` (capped at upstream's 16); top-16 selection only
+    FP16 M5/M10 and always with the packed key. ``select_top16=None`` (no
+    lane decision) reads VLLM_SM70_MTP_ROUTER_TOP16 as upstream does.
+    """
+    num_tokens = gating_output.shape[0]
+    half = gating_output.dtype == torch.float16
+    if select_top16 is None:
+        select_top16 = getattr(envs, _SM70_MTP_ROUTER_TOP16_ENV, False)
+    top16 = bool(
+        select_top16 and half and num_tokens in _SM70_QWEN38_ROUTER_TOP16_ROWS
+    )
+    packed_rows = min(int(packed_key_max_rows), _SM70_QWEN38_ROUTER_PACKED_KEY_MAX_M)
+    packed = bool(half and (num_tokens == 1 or num_tokens <= packed_rows or top16))
+    return packed, top16
+
+
 @triton.jit
 def _sm70_qwen38_router_topk_kernel(
     gating_ptr,
@@ -192,6 +277,7 @@ def _sm70_qwen38_router_topk_kernel(
     M: tl.constexpr,
     BLOCK_E: tl.constexpr,
     PACKED_HALF_KEY: tl.constexpr = False,
+    SELECT_TOP16: tl.constexpr = False,
 ) -> None:
     """Sort one exact Qwen3.8 decode or MTP verifier row per program."""
 
@@ -226,7 +312,12 @@ def _sm70_qwen38_router_topk_kernel(
         # Original int64 sort is signed: flip the key sign bit when moving
         # to a positive 25-bit key so positive logits still precede negatives.
         packed = ((key ^ 0x8000) << 9) | offsets
-        sorted_packed = tl.sort(packed, descending=False)
+        if SELECT_TOP16:
+            # Keys include the expert ID, so partial selection keeps the same
+            # total order. Only the first ten values enter normalization.
+            sorted_packed = -tl.topk(-packed, 16)
+        else:
+            sorted_packed = tl.sort(packed, descending=False)
         sorted_keys = (sorted_packed >> 9) ^ 0x8000
         sorted_ids = sorted_packed & 0x1FF
         sorted_bits = tl.where(
@@ -250,6 +341,9 @@ def _sm70_qwen38_router_topk_kernel(
         sorted_bits = tl.where(sorted_sign < 0, sorted_keys ^ -1, sorted_keys ^ min_i32)
         sorted_logits = sorted_bits.to(tl.float32, bitcast=True)
 
+    if SELECT_TOP16:
+        tl.static_assert(PACKED_HALF_KEY and K == 10)
+        offsets = tl.arange(0, 16)
     raw_weights = tl.math.exp2((sorted_logits - max_logit) * 1.4426950408889634)
     raw_weights = tl.where(invalid_row, 0.0, raw_weights)
     top_mask = offsets < K
@@ -271,8 +365,13 @@ def _sm70_qwen38_router_topk(
     topk_ids: torch.Tensor,
     token_expert_indices: torch.Tensor,
     gating_output: torch.Tensor,
+    packed_key_max_rows: int = 1,
+    select_top16: bool | None = None,
 ) -> None:
     num_tokens = gating_output.shape[0]
+    packed, top16 = _sm70_qwen38_router_key_mode(
+        gating_output, packed_key_max_rows, select_top16
+    )
     _sm70_qwen38_router_topk_kernel[(num_tokens,)](
         gating_output,
         topk_weights,
@@ -282,7 +381,8 @@ def _sm70_qwen38_router_topk(
         K=10,
         M=num_tokens,
         BLOCK_E=512,
-        PACKED_HALF_KEY=(gating_output.dtype == torch.float16 and num_tokens == 1),
+        PACKED_HALF_KEY=packed,
+        SELECT_TOP16=top16,
         num_warps=8,
     )
 
@@ -298,6 +398,7 @@ def _sm70_qwen38_router_topk_runtime_m_kernel(
     K: tl.constexpr,
     BLOCK_E: tl.constexpr,
     PACKED_HALF_KEY: tl.constexpr = False,
+    SELECT_TOP16: tl.constexpr = False,
 ) -> None:
     """_sm70_qwen38_router_topk_kernel with a runtime, non-specialized M.
 
@@ -337,7 +438,12 @@ def _sm70_qwen38_router_topk_runtime_m_kernel(
         # Original int64 sort is signed: flip the key sign bit when moving
         # to a positive 25-bit key so positive logits still precede negatives.
         packed = ((key ^ 0x8000) << 9) | offsets
-        sorted_packed = tl.sort(packed, descending=False)
+        if SELECT_TOP16:
+            # Keys include the expert ID, so partial selection keeps the same
+            # total order. Only the first ten values enter normalization.
+            sorted_packed = -tl.topk(-packed, 16)
+        else:
+            sorted_packed = tl.sort(packed, descending=False)
         sorted_keys = (sorted_packed >> 9) ^ 0x8000
         sorted_ids = sorted_packed & 0x1FF
         sorted_bits = tl.where(
@@ -361,6 +467,9 @@ def _sm70_qwen38_router_topk_runtime_m_kernel(
         sorted_bits = tl.where(sorted_sign < 0, sorted_keys ^ -1, sorted_keys ^ min_i32)
         sorted_logits = sorted_bits.to(tl.float32, bitcast=True)
 
+    if SELECT_TOP16:
+        tl.static_assert(PACKED_HALF_KEY and K == 10)
+        offsets = tl.arange(0, 16)
     raw_weights = tl.math.exp2((sorted_logits - max_logit) * 1.4426950408889634)
     raw_weights = tl.where(invalid_row, 0.0, raw_weights)
     top_mask = offsets < K
@@ -382,9 +491,15 @@ def _sm70_qwen38_router_topk_runtime_m(
     topk_ids: torch.Tensor,
     token_expert_indices: torch.Tensor,
     gating_output: torch.Tensor,
+    packed_key_max_rows: int = 1,
+    select_top16: bool | None = None,
 ) -> None:
-    """Launch the runtime-M router; one compiled variant serves M1..M32."""
+    """Launch the runtime-M router; one compiled variant serves M1..M32
+    (per key mode: lane routers add the packed-key / top-16 variants)."""
     num_tokens = gating_output.shape[0]
+    packed, top16 = _sm70_qwen38_router_key_mode(
+        gating_output, packed_key_max_rows, select_top16
+    )
     _sm70_qwen38_router_topk_runtime_m_kernel[(num_tokens,)](
         gating_output,
         topk_weights,
@@ -394,7 +509,8 @@ def _sm70_qwen38_router_topk_runtime_m(
         E=512,
         K=10,
         BLOCK_E=512,
-        PACKED_HALF_KEY=(gating_output.dtype == torch.float16 and num_tokens == 1),
+        PACKED_HALF_KEY=packed,
+        SELECT_TOP16=top16,
         num_warps=8,
     )
 
@@ -459,6 +575,7 @@ def fused_topk(
     indices_type: torch.dtype | None = None,
     scoring_func: str = "softmax",
     sm70_qwen38_router_runtime_m: bool = False,
+    sm70_qwen38_router_key_args: tuple = (),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused top-k routing.
 
@@ -467,6 +584,9 @@ def fused_topk(
     _sm70_qwen38_router_runtime_m_for_current_config) widens the
     exact SM70 Qwen3.8 E512/K10 Triton router from M<=16 to M<=32 using the
     runtime-M kernel. Other callers keep the previous M<=16 constexpr route.
+    ``sm70_qwen38_router_key_args`` (FusedTopKRouter in the MTP lane only,
+    see _sx_mtp_router_key_args_for_current_config) are the extra
+    (packed-key rows, top-16) launcher arguments; ``()`` keeps the defaults.
     """
     assert hidden_states.size(0) == gating_output.size(0), "Number of tokens mismatch"
 
@@ -514,6 +634,7 @@ def fused_topk(
                     topk_ids,
                     token_expert_indices,
                     gating_output,
+                    *sm70_qwen38_router_key_args,
                 )
             else:
                 logger.info_once(
@@ -524,6 +645,7 @@ def fused_topk(
                     topk_ids,
                     token_expert_indices,
                     gating_output,
+                    *sm70_qwen38_router_key_args,
                 )
             return topk_weights, topk_ids, token_expert_indices
 
@@ -572,6 +694,10 @@ class FusedTopKRouter(BaseRouter):
         self._sm70_qwen38_router_runtime_m = (
             _sm70_qwen38_router_runtime_m_for_current_config()
         )
+        # SX_OPT_MTP_ROUTER_PACKED_KEY / _TOP16: MTP-lane routers only.
+        self._sm70_qwen38_router_key_args = (
+            _sx_mtp_router_key_args_for_current_config()
+        )
 
     @property
     def routing_method_type(self) -> RoutingMethodType:
@@ -601,6 +727,9 @@ class FusedTopKRouter(BaseRouter):
             scoring_func=self.scoring_func,
             sm70_qwen38_router_runtime_m=getattr(
                 self, "_sm70_qwen38_router_runtime_m", False
+            ),
+            sm70_qwen38_router_key_args=getattr(
+                self, "_sm70_qwen38_router_key_args", ()
             ),
         )
 

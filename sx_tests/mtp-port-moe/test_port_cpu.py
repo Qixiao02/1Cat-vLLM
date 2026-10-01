@@ -11,7 +11,9 @@ skip; ``--noconftest`` keeps tests/conftest.py, which imports vLLM, out):
     PYTHONPATH=sx_tests/mtp-port-moe python -m pytest -q --noconftest \\
         -p port_boot \\
         tests/quantization/test_sm70_nvfp4_grouped_decode_dispatch.py \\
-        tests/kernels/moe/test_sm70_mtp_moe_fp16.py
+        tests/kernels/moe/test_sm70_mtp_moe_fp16.py \\
+        tests/kernels/moe/test_sm70_router_key_dispatch.py \\
+        sx_tests/moe-router/test_router32.py
 
 Inside the image (vLLM installed, the group's files bind-mounted) the real
 modules are used and the same commands work.
@@ -46,6 +48,16 @@ Item 2 (exact FP16 draft MoE projections, SX_OPT_MTP_MOE_FP16_EXACT):
   its Triton calls (W13 still without routing weights); the drafter arms
   the op only under _is_sm70_qwen38_mtp_lane_contract (SX_OPT_MTP_LANE=0,
   other methods, k > 7, TP2 and partial configs refuse).
+Item 3 (router packed key M<=16, top-16 selection; SX_OPT_MTP_ROUTER_*):
+* construction: lane target and draft routers carry (16, top-16) launcher
+  arguments; the switches and an explicit VLLM_SM70_MTP_ROUTER_TOP16 decide
+  them; no-MTP, no config, EAGLE, SX_OPT_MTP_LANE=0,
+  SX_OPT_MTP_MOE_ROUTES=0, TP2 and k > 7 carry () (previous launch);
+* fused_topk forwards exactly those arguments to whichever router kernel
+  it launches (none outside the lane);
+* the launch key mode for M1..32 x FP16/BF16: packed key at M1, at M<=16
+  for lane routers (capped at 16), top-16 only at FP16 M5/M10 and always
+  with the packed key.
 Expected: all pass.
 """
 
@@ -640,3 +652,156 @@ def test_mtp_draft_arms_fp16_exact_in_lane_only():
         mp.setenv("SX_OPT_MTP_LANE", "0")
         assert not lane(NS(model_config=target, speculative_config=spec(),
                            parallel_config=parallel))
+
+
+# ----------------------------------------------------------------------------
+# item 3: router packed key M<=16 and top-16 selection (lane routers)
+router = MODULES["router"]
+TOP16_ENV = "VLLM_SM70_MTP_ROUTER_TOP16"
+
+
+def _text_config():
+    return NS(hidden_size=2560, num_hidden_layers=48, num_experts=512,
+              num_experts_per_tok=10, moe_intermediate_size=640, hc_count=4,
+              hc_lowrank=320, num_attention_heads=24, num_key_value_heads=2,
+              indexer_head_dim=128, indexer_budget=2048,
+              indexer_compress_ratio=4)
+
+
+def _target():
+    return NS(hf_text_config=_text_config(), architectures=["Qwen4ExpForCausalLM"],
+              multimodal_config=None, dtype=torch.float16)
+
+
+def _parallel(tp=4):
+    return NS(tensor_parallel_size=tp, pipeline_parallel_size=1, enable_dbo=False,
+              use_ubatching=False, ubatch_size=0)
+
+
+def router_config(kind: str = "lane", k: int = 4):
+    spec = NS(method="eagle" if kind == "eagle" else "mtp",
+              num_speculative_tokens=k, use_qwen4_exp_mtp=lambda: True,
+              num_speculative_state_tokens=lambda: k, parallel_drafting=False,
+              rejection_sample_method="standard",
+              target_model_config=_target(),
+              target_parallel_config=_parallel())
+    if kind == "nomtp":
+        spec = None
+    model = (NS(hf_text_config=NS(hidden_size=2560, num_hidden_layers=1),
+                architectures=["Qwen4ExpMTPModel"], multimodal_config=None,
+                dtype=torch.float16)
+             if kind == "draft" else _target())
+    return NS(speculative_config=spec, model_config=model,
+              parallel_config=_parallel())
+
+
+@pytest.fixture
+def lane_router(monkeypatch):
+    """SM70 platform, lane switches at their defaults, env unset."""
+    import vllm.config.vllm as vcfg
+
+    monkeypatch.setattr(router, "current_platform",
+                        NS(is_device_capability=lambda cap, *a, **k: cap == 70))
+    for name in ("_SX_OPT_MTP_MOE_ROUTES", "_SX_OPT_ROUTER32",
+                 "_SX_OPT_MTP_ROUTER_PACKED_KEY", "_SX_OPT_MTP_ROUTER_TOP16"):
+        monkeypatch.setattr(router, name, True)
+    monkeypatch.delenv("SX_OPT_MTP_LANE", raising=False)
+    monkeypatch.delenv(TOP16_ENV, raising=False)
+    getattr(envs, "disable_envs_cache", lambda: None)()
+
+    def use(cfg):
+        monkeypatch.setattr(vcfg, "get_current_vllm_config_or_none", lambda: cfg)
+        return router._sx_mtp_router_key_args_for_current_config()
+
+    return use
+
+
+def test_router_key_args_lane(monkeypatch, lane_router):
+    assert lane_router(router_config("lane")) == (16, True)
+    assert lane_router(router_config("draft")) == (16, True)  # MTP drafter
+    assert lane_router(router_config("lane", k=2)) == (16, True)  # any k
+    monkeypatch.setattr(router, "_SX_OPT_MTP_ROUTER_TOP16", False)
+    assert lane_router(router_config("lane")) == (16, False)
+    monkeypatch.setattr(router, "_SX_OPT_MTP_ROUTER_PACKED_KEY", False)
+    monkeypatch.setattr(router, "_SX_OPT_MTP_ROUTER_TOP16", True)
+    assert lane_router(router_config("lane")) == (1, False)  # top-16 needs it
+
+
+@pytest.mark.parametrize("value", ["0", "1"])
+def test_router_key_args_explicit_env(monkeypatch, lane_router, value):
+    monkeypatch.setenv(TOP16_ENV, value)
+    getattr(envs, "disable_envs_cache", lambda: None)()
+    assert lane_router(router_config("lane")) == (16, value == "1")
+    assert lane_router(router_config("nomtp")) == ()  # launch default reads it
+
+
+@pytest.mark.parametrize("case", ["nomtp", "none", "eagle", "lane_off",
+                                  "routes_off", "tp2", "k8"])
+def test_router_key_args_outside_lane(monkeypatch, lane_router, case):
+    cfg = router_config("lane")
+    if case == "nomtp":
+        cfg = router_config("nomtp")
+    elif case == "none":
+        cfg = None
+    elif case == "eagle":
+        cfg = router_config("eagle")
+    elif case == "lane_off":
+        monkeypatch.setenv("SX_OPT_MTP_LANE", "0")
+    elif case == "routes_off":
+        monkeypatch.setattr(router, "_SX_OPT_MTP_MOE_ROUTES", False)
+    elif case == "tp2":
+        cfg.speculative_config.target_parallel_config = _parallel(2)
+    else:
+        cfg = router_config("lane", k=8)
+    assert lane_router(cfg) == ()
+
+
+def test_router_stores_key_args(monkeypatch, lane_router):
+    import vllm.config.vllm as vcfg
+
+    for cfg, expected in ((router_config("lane"), (16, True)),
+                          (router_config("nomtp"), ())):
+        monkeypatch.setattr(vcfg, "get_current_vllm_config_or_none", lambda c=cfg: c)
+        built = router.FusedTopKRouter(top_k=10, global_num_experts=512,
+                                       scoring_func="softmax", renormalize=True)
+        assert built._sm70_qwen38_router_key_args == expected
+
+
+@pytest.mark.parametrize("runtime_m", [False, True])
+@pytest.mark.parametrize("key_args", [(), (16, True), (16, False), (1, False)])
+def test_fused_topk_forwards_key_args(monkeypatch, runtime_m, key_args):
+    seen = []
+    monkeypatch.setattr(router, "current_platform",
+                        NS(is_device_capability=lambda cap, *a, **k: cap == 70))
+    monkeypatch.setattr(router, "envs", NS(VLLM_SM70_QWEN38_ROUTER_TOPK=True))
+    monkeypatch.setattr(router, "_sm70_qwen38_router_topk",
+                        lambda *a: seen.append(("legacy", a[4:])))
+    monkeypatch.setattr(router, "_sm70_qwen38_router_topk_runtime_m",
+                        lambda *a: seen.append(("runtime", a[4:])))
+    for m in (1, 5, 10, 16):
+        seen.clear()
+        router.fused_topk(torch.empty(m, 2560, dtype=torch.float16),
+                          torch.empty(m, 512, dtype=torch.float16), 10, True,
+                          sm70_qwen38_router_runtime_m=runtime_m,
+                          sm70_qwen38_router_key_args=key_args)
+        assert seen == [("runtime" if runtime_m else "legacy", key_args)]
+
+
+@pytest.mark.parametrize("rows", range(1, 33))
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_router_key_mode_table(monkeypatch, rows, dtype):
+    monkeypatch.setattr(router.envs, "VLLM_SM70_MTP_ROUTER_TOP16", False)
+    x = torch.empty(rows, 512, dtype=dtype)
+    half = dtype == torch.float16
+    assert router._sm70_qwen38_router_key_mode(x) == (half and rows == 1, False)
+    assert router._sm70_qwen38_router_key_mode(x, 16, False) == (
+        half and rows <= 16, False)
+    top16 = half and rows in (5, 10)
+    assert router._sm70_qwen38_router_key_mode(x, 16, True) == (
+        half and rows <= 16, top16)
+    # top-16 forces the packed key at its two widths, even with M1-only rows
+    assert router._sm70_qwen38_router_key_mode(x, 1, True) == (
+        half and (rows == 1 or top16), top16)
+    # a wider request is capped at upstream's 16 rows
+    assert router._sm70_qwen38_router_key_mode(x, 32, False)[0] == (
+        half and rows <= 16)
