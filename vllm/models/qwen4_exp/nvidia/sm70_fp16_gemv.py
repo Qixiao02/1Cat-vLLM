@@ -92,6 +92,17 @@ wins over the upstream alias, whose name keeps working):
     cuBLAS path's four contiguous K640 FP32 partitions, one per m8n8k4 quad
     pair, reduced left to right by warp shuffles, FP16 output. +120 MiB/rank
     for the 48 target routers (upstream counts 122.5 MiB with its draft).
+``SX_OPT_MTP_SHARED_BATCH=1`` (alias ``VLLM_SM70_MTP_SHARED_BATCH``)
+    Packed-MMA shared-expert gate/up projection with its SiLU-and-multiply
+    (qwen38_shared_up_batch_sm70_out), installed as the shared expert's
+    ``forward_fused_silu_and_mul`` hook: eight K320 partitions each rounded
+    to FP16 like the cuBLAS split-K, left-to-right FP32 reduction, FP16
+    projection, FP16 SiLU, FP16 multiply. Other widths run the original
+    F.linear + _C.silu_and_mul inside the same opaque op. +75 MiB/rank for
+    the 48 target shared experts (upstream counts 76.6 MiB with its draft).
+    Upstream's shared-gate sigmoid/multiply epilogue is not ported: the
+    fork's exact multi-row shared gate (SX_OPT_SHARED_GATE_ROWS, qwen2_moe.py)
+    already fuses gate dot + sigmoid + multiply for those rows.
 ``SX_OPT_MTP_BATCH_OVER_ROWS=0``
     Where an SX_OPT_ROWS multi-row kernel already serves a role at that
     width (router and fused GDN input at M5 with the default table), it keeps
@@ -105,6 +116,7 @@ from __future__ import annotations
 
 import functools
 import os
+from types import MethodType
 from typing import NamedTuple
 
 import torch
@@ -140,6 +152,7 @@ _QSA_QKV_SUFFIX = ".self_attn.qkv_proj"
 _QSA_OUT_SUFFIX = ".self_attn.o_proj"
 _QSA_INDEX_SUFFIX = ".self_attn.indexer.index_qk_proj"
 _ROUTER_SUFFIX = ".mlp.gate"
+_SHARED_UP_SUFFIX = ".mlp.shared_expert.gate_up_proj"
 
 # Plans are cold-cache CUDA Graph winners on real checkpoint weights. Keep the
 # role in the key: GDN and QSA can share a physical shape while remaining
@@ -349,6 +362,7 @@ class _SxMtpBatchConfig(NamedTuple):
     hc_cooperative: bool
     hc_full_unroll: bool
     router: bool
+    shared: bool
     over_rows: bool
 
 
@@ -371,6 +385,9 @@ def _sx_mtp_batch_config() -> _SxMtpBatchConfig:
         ),
         router=_sx_mtp_switch(
             "SX_OPT_MTP_ROUTER_BATCH", "VLLM_SM70_MTP_ROUTER_BATCH", "1"
+        ),
+        shared=_sx_mtp_switch(
+            "SX_OPT_MTP_SHARED_BATCH", "VLLM_SM70_MTP_SHARED_BATCH", "1"
         ),
         over_rows=os.environ.get("SX_OPT_MTP_BATCH_OVER_ROWS", "0").strip()
         not in ("", "0"),
@@ -472,6 +489,35 @@ def _router_batch_runtime_ok(
         and packed.is_contiguous()
         and packed.data_ptr() % 16 == 0
         and _sx_mtp_batch_takes_width(rows_tile)
+    )
+
+
+_SHARED_BATCH_PACKED_SHAPE = (10, 160, 2, 32, 8)
+
+
+def _pack_shared_batch_weight(weight: torch.Tensor) -> torch.Tensor:
+    """N32/K16 tiles of the TP4 shared-expert gate/up [320, 2560] shard."""
+    if weight.dtype != torch.float16 or weight.shape != (320, 2560):
+        raise ValueError("Shared expert batch packing requires FP16 [320, 2560]")
+    return weight.detach().reshape(10, 32, 160, 2, 8).permute(0, 2, 3, 1, 4).contiguous()
+
+
+def _shared_batch_runtime_ok(x: torch.Tensor, packed: torch.Tensor | None) -> bool:
+    # The packed copy exists only where the loader admitted the MTP lane.
+    return bool(
+        packed is not None
+        and _sx_mtp_batch_config().shared
+        and _sx_mtp_batch_rows_ok(x)
+        and x.shape[1] == 2560
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and tuple(packed.shape) == _SHARED_BATCH_PACKED_SHAPE
+        and packed.device == x.device
+        and packed.dtype == x.dtype
+        and packed.is_contiguous()
+        and packed.data_ptr() % 16 == 0
     )
 
 
@@ -1168,6 +1214,49 @@ direct_register_custom_op(
 )
 
 
+def _qwen38_sm70_shared_up(
+    x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Shared-expert gate/up + SiLU-and-multiply (SX_OPT_MTP_SHARED_BATCH)."""
+    if _shared_batch_runtime_ok(x, packed):
+        assert packed is not None
+        out = x.new_empty((x.shape[0], 160))
+        partial = x.new_empty((8, x.shape[0], 320))
+        torch.ops._C.qwen38_shared_up_batch_sm70_out(out, partial, x, packed)
+        logger.info_once(
+            "SM70 Qwen3.8 MTP exact shared-expert batch projection enabled "
+            "(SX_OPT_MTP_SHARED_BATCH)."
+        )
+        return out
+    # Every other width: the shared expert's own linear and SiluAndMul.
+    gate_up = torch.nn.functional.linear(x, weight)
+    out = gate_up.new_empty((*gate_up.shape[:-1], 160))
+    torch.ops._C.silu_and_mul(out, gate_up)
+    return out
+
+
+def _qwen38_sm70_shared_up_fake(
+    x: torch.Tensor, weight: torch.Tensor, packed: torch.Tensor | None = None
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], 160))
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_shared_up",
+    op_func=_qwen38_sm70_shared_up,
+    fake_impl=_qwen38_sm70_shared_up_fake,
+)
+
+
+def _forward_shared_batch_silu(layer: nn.Module, x: torch.Tensor):
+    """forward_fused_silu_and_mul of an admitted shared expert's gate/up."""
+    if not use_sm70_decode_graph_semantics():
+        return None  # Prefill/mixed: the module's own linear + SiluAndMul.
+    return torch.ops.vllm.qwen38_sm70_shared_up(
+        x, layer.weight, getattr(layer, "_sm70_mtp_shared_packed", None)
+    )
+
+
 def _sx_gdn_rows_tile(
     x: torch.Tensor, qkvz_weight: torch.Tensor, ba_weight: torch.Tensor
 ) -> int:
@@ -1326,6 +1415,14 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
                 _pack_router_batch_weight,
                 "SX_OPT_MTP_ROUTER_BATCH",
             )
+        if getattr(layer, "_sm70_mtp_prepare_shared_batch", False):
+            _sx_prepare_packed(
+                layer,
+                "_sm70_mtp_shared_packed",
+                "qwen38_shared_up_batch_sm70_out",
+                _pack_shared_batch_weight,
+                "SX_OPT_MTP_SHARED_BATCH",
+            )
 
     def apply(
         self,
@@ -1429,8 +1526,10 @@ def enable_qwen38_sm70_fp16_gemv(
     # method makes once the checkpoint is loaded (admitted lane only).
     mtp_batch = _sx_mtp_batch_contract(vllm_config)
     router_batch = bool(mtp_batch and _sx_mtp_batch_config().router)
+    shared_batch = bool(mtp_batch and _sx_mtp_batch_config().shared)
     replaced = 0
     router_tagged = 0
+    shared_tagged = 0
     for child in module.modules():
         if not (
             isinstance(child, LinearBase)
@@ -1442,6 +1541,21 @@ def enable_qwen38_sm70_fp16_gemv(
             continue
         shape = (int(weight.shape[0]), int(weight.shape[1]))
         prefix = str(getattr(child, "prefix", ""))
+        if (
+            shared_batch
+            and prefix.endswith(_SHARED_UP_SUFFIX)
+            and shape == (320, 2560)
+        ):
+            # No M1 plan: the FP16 method only packs it after loading; its
+            # apply() keeps the unquantized path, and the hook below replaces
+            # linear + SiluAndMul under decode semantics only.
+            child.quant_method = Qwen38SM70FP16LinearMethod()
+            child._sm70_mtp_prepare_shared_batch = True
+            child.forward_fused_silu_and_mul = MethodType(
+                _forward_shared_batch_silu, child
+            )
+            shared_tagged += 1
+            continue
         if _plan_for(prefix, shape) is None:
             continue
         child.quant_method = Qwen38SM70FP16LinearMethod()
@@ -1501,6 +1615,12 @@ def enable_qwen38_sm70_fp16_gemv(
             "SX_OPT_MTP_ROUTER_BATCH: %d routers will carry packed copies "
             "(2.5 MiB each) for the M5/M10 MTP verify.",
             router_tagged,
+        )
+    if shared_tagged:
+        logger.info_once(
+            "SX_OPT_MTP_SHARED_BATCH: %d shared experts will carry packed "
+            "gate/up copies (1.5625 MiB each) for the M5/M10 MTP verify.",
+            shared_tagged,
         )
 
 

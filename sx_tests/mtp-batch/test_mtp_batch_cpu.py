@@ -35,6 +35,15 @@ Asserted (SX_OPT_MTP_ROUTER_BATCH, SX_OPT_MTP_BATCH_OVER_ROWS):
   the rows tile of that call; everything else keeps its old route;
 * the loader tags only routers, only in the admitted lane; packing happens
   only for tagged layers with the native op; apply() forwards the pack.
+
+Asserted (SX_OPT_MTP_SHARED_BATCH):
+* switch parsing; packing keeps every gate/up weight bit;
+* the opaque op takes the native kernel only when admitted, otherwise runs
+  the shared expert's own F.linear + _C.silu_and_mul on the same inputs;
+* the hook returns None outside decode semantics (module path unchanged)
+  and forwards the packed copy inside them;
+* the loader tags (method + hook) only the [320, 2560] shared gate/up of the
+  admitted lane; packing happens only for tagged layers with the native op.
 """
 
 from __future__ import annotations
@@ -67,6 +76,8 @@ SWITCHES = (
     "SX_OPT_MTP_ROUTER_BATCH",
     "VLLM_SM70_MTP_ROUTER_BATCH",
     "SX_OPT_MTP_BATCH_OVER_ROWS",
+    "SX_OPT_MTP_SHARED_BATCH",
+    "VLLM_SM70_MTP_SHARED_BATCH",
 )
 PRECISION = (
     "allow_fp16_reduced_precision_reduction",
@@ -690,6 +701,160 @@ def test_registered_gemv_op_accepts_the_router_pack():
     packed = torch.empty(64, 40, 2, 4, 8, 8, dtype=torch.float16, device="meta")
     for args in ((x, w), (x, w, ROUTER), (x, w, ROUTER, packed), (x, w, ROUTER, None)):
         assert torch.ops.vllm.qwen38_sm70_fp16_gemv(*args).shape == (10, 512)
+
+
+# ---------------------------------------------------------------------------
+# Shared-expert batch
+# ---------------------------------------------------------------------------
+SHARED = "model.layers.3.mlp.shared_expert.gate_up_proj"
+
+
+@pytest.mark.parametrize(
+    "env,shared",
+    [
+        ({}, True),
+        ({"SX_OPT_MTP_SHARED_BATCH": "0"}, False),
+        ({"VLLM_SM70_MTP_SHARED_BATCH": "0"}, False),
+        ({"SX_OPT_MTP_SHARED_BATCH": "1", "VLLM_SM70_MTP_SHARED_BATCH": "0"}, True),
+    ],
+)
+def test_shared_switches(monkeypatch, env, shared):
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    _reset_env_cache()
+    assert gemv._sx_mtp_batch_config().shared == shared
+
+
+def test_shared_pack_preserves_every_weight_bit():
+    raw = torch.randint(-(2**15), 2**15, (320, 2560), dtype=torch.int16)
+    packed = gemv._pack_shared_batch_weight(raw.view(torch.float16))
+    assert packed.shape == (10, 160, 2, 32, 8)
+    restored = packed.permute(0, 3, 1, 2, 4).contiguous().view(320, 2560)
+    assert torch.equal(restored.view(torch.int16), raw)
+    for shape, dtype in (((321, 2560), torch.float16), ((320, 2560), torch.float32)):
+        with pytest.raises(ValueError):
+            gemv._pack_shared_batch_weight(torch.empty(shape, dtype=dtype))
+
+
+def test_shared_runtime_admission(monkeypatch):
+    x = _fake_cuda(torch.zeros(10, 2560, dtype=torch.float16))
+    packed = _fake_cuda(torch.zeros(10, 160, 2, 32, 8, dtype=torch.float16))
+    with _verify_capture():
+        assert gemv._shared_batch_runtime_ok(x, packed)
+        assert not gemv._shared_batch_runtime_ok(x, None)
+        assert not gemv._shared_batch_runtime_ok(x[:8], packed)
+        assert not gemv._shared_batch_runtime_ok(x.as_subclass(torch.Tensor), packed)
+        assert not gemv._shared_batch_runtime_ok(x, packed[:5])
+    assert not gemv._shared_batch_runtime_ok(x, packed)
+    monkeypatch.setenv("SX_OPT_MTP_SHARED_BATCH", "0")
+    _reset_env_cache()
+    with _verify_capture():
+        assert not gemv._shared_batch_runtime_ok(x, packed)
+
+
+@pytest.mark.parametrize("admit", [True, False])
+def test_shared_up_op_dispatch(monkeypatch, admit):
+    monkeypatch.setattr(gemv, "_shared_batch_runtime_ok", lambda x, p: admit)
+    native = _NativeC("qwen38_shared_up_batch_sm70_out", "silu_and_mul")
+    torch.manual_seed(3)
+    x = torch.randn(5, 2560).half()
+    w = (torch.randn(320, 2560) * 0.02).half()
+    packed = torch.empty(10, 160, 2, 32, 8, dtype=torch.float16)
+    expected_gate_up = torch.nn.functional.linear(x, w)
+    _swap_native(monkeypatch, native)
+    out = gemv._qwen38_sm70_shared_up(x, w, packed)
+    assert out.shape == (5, 160) and out.dtype == torch.float16
+    ((name, args),) = native.calls
+    if admit:
+        assert name == "qwen38_shared_up_batch_sm70_out"
+        assert args[0] is out and args[2] is x and args[3] is packed
+        assert args[1].shape == (8, 5, 320) and args[1].dtype == torch.float16
+    else:
+        assert name == "silu_and_mul" and args[0] is out
+        assert torch.equal(args[1].view(torch.int16), expected_gate_up.view(torch.int16))
+
+
+def test_shared_hook(monkeypatch):
+    calls = []
+
+    def op(*args):
+        calls.append(args)
+        return "out"
+
+    layer = _Dense(SHARED, (320, 2560))
+    packed = torch.empty(10, 160, 2, 32, 8, dtype=torch.float16, device="meta")
+    x = torch.empty(5, 2560, dtype=torch.float16, device="meta")
+    monkeypatch.setattr(gemv, "use_sm70_decode_graph_semantics", lambda: False)
+    assert gemv._forward_shared_batch_silu(layer, x) is None
+    monkeypatch.setattr(gemv, "use_sm70_decode_graph_semantics", lambda: True)
+    _swap_native(monkeypatch, _NativeC(), SimpleNamespace(qwen38_sm70_shared_up=op))
+    assert gemv._forward_shared_batch_silu(layer, x) == "out"
+    assert calls[-1][0] is x and calls[-1][1] is layer.weight and calls[-1][2] is None
+    layer.register_buffer("_sm70_mtp_shared_packed", packed, persistent=False)
+    assert gemv._forward_shared_batch_silu(layer, x) == "out"
+    assert calls[-1][2] is packed
+
+
+@pytest.mark.parametrize(
+    "config,switch,tagged",
+    [(4, None, True), (4, "0", False), (5, None, False), (None, None, False)],
+)
+def test_shared_loader_tags_only_the_lane(monkeypatch, config, switch, tagged):
+    monkeypatch.setattr(gemv, "LinearBase", _Dense)
+    monkeypatch.setattr(gemv.current_platform, "is_device_capability", lambda _: True)
+    monkeypatch.setenv("VLLM_SM70_QWEN38_FP16_GEMV", "1")
+    monkeypatch.setenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0")
+    monkeypatch.setenv("VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16", "0")
+    if switch is not None:
+        monkeypatch.setenv("SX_OPT_MTP_SHARED_BATCH", switch)
+    _reset_env_cache()
+    model = torch.nn.Module()
+    model.shared = _Dense(SHARED, (320, 2560))
+    model.wide = _Dense(SHARED, (640, 2560))
+    model.expert = _Dense("model.layers.3.mlp.experts.gate_up_proj", (320, 2560))
+    gemv.enable_qwen38_sm70_fp16_gemv(model, torch.float16, boot.lane_config(config))
+    assert getattr(model.shared, "_sm70_mtp_prepare_shared_batch", False) == tagged
+    assert ("forward_fused_silu_and_mul" in vars(model.shared)) == tagged
+    if tagged:
+        assert isinstance(model.shared.quant_method, gemv.Qwen38SM70FP16LinearMethod)
+        assert model.shared.forward_fused_silu_and_mul.__func__ is (
+            gemv._forward_shared_batch_silu
+        )
+    else:
+        assert type(model.shared.quant_method) is UnquantizedLinearMethod
+    for other in (model.wide, model.expert):
+        assert type(other.quant_method) is UnquantizedLinearMethod
+        assert not hasattr(other, "_sm70_mtp_prepare_shared_batch")
+        assert "forward_fused_silu_and_mul" not in vars(other)
+
+
+@pytest.mark.parametrize("op_present", [True, False])
+def test_shared_process_weights(monkeypatch, op_present):
+    layer = torch.nn.Module()
+    raw = torch.randint(-(2**15), 2**15, (320, 2560), dtype=torch.int16)
+    layer.weight = torch.nn.Parameter(_fake_cuda(raw.view(torch.float16)),
+                                      requires_grad=False)
+    layer._sm70_mtp_prepare_shared_batch = True
+    native = _NativeC(*(["qwen38_shared_up_batch_sm70_out"] if op_present else []))
+    _swap_native(monkeypatch, native)
+    gemv.Qwen38SM70FP16LinearMethod().process_weights_after_loading(layer)
+    assert hasattr(layer, "_sm70_mtp_shared_packed") == op_present
+    if op_present:
+        expected = gemv._pack_shared_batch_weight(raw.view(torch.float16))
+        assert torch.equal(
+            layer._sm70_mtp_shared_packed.as_subclass(torch.Tensor).view(torch.int16),
+            expected.view(torch.int16),
+        )
+        assert "_sm70_mtp_shared_packed" not in layer.state_dict()
+
+
+def test_registered_shared_op_fake_shapes():
+    w = torch.empty(320, 2560, dtype=torch.float16, device="meta")
+    packed = torch.empty(10, 160, 2, 32, 8, dtype=torch.float16, device="meta")
+    for m in (1, 5, 10, 17):
+        x = torch.empty(m, 2560, dtype=torch.float16, device="meta")
+        for args in ((x, w), (x, w, packed), (x, w, None)):
+            assert torch.ops.vllm.qwen38_sm70_shared_up(*args).shape == (m, 160)
 
 
 if __name__ == "__main__":

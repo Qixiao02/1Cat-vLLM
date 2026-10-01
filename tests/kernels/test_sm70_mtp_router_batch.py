@@ -77,6 +77,9 @@ def test_native_and_dispatch_changed_input_graph(mtp_env, rows, over_rows):
     packed = gemv._pack_router_batch_weight(w)
     expected = torch.empty(rows, 512, device="cuda", dtype=torch.float16)
     actual = torch.empty_like(expected)
+    with _mtp_verify_capture():
+        tile = gemv._sx_rows_tile(x, w, gemv._sx_role_key(ROLE, (512, 2560)))
+        assert gemv._router_batch_runtime_ok(x, packed, tile)  # the batch route
 
     def run():
         torch.mm(x, w.t(), out=expected)
