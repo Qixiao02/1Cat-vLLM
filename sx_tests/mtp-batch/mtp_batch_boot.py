@@ -112,6 +112,7 @@ def _install_stubs() -> None:
         dispatch_key="CPU",
         is_device_capability=lambda capability: False,
         is_cuda=lambda: False,
+        is_arch_support_pdl=lambda: False,
     )
     sys.modules["vllm.platforms"] = platforms
 
@@ -119,7 +120,8 @@ def _install_stubs() -> None:
     config.get_current_vllm_config = _get_current_vllm_config
     config.get_current_vllm_config_or_none = lambda: CURRENT_CONFIG[0]
     config_vllm = types.ModuleType("vllm.config.vllm")
-    exec(compile(_contract_source(), CONFIG_VLLM, "exec"), config_vllm.__dict__)  # noqa: S102
+    code = compile(_contract_source(), CONFIG_VLLM, "exec")
+    exec(code, config_vllm.__dict__)  # noqa: S102
     sys.modules["vllm.config.vllm"] = config_vllm
     config.vllm = config_vllm
 

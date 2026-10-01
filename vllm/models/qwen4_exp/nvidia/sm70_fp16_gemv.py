@@ -508,6 +508,39 @@ def _router_batch_runtime_ok(
 
 
 _SHARED_BATCH_PACKED_SHAPE = (10, 160, 2, 32, 8)
+
+
+def _pack_shared_batch_weight(weight: torch.Tensor) -> torch.Tensor:
+    """N32/K16 tiles of the TP4 shared-expert gate/up [320, 2560] shard."""
+    if weight.dtype != torch.float16 or weight.shape != (320, 2560):
+        raise ValueError("Shared expert batch packing requires FP16 [320, 2560]")
+    return (
+        weight.detach()
+        .reshape(10, 32, 160, 2, 8)
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+    )
+
+
+def _shared_batch_runtime_ok(x: torch.Tensor, packed: torch.Tensor | None) -> bool:
+    # The packed copy exists only where the loader admitted the MTP lane.
+    return bool(
+        packed is not None
+        and _sx_mtp_batch_config().shared
+        and _sx_mtp_batch_rows_ok(x)
+        and x.shape[1] == 2560
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and tuple(packed.shape) == _SHARED_BATCH_PACKED_SHAPE
+        and packed.device == x.device
+        and packed.dtype == x.dtype
+        and packed.is_contiguous()
+        and packed.data_ptr() % 16 == 0
+    )
+
+
 _GDN_QKVZ_PACKED_SHAPE = (128, 160, 2, 32, 8)
 _GDN_BA_PACKED_SHAPE = (1, 160, 2, 32, 8)
 
@@ -552,37 +585,6 @@ def _can_use_packed_gdn_input(
         )
         and current_platform.is_device_capability(70)
         and _sx_mtp_batch_takes_width(rows_tile)
-    )
-
-
-def _pack_shared_batch_weight(weight: torch.Tensor) -> torch.Tensor:
-    """N32/K16 tiles of the TP4 shared-expert gate/up [320, 2560] shard."""
-    if weight.dtype != torch.float16 or weight.shape != (320, 2560):
-        raise ValueError("Shared expert batch packing requires FP16 [320, 2560]")
-    return (
-        weight.detach()
-        .reshape(10, 32, 160, 2, 8)
-        .permute(0, 2, 3, 1, 4)
-        .contiguous()
-    )
-
-
-def _shared_batch_runtime_ok(x: torch.Tensor, packed: torch.Tensor | None) -> bool:
-    # The packed copy exists only where the loader admitted the MTP lane.
-    return bool(
-        packed is not None
-        and _sx_mtp_batch_config().shared
-        and _sx_mtp_batch_rows_ok(x)
-        and x.shape[1] == 2560
-        and x.is_cuda
-        and x.dtype == torch.float16
-        and x.is_contiguous()
-        and x.data_ptr() % 16 == 0
-        and tuple(packed.shape) == _SHARED_BATCH_PACKED_SHAPE
-        and packed.device == x.device
-        and packed.dtype == x.dtype
-        and packed.is_contiguous()
-        and packed.data_ptr() % 16 == 0
     )
 
 

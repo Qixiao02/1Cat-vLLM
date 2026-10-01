@@ -168,8 +168,14 @@ class _Comm:
         ({}, (True, True, True)),
         ({"SX_OPT_MTP_HC_BATCH": "0"}, (False, True, True)),
         ({"VLLM_SM70_MTP_HC_BATCH": "0"}, (False, True, True)),
-        ({"SX_OPT_MTP_HC_BATCH": "1", "VLLM_SM70_MTP_HC_BATCH": "0"}, (True, True, True)),
-        ({"SX_OPT_MTP_HC_BATCH": " ", "VLLM_SM70_MTP_HC_BATCH": "0"}, (False, True, True)),
+        (
+            {"SX_OPT_MTP_HC_BATCH": "1", "VLLM_SM70_MTP_HC_BATCH": "0"},
+            (True, True, True),
+        ),
+        (
+            {"SX_OPT_MTP_HC_BATCH": " ", "VLLM_SM70_MTP_HC_BATCH": "0"},
+            (False, True, True),
+        ),
         ({"SX_OPT_MTP_HC_COOPERATIVE": "0"}, (True, False, True)),
         ({"VLLM_SM70_MTP_HC_FULL_UNROLL": "0"}, (True, True, False)),
     ],
@@ -519,9 +525,8 @@ class _NativeC:
 
 def _swap_native(monkeypatch, native: _NativeC, vllm_ops=None) -> None:
     """Replace torch.ops for the module under test (restored by monkeypatch)."""
-    monkeypatch.setattr(
-        gemv.torch, "ops", SimpleNamespace(_C=native, vllm=vllm_ops or SimpleNamespace())
-    )
+    ops = SimpleNamespace(_C=native, vllm=vllm_ops or SimpleNamespace())
+    monkeypatch.setattr(gemv.torch, "ops", ops)
 
 
 @pytest.mark.parametrize(
@@ -530,7 +535,11 @@ def _swap_native(monkeypatch, native: _NativeC, vllm_ops=None) -> None:
         ({}, True, False),
         ({"SX_OPT_MTP_ROUTER_BATCH": "0"}, False, False),
         ({"VLLM_SM70_MTP_ROUTER_BATCH": "0"}, False, False),
-        ({"SX_OPT_MTP_ROUTER_BATCH": "1", "VLLM_SM70_MTP_ROUTER_BATCH": "0"}, True, False),
+        (
+            {"SX_OPT_MTP_ROUTER_BATCH": "1", "VLLM_SM70_MTP_ROUTER_BATCH": "0"},
+            True,
+            False,
+        ),
         ({"SX_OPT_MTP_BATCH_OVER_ROWS": "1"}, True, True),
         ({"SX_OPT_MTP_BATCH_OVER_ROWS": "0"}, True, False),
     ],
@@ -563,7 +572,9 @@ def test_router_bad_pack_rejected(shape, dtype):
 @pytest.mark.parametrize(
     "tile,over_rows,admitted", [(0, "0", True), (5, "0", False), (5, "1", True)]
 )
-def test_router_runtime_admission_and_precedence(monkeypatch, tile, over_rows, admitted):
+def test_router_runtime_admission_and_precedence(
+    monkeypatch, tile, over_rows, admitted
+):
     monkeypatch.setenv("SX_OPT_MTP_BATCH_OVER_ROWS", over_rows)
     _reset_env_cache()
     x = _fake_cuda(torch.zeros(5, 2560, dtype=torch.float16))
@@ -596,7 +607,9 @@ def test_router_dispatch(monkeypatch, admit, rows_tile):
     monkeypatch.setattr(gemv, "_sx_rows_tile", lambda *a: rows_tile)
     rows_calls = []
     monkeypatch.setattr(
-        gemv, "_sx_rows_gemv", lambda x, w, plan, tile: rows_calls.append(tile) or "rows"
+        gemv,
+        "_sx_rows_gemv",
+        lambda x, w, plan, tile: rows_calls.append(tile) or "rows",
     )
     native = _NativeC("qwen38_router_batch_sm70_out")
     x = torch.randn(5, 2560).half()
@@ -614,8 +627,8 @@ def test_router_dispatch(monkeypatch, admit, rows_tile):
         assert out == "rows" if rows_tile else out.shape == (5, 512)
     # Other roles never consult the router route.
     seen.clear()
-    gemv._qwen38_sm70_fp16_gemv(x, torch.randn(640, 2560).half(),
-                                "model.layers.3.self_attn.indexer.index_qk_proj", packed)
+    index = "model.layers.3.self_attn.indexer.index_qk_proj"
+    gemv._qwen38_sm70_fp16_gemv(x, torch.randn(640, 2560).half(), index, packed)
     assert not seen
 
 
@@ -633,7 +646,9 @@ class _Dense(torch.nn.Module):
     "config,switch,tagged",
     [(4, None, True), (4, "0", False), (2, None, False), (None, None, False)],
 )
-def test_router_loader_tags_only_routers_in_the_lane(monkeypatch, config, switch, tagged):
+def test_router_loader_tags_only_routers_in_the_lane(
+    monkeypatch, config, switch, tagged
+):
     monkeypatch.setattr(gemv, "LinearBase", _Dense)
     monkeypatch.setattr(gemv.current_platform, "is_device_capability", lambda _: True)
     monkeypatch.setenv("VLLM_SM70_QWEN38_FP16_GEMV", "1")
@@ -781,7 +796,8 @@ def test_shared_up_op_dispatch(monkeypatch, admit):
         assert args[1].shape == (8, 5, 320) and args[1].dtype == torch.float16
     else:
         assert name == "silu_and_mul" and args[0] is out
-        assert torch.equal(args[1].view(torch.int16), expected_gate_up.view(torch.int16))
+        expected = expected_gate_up.view(torch.int16)
+        assert torch.equal(args[1].view(torch.int16), expected)
 
 
 def test_shared_hook(monkeypatch):
@@ -968,7 +984,8 @@ def test_gdn_dispatch(monkeypatch, admit, rows_tile):
     if admit:
         ((name, args),) = native.calls
         assert args[:4] == outputs and args[4] is x and args[5] is pq and args[6] is pb
-        assert [tuple(o.shape) for o in outputs] == [(10, n) for n in (2560, 1536, 12, 12)]
+        shapes = [tuple(o.shape) for o in outputs]
+        assert shapes == [(10, n) for n in (2560, 1536, 12, 12)]
     else:
         assert not native.calls
         if rows_tile:

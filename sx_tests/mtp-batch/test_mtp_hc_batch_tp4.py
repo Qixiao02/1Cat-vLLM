@@ -208,7 +208,9 @@ def run(args) -> None:
                         for a, b in zip(out, ref):
                             mismatches += _bits_differ(a, b)
             if mismatches:
-                failures.append(f"rank{rank} M={m} {label}: {mismatches} FP16 mismatches")
+                failures.append(
+                    f"rank{rank} M={m} {label}: {mismatches} FP16 mismatches"
+                )
             return mismatches
 
         def replay_all(graphs):
@@ -349,7 +351,9 @@ def run(args) -> None:
                 args.out.parent.mkdir(parents=True, exist_ok=True)
                 args.out.write_text(json.dumps(result, indent=2) + "\n")
         if any(all_failures):
-            raise AssertionError(f"TP4 batch HC != replicated MTP chain: {all_failures}")
+            raise AssertionError(
+                f"TP4 batch HC != replicated MTP chain: {all_failures}"
+            )
         if rank == 0:
             print("PASS: TP4 batch HC == replicated MTP chain on all ranks.")
     finally:
