@@ -5010,9 +5010,11 @@ def compile_factors() -> dict[str, object]:
     # kernel route is silently reused for another; that is the classic
     # "cached run answers differently" report. Hash whatever is set: an
     # over-invalidated cache costs a recompile, a wrongly reused one costs
-    # correctness.
+    # correctness. The fork's SX_OPT_* switches (multi-row kernels, MTP batch
+    # routes, ...) select ops and packed-weight inputs of the traced graph in
+    # the same way.
     for name, value in os.environ.items():
-        if not name.startswith("VLLM_"):
+        if not name.startswith(("VLLM_", "SX_OPT_")):
             continue
         if name in factors or name in ignored_factors:
             continue

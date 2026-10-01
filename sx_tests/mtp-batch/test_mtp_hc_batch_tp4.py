@@ -150,13 +150,24 @@ def run(args) -> None:
     matmul = torch.backends.cuda.matmul
     matmul.allow_fp16_reduced_precision_reduction = True
     matmul.allow_fp16_accumulation = False
+    # Defaults only: the multi-row table (SX_OPT_ROWS*) decides whether the
+    # dispatcher yields M5/M10 to the multi-row HC kernel.
     for key in (
         "SX_OPT_MTP_HC_BATCH",
         "SX_OPT_MTP_HC_COOPERATIVE",
         "SX_OPT_MTP_HC_FULL_UNROLL",
+        "SX_OPT_MTP_BATCH_OVER_ROWS",
+        "VLLM_SM70_MTP_HC_BATCH",
+        "VLLM_SM70_MTP_HC_COOPERATIVE",
+        "VLLM_SM70_MTP_HC_FULL_UNROLL",
+        "SX_OPT_ROWS",
+        "SX_OPT_ROWS_TABLE",
+        "SX_OPT_ROWS_MAX_M",
+        "SX_OPT_MTP_ROWS",
     ):
         os.environ.pop(key, None)
     gemv._sx_mtp_batch_config.cache_clear()
+    gemv._sx_rows_config.cache_clear()
     dist.init_process_group("nccl")
     group = dist.new_group(backend="gloo")
     comm = CustomAllreduce(group=group, device=local_rank, max_size=8 * 1024 * 1024)

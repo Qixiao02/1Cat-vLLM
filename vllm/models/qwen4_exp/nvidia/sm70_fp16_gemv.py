@@ -79,9 +79,24 @@ of this. Switches (``os.environ``, read once per process;
 ``_sx_mtp_batch_config.cache_clear()`` re-reads them; an ``SX_OPT_*`` value
 wins over the upstream alias, whose name keeps working):
 
+Extra memory per rank (the packed copies; every switch allocates only its
+own, and only when it is on in the admitted lane):
+
+    SX_OPT_MTP_HC_BATCH       330.0 MiB  (96 pairs x 3.4375 MiB: down 1.875 +
+                                          up 1.5625)
+    SX_OPT_MTP_HC_COOPERATIVE   0        (launch schedule of the HC packs)
+    SX_OPT_MTP_HC_FULL_UNROLL   0        (K unroll of the cooperative kernel)
+    SX_OPT_MTP_ROUTER_BATCH   120.0 MiB  (48 routers x 2.5 MiB)
+    SX_OPT_MTP_SHARED_BATCH    75.0 MiB  (48 shared experts x 1.5625 MiB)
+    SX_OPT_MTP_GDN_INPUT_BATCH 725.625 MiB (36 layers x 20.15625 MiB; off)
+
+Default-on total 525.0 MiB. Independently of the switches every TP4 SM70
+deployment's custom all-reduce push buffer is 364.5 KiB larger (two batch HC
+channels, csrc/custom_all_reduce.cuh).
+
 ``SX_OPT_MTP_HC_BATCH=1`` (alias ``VLLM_SM70_MTP_HC_BATCH``)
     TP4-sharded packed-MMA HyperConnection (sm70_fp16_hc.py) through the
-    custom all-reduce's batch channels: +330 MiB/rank for the 96 HC pairs.
+    custom all-reduce's batch channels.
 ``SX_OPT_MTP_HC_COOPERATIVE=1`` (alias ``VLLM_SM70_MTP_HC_COOPERATIVE``)
     One cooperative launch for down / gather+SiLU / up+mix / gather instead
     of four launches (identical arithmetic and transport).
@@ -90,16 +105,17 @@ wins over the upstream alias, whose name keeps working):
 ``SX_OPT_MTP_ROUTER_BATCH=1`` (alias ``VLLM_SM70_MTP_ROUTER_BATCH``)
     Packed-MMA E512 router projection (qwen38_router_batch_sm70_out): the
     cuBLAS path's four contiguous K640 FP32 partitions, one per m8n8k4 quad
-    pair, reduced left to right by warp shuffles, FP16 output. +120 MiB/rank
-    for the 48 target routers (upstream counts 122.5 MiB with its draft).
+    pair, reduced left to right by warp shuffles, FP16 output.
 ``SX_OPT_MTP_SHARED_BATCH=1`` (alias ``VLLM_SM70_MTP_SHARED_BATCH``)
     Packed-MMA shared-expert gate/up projection with its SiLU-and-multiply
-    (qwen38_shared_up_batch_sm70_out), installed as the shared expert's
-    ``forward_fused_silu_and_mul`` hook: eight K320 partitions each rounded
-    to FP16 like the cuBLAS split-K, left-to-right FP32 reduction, FP16
-    projection, FP16 SiLU, FP16 multiply. Other widths run the original
-    F.linear + _C.silu_and_mul inside the same opaque op. +75 MiB/rank for
-    the 48 target shared experts (upstream counts 76.6 MiB with its draft).
+    (qwen38_shared_up_batch_sm70_out), installed after loading as the shared
+    expert's ``forward_fused_silu_and_mul`` hook: eight K320 partitions each
+    rounded to FP16 like the cuBLAS split-K, left-to-right FP32 reduction,
+    FP16 projection, FP16 SiLU, FP16 multiply. Under decode semantics every
+    width goes through the opaque op (the width is a symbolic dimension at
+    trace time); outside M5/M10 it runs the module's own F.linear +
+    _C.silu_and_mul on the same inputs. Without the packed copy (native op
+    missing) no hook is installed and the layer keeps its original path.
     Upstream's shared-gate sigmoid/multiply epilogue is not ported: the
     fork's exact multi-row shared gate (SX_OPT_SHARED_GATE_ROWS, qwen2_moe.py)
     already fuses gate dot + sigmoid + multiply for those rows.
@@ -110,17 +126,22 @@ wins over the upstream alias, whose name keeps working):
     left to right, FP16 outputs written straight into qkv/z/b/a. Upstream
     measured -0.81 ms per MTP4 round against cuBLAS at M5; here M5 already
     runs the SX_OPT_ROWS GDN-input kernel, so by default only M10 (cuBLAS
-    today) changes. Costs +725.6 MiB/rank of packed copies for the 36 GDN
-    layers (upstream: KV cache 153,910 -> 122,631 tokens), hence off by
-    default. Upstream's alias also admits no-MTP M2..16; here it only
+    today) changes. Upstream: KV cache 153,910 -> 122,631 tokens, hence off
+    by default. Upstream's alias also admits no-MTP M2..16; here it only
     enables this MTP-lane M5/M10 route.
 ``SX_OPT_MTP_BATCH_OVER_ROWS=0``
     Where an SX_OPT_ROWS multi-row kernel already serves a role at that
-    width (router and fused GDN input at M5 with the default table), it keeps
-    the width and the MTP batch route only takes the widths that would
-    otherwise fall back to cuBLAS (M10). ``1`` lets the MTP batch routes take
-    M5 from the multi-row kernels too (cuBLAS-exact instead of
-    row-equals-M1 numerics), e.g. for an A/B on the V100s.
+    width (router, fused GDN input and HC at M5/M10 when SX_OPT_ROWS_TABLE
+    admits them; with the default table that is the router and the GDN input
+    at M5), it keeps the width and the MTP batch route only takes the widths
+    that would otherwise fall back to cuBLAS. ``1`` lets the MTP batch
+    routes take those widths from the multi-row kernels too (cuBLAS-exact
+    instead of row-equals-M1 numerics), e.g. for an A/B on the V100s.
+
+Upstream names (the aliases) are parsed like upstream, ``int(value) != 0``,
+and an unparsable value raises; ``SX_OPT_*`` values follow the fork's
+convention (anything but ``0`` is on). The ``SX_OPT_*`` switches enter the
+torch.compile cache key (vllm/envs.py compile_factors).
 """
 
 from __future__ import annotations
@@ -380,9 +401,18 @@ class _SxMtpBatchConfig(NamedTuple):
 
 def _sx_mtp_switch(name: str, alias: str, default: str) -> bool:
     raw = os.environ.get(name, "").strip()
-    if not raw:
-        raw = os.environ.get(alias, "").strip()
-    return (raw or default) != "0"
+    if raw:
+        return raw != "0"  # SX_OPT_* convention
+    raw = os.environ.get(alias, "").strip()
+    if raw:
+        # Upstream's envs.py: bool(int(os.getenv(alias, default))).
+        try:
+            return int(raw) != 0
+        except ValueError:
+            raise ValueError(
+                f"{alias}={raw!r} is not an integer (use 0 or 1, as in upstream)"
+            ) from None
+    return default != "0"
 
 
 @functools.lru_cache(maxsize=1)
@@ -1317,11 +1347,10 @@ direct_register_custom_op(
 
 def _forward_shared_batch_silu(layer: nn.Module, x: torch.Tensor):
     """forward_fused_silu_and_mul of an admitted shared expert's gate/up."""
-    if not use_sm70_decode_graph_semantics():
-        return None  # Prefill/mixed: the module's own linear + SiluAndMul.
-    return torch.ops.vllm.qwen38_sm70_shared_up(
-        x, layer.weight, getattr(layer, "_sm70_mtp_shared_packed", None)
-    )
+    packed = getattr(layer, "_sm70_mtp_shared_packed", None)
+    if packed is None or not use_sm70_decode_graph_semantics():
+        return None  # The module's own linear + SiluAndMul.
+    return torch.ops.vllm.qwen38_sm70_shared_up(x, layer.weight, packed)
 
 
 def _sx_gdn_rows_tile(
@@ -1460,11 +1489,15 @@ direct_register_custom_op(
 
 def _sx_prepare_packed(
     layer: nn.Module, name: str, op_name: str, pack, switch: str
-) -> None:
-    """Register an SX MTP batch route's packed copy of the loaded weight."""
+) -> bool:
+    """Register an SX MTP batch route's packed copy of the loaded weight.
+
+    Returns whether the copy exists (it is skipped, and nothing is allocated,
+    for a PLE-only/meta loader and for an extension built before the route).
+    """
     weight = layer.weight
     if not weight.is_cuda or weight.dtype != torch.float16:
-        return  # A PLE-only/meta loader never executes these GPU routes.
+        return False  # A PLE-only/meta loader never executes these GPU routes.
     if not hasattr(torch.ops._C, op_name):
         # An extension built before the route: allocate nothing, the route
         # can never run and the original projection keeps the width.
@@ -1473,8 +1506,9 @@ def _sx_prepare_packed(
             switch,
             op_name,
         )
-        return
+        return False
     layer.register_buffer(name, pack(weight), persistent=False)
+    return True
 
 
 class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
@@ -1498,13 +1532,19 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
                 _pack_router_batch_weight,
                 "SX_OPT_MTP_ROUTER_BATCH",
             )
-        if getattr(layer, "_sm70_mtp_prepare_shared_batch", False):
+        if getattr(layer, "_sm70_mtp_prepare_shared_batch", False) and (
             _sx_prepare_packed(
                 layer,
                 "_sm70_mtp_shared_packed",
                 "qwen38_shared_up_batch_sm70_out",
                 _pack_shared_batch_weight,
                 "SX_OPT_MTP_SHARED_BATCH",
+            )
+        ):
+            # The hook exists only together with its packed copy: a layer
+            # whose packing was skipped keeps the original module path.
+            layer.forward_fused_silu_and_mul = MethodType(
+                _forward_shared_batch_silu, layer
             )
         if getattr(layer, "_sm70_qwen38_prepare_gdn_batch", False):
             _sx_prepare_packed(
@@ -1532,6 +1572,23 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
                 getattr(layer, "_sm70_mtp_router_packed", None),
             )
         return super().apply(layer, x, bias)
+
+
+class Qwen38SM70PackOnlyLinearMethod(Qwen38SM70FP16LinearMethod):
+    """Packs after loading (SX MTP batch routes); apply() stays unquantized.
+
+    For layers without an M=1 GEMV plan (the HC up projection, the shared
+    expert gate/up): every path that does not take the batch route runs
+    exactly what the layer ran before.
+    """
+
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return UnquantizedLinearMethod.apply(self, layer, x, bias)
 
 
 def _plan_for(prefix: str, shape: tuple[int, int]) -> _GemvPlan | None:
@@ -1637,14 +1694,11 @@ def enable_qwen38_sm70_fp16_gemv(
             and prefix.endswith(_SHARED_UP_SUFFIX)
             and shape == (320, 2560)
         ):
-            # No M1 plan: the FP16 method only packs it after loading; its
-            # apply() keeps the unquantized path, and the hook below replaces
+            # No M1 plan: the pack-only method keeps the unquantized apply();
+            # the hook (installed with the packed copy after loading) replaces
             # linear + SiluAndMul under decode semantics only.
-            child.quant_method = Qwen38SM70FP16LinearMethod()
+            child.quant_method = Qwen38SM70PackOnlyLinearMethod()
             child._sm70_mtp_prepare_shared_batch = True
-            child.forward_fused_silu_and_mul = MethodType(
-                _forward_shared_batch_silu, child
-            )
             shared_tagged += 1
             continue
         if _plan_for(prefix, shape) is None:
@@ -1727,6 +1781,7 @@ def enable_qwen38_sm70_fp16_gemv(
 
 __all__ = [
     "Qwen38SM70FP16LinearMethod",
+    "Qwen38SM70PackOnlyLinearMethod",
     "_qwen38_fp16_gdn_input_kernel",
     "_qwen38_fp16_gdn_input_rows_kernel",
     "_qwen38_fp16_rows_gemv_kernel",

@@ -10,7 +10,7 @@ policy (allow_fp16_reduced_precision_reduction=True, FP32 accumulation); at
 M5 the SX_OPT_ROWS GDN-input kernel keeps the width unless
 SX_OPT_MTP_BATCH_OVER_ROWS=1. The reference is the cuBLAS fallback.
 
-    /opt/venv/bin/python -m pytest -q tests/models/qwen4_exp/test_sm70_gdn_input_batch.py
+    python -m pytest -q tests/models/qwen4_exp/test_sm70_gdn_input_batch.py
 """
 
 from contextlib import contextmanager
@@ -48,21 +48,29 @@ def mtp_policy(monkeypatch):
     previous = [getattr(backend, name) for name in names]
     backend.allow_fp16_reduced_precision_reduction = True
     backend.allow_fp16_accumulation = False
+    # The default multi-row table decides which widths the batch route may
+    # take; a container that sets SX_OPT_ROWS* must not change these tests.
     for name in (
         "SX_OPT_MTP_GDN_INPUT_BATCH",
         "VLLM_SM70_QWEN38_GDN_INPUT_BATCH",
         "SX_OPT_MTP_BATCH_OVER_ROWS",
+        "SX_OPT_ROWS",
+        "SX_OPT_ROWS_TABLE",
+        "SX_OPT_ROWS_MAX_M",
+        "SX_OPT_MTP_ROWS",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("VLLM_SM70_QWEN38_DUAL_COMPILE", "1")
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     envs.disable_envs_cache()
     gemv._sx_mtp_batch_config.cache_clear()
+    gemv._sx_rows_config.cache_clear()
     yield
     for name, value in zip(names, previous):
         setattr(backend, name, value)
     envs.disable_envs_cache()
     gemv._sx_mtp_batch_config.cache_clear()
+    gemv._sx_rows_config.cache_clear()
 
 
 def _enable(monkeypatch, over_rows: bool = True) -> None:

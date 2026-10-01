@@ -25,6 +25,10 @@ Asserted (SX_OPT_MTP_HC_BATCH):
   copy (every non-MTP deployment) never reads the MTP switches;
 * the opaque op keeps its fake shapes and forwards both packed buffers.
 
+Also asserted: the HC route yields to an admitted SX_OPT_ROWS multi-row HC
+kernel unless OVER_ROWS=1; upstream-named switches parse like upstream
+(int(), an invalid value raises); SX_OPT_* variables enter the compile key.
+
 Asserted (SX_OPT_MTP_ROUTER_BATCH, SX_OPT_MTP_BATCH_OVER_ROWS):
 * switch parsing (router default on, OVER_ROWS default off);
 * packing keeps every router weight bit, bad geometries are rejected;
@@ -40,10 +44,11 @@ Asserted (SX_OPT_MTP_SHARED_BATCH):
 * switch parsing; packing keeps every gate/up weight bit;
 * the opaque op takes the native kernel only when admitted, otherwise runs
   the shared expert's own F.linear + _C.silu_and_mul on the same inputs;
-* the hook returns None outside decode semantics (module path unchanged)
-  and forwards the packed copy inside them;
-* the loader tags (method + hook) only the [320, 2560] shared gate/up of the
-  admitted lane; packing happens only for tagged layers with the native op.
+* the hook returns None outside decode semantics and without a packed copy
+  (module path unchanged) and forwards the packed copy inside them;
+* the loader tags only the [320, 2560] shared gate/up of the admitted lane
+  (pack-only method: apply() stays the unquantized one); packing, and the
+  hook with it, happen only for tagged layers with the native op.
 
 Asserted (SX_OPT_MTP_GDN_INPUT_BATCH, opt-in):
 * switch parsing: default off, SX switch or upstream alias turn it on;
@@ -89,6 +94,13 @@ SWITCHES = (
     "SX_OPT_MTP_GDN_INPUT_BATCH",
     "VLLM_SM70_QWEN38_GDN_INPUT_BATCH",
 )
+# The multi-row routes (SX_OPT_ROWS*) decide the precedence tests.
+ROWS_SWITCHES = (
+    "SX_OPT_ROWS",
+    "SX_OPT_ROWS_TABLE",
+    "SX_OPT_ROWS_MAX_M",
+    "SX_OPT_MTP_ROWS",
+)
 PRECISION = (
     "allow_fp16_reduced_precision_reduction",
     "allow_bf16_reduced_precision_reduction",
@@ -99,13 +111,14 @@ PRECISION = (
 def _reset_env_cache() -> None:
     getattr(envs, "disable_envs_cache", lambda: None)()
     gemv._sx_mtp_batch_config.cache_clear()
+    gemv._sx_rows_config.cache_clear()
 
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     for key in SWITCHES:
         monkeypatch.delenv(key, raising=False)
-    for key in ("VLLM_BATCH_INVARIANT", "SX_OPT_MTP_LANE"):
+    for key in ("VLLM_BATCH_INVARIANT", "SX_OPT_MTP_LANE", *ROWS_SWITCHES):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("VLLM_SM70_QWEN38_DUAL_COMPILE", "1")
     matmul = torch.backends.cuda.matmul
@@ -335,6 +348,9 @@ def test_hc_loader_tags_only_the_admitted_lane(monkeypatch, config, switch, tagg
         if tagged:
             assert layer._sm70_qwen38_hc_batch_role == role
             assert isinstance(layer.quant_method, gemv.Qwen38SM70FP16LinearMethod)
+            # No M1 plan on these test layers: the pack-only method, whose
+            # apply() is the unquantized one.
+            assert type(layer.quant_method) is gemv.Qwen38SM70PackOnlyLinearMethod
         else:
             assert type(layer.quant_method) is UnquantizedLinearMethod
     if config is None:
@@ -810,14 +826,18 @@ def test_shared_hook(monkeypatch):
     layer = _Dense(SHARED, (320, 2560))
     packed = torch.empty(10, 160, 2, 32, 8, dtype=torch.float16, device="meta")
     x = torch.empty(5, 2560, dtype=torch.float16, device="meta")
+    _swap_native(monkeypatch, _NativeC(), SimpleNamespace(qwen38_sm70_shared_up=op))
+    monkeypatch.setattr(gemv, "use_sm70_decode_graph_semantics", lambda: True)
+    # No packed copy (native op missing): the original module path, always.
+    assert gemv._forward_shared_batch_silu(layer, x) is None
+    assert not calls
+    layer.register_buffer("_sm70_mtp_shared_packed", packed, persistent=False)
     monkeypatch.setattr(gemv, "use_sm70_decode_graph_semantics", lambda: False)
     assert gemv._forward_shared_batch_silu(layer, x) is None
+    assert not calls
     monkeypatch.setattr(gemv, "use_sm70_decode_graph_semantics", lambda: True)
-    _swap_native(monkeypatch, _NativeC(), SimpleNamespace(qwen38_sm70_shared_up=op))
     assert gemv._forward_shared_batch_silu(layer, x) == "out"
-    assert calls[-1][0] is x and calls[-1][1] is layer.weight and calls[-1][2] is None
-    layer.register_buffer("_sm70_mtp_shared_packed", packed, persistent=False)
-    assert gemv._forward_shared_batch_silu(layer, x) == "out"
+    assert calls[-1][0] is x and calls[-1][1] is layer.weight
     assert calls[-1][2] is packed
 
 
@@ -840,12 +860,10 @@ def test_shared_loader_tags_only_the_lane(monkeypatch, config, switch, tagged):
     model.expert = _Dense("model.layers.3.mlp.experts.gate_up_proj", (320, 2560))
     gemv.enable_qwen38_sm70_fp16_gemv(model, torch.float16, boot.lane_config(config))
     assert getattr(model.shared, "_sm70_mtp_prepare_shared_batch", False) == tagged
-    assert ("forward_fused_silu_and_mul" in vars(model.shared)) == tagged
+    # The hook comes with the packed copy, after loading.
+    assert "forward_fused_silu_and_mul" not in vars(model.shared)
     if tagged:
-        assert isinstance(model.shared.quant_method, gemv.Qwen38SM70FP16LinearMethod)
-        assert model.shared.forward_fused_silu_and_mul.__func__ is (
-            gemv._forward_shared_batch_silu
-        )
+        assert type(model.shared.quant_method) is gemv.Qwen38SM70PackOnlyLinearMethod
     else:
         assert type(model.shared.quant_method) is UnquantizedLinearMethod
     for other in (model.wide, model.expert):
@@ -863,9 +881,14 @@ def test_shared_process_weights(monkeypatch, op_present):
     layer._sm70_mtp_prepare_shared_batch = True
     native = _NativeC(*(["qwen38_shared_up_batch_sm70_out"] if op_present else []))
     _swap_native(monkeypatch, native)
-    gemv.Qwen38SM70FP16LinearMethod().process_weights_after_loading(layer)
+    gemv.Qwen38SM70PackOnlyLinearMethod().process_weights_after_loading(layer)
     assert hasattr(layer, "_sm70_mtp_shared_packed") == op_present
+    # The hook exists only together with the packed copy.
+    assert ("forward_fused_silu_and_mul" in vars(layer)) == op_present
     if op_present:
+        assert layer.forward_fused_silu_and_mul.__func__ is (
+            gemv._forward_shared_batch_silu
+        )
         expected = gemv._pack_shared_batch_weight(raw.view(torch.float16))
         assert torch.equal(
             layer._sm70_mtp_shared_packed.as_subclass(torch.Tensor).view(torch.int16),
@@ -1077,6 +1100,135 @@ def test_gdn_layer_passes_both_packed_copies():
         "getattr(self.in_proj_qkvz, '_sm70_qwen38_gdn_packed', None)",
         "getattr(self.in_proj_ba, '_sm70_qwen38_gdn_packed', None)",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Review items: HC precedence, upstream-name parsing, compile key
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("over_rows,tile,admitted", [("0", 0, True), ("0", 1, False),
+                                                      ("1", 1, True), ("1", 0, True)])
+def test_hc_runtime_admission_and_precedence(monkeypatch, over_rows, tile, admitted):
+    monkeypatch.setenv("SX_OPT_MTP_BATCH_OVER_ROWS", over_rows)
+    _reset_env_cache()
+    x = _fake_cuda(torch.zeros(5, 10240, dtype=torch.float16))
+    pd = _fake_cuda(torch.zeros(3, 640, 2, 32, 8, dtype=torch.float16))
+    pu = _fake_cuda(torch.zeros(80, 20, 2, 4, 8, 8, dtype=torch.float16))
+    with _verify_capture():
+        assert hc._batch_runtime_ok(x, pd, pu, tile) == admitted
+
+
+class _CublasChain(Exception):
+    """The original replicated chain was reached (F.linear)."""
+
+
+@pytest.mark.parametrize("table,rows,yields", [
+    (None, 5, False),       # default table: hc covers M <= 2 only
+    ("hc=8", 5, True),      # the multi-row HC kernel serves M5
+    ("hc=8", 10, False),    # ... but not M10
+    ("hc=16", 10, True),
+])
+def test_hc_dispatch_yields_to_the_rows_kernel(monkeypatch, table, rows, yields):
+    if table is not None:
+        monkeypatch.setenv("SX_OPT_ROWS_TABLE", table)
+    _reset_env_cache()
+    seen = []
+    monkeypatch.setattr(
+        hc, "_batch_runtime_ok", lambda x, pd, pu, tile=0: seen.append(tile) or False
+    )
+    rows_calls = []
+    monkeypatch.setattr(
+        hc,
+        "_sx_hc_rows_forward",
+        lambda *a: rows_calls.append(a) or (a[0].new_empty((rows, 2560)),) * 2,
+    )
+
+    def linear(*a):
+        raise _CublasChain
+
+    monkeypatch.setattr(hc.torch.nn.functional, "linear", linear)
+    # CPU tensors never pass the rows plan's CUDA/graph checks: keep its table
+    # logic (the part SX_OPT_ROWS_TABLE controls), drop the rest.
+    monkeypatch.setattr(
+        hc,
+        "_sx_hc_rows_plan",
+        lambda x, d, u: hc._sx_hc_rows_plan_for_m(x.shape[0]),
+    )
+    x = torch.empty(rows, 10240, dtype=torch.float16)
+    down = torch.empty(336, 10240, dtype=torch.float16)
+    up = torch.empty(10240, 320, dtype=torch.float16)
+    pd = torch.empty(3, 640, 2, 32, 8, dtype=torch.float16)
+    pu = torch.empty(80, 20, 2, 4, 8, 8, dtype=torch.float16)
+
+    def run(*packed):
+        try:
+            return hc._qwen38_sm70_fp16_fused_hc(x, down, up, *packed)
+        except _CublasChain:
+            return "cublas"
+
+    out = run(pd, pu)
+    assert seen == [int(yields)]  # the rows kernel's width is passed to the check
+    assert (out == "cublas") == (not yields) and len(rows_calls) == int(yields)
+    # Without packed copies the batch check is not evaluated at all.
+    seen.clear()
+    run()
+    assert not seen
+
+
+@pytest.mark.parametrize("value,expected", [("0", False), ("1", True), ("2", True),
+                                            (" 0 ", False), ("-1", True)])
+def test_upstream_alias_parses_like_int(monkeypatch, value, expected):
+    monkeypatch.setenv("VLLM_SM70_MTP_HC_BATCH", value)
+    _reset_env_cache()
+    assert gemv._sx_mtp_batch_config().hc == expected
+
+
+@pytest.mark.parametrize("value", ["false", "off", "true", "1.0", "yes"])
+def test_upstream_alias_invalid_value_raises(monkeypatch, value):
+    monkeypatch.setenv("VLLM_SM70_MTP_HC_BATCH", value)
+    _reset_env_cache()
+    with pytest.raises(ValueError, match="VLLM_SM70_MTP_HC_BATCH"):
+        gemv._sx_mtp_batch_config()
+
+
+def test_sx_switch_wins_over_a_bad_alias(monkeypatch):
+    monkeypatch.setenv("SX_OPT_MTP_HC_BATCH", "0")
+    monkeypatch.setenv("VLLM_SM70_MTP_HC_BATCH", "false")
+    _reset_env_cache()
+    assert not gemv._sx_mtp_batch_config().hc
+
+
+def test_pack_only_method_keeps_the_unquantized_apply(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        UnquantizedLinearMethod,
+        "apply",
+        lambda self, layer, x, bias=None: seen.append((self, layer)) or "plain",
+    )
+    layer = _Dense(SHARED, (320, 2560))
+    method = gemv.Qwen38SM70PackOnlyLinearMethod()
+    assert method.apply(layer, torch.empty(1, 2560)) == "plain"
+    assert seen == [(method, layer)]
+
+
+def test_sx_opt_switches_enter_the_compile_key(monkeypatch):
+    for name in ("SX_OPT_MTP_ROUTER_BATCH", "SX_OPT_ROWS_TABLE", "SX_OPT_MTP_HC_BATCH"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("VLLM_SM70_MTP_HC_BATCH", raising=False)
+    try:
+        base = envs.compile_factors()
+    except ModuleNotFoundError:  # vllm.config.utils needs the full install
+        pytest.skip("compile_factors needs the full vLLM install")
+    for name, value in (
+        ("SX_OPT_MTP_ROUTER_BATCH", "0"),
+        ("SX_OPT_ROWS_TABLE", "hc=8"),
+        ("SX_OPT_MTP_HC_BATCH", "1"),
+        ("VLLM_SM70_MTP_HC_BATCH", "1"),
+    ):
+        monkeypatch.setenv(name, value)
+        changed = envs.compile_factors()
+        assert changed.get(name) is not None and changed != base, name
+        monkeypatch.delenv(name)
+        assert envs.compile_factors() == base
 
 
 if __name__ == "__main__":

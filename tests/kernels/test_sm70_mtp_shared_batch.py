@@ -93,6 +93,39 @@ def test_changed_input_graph(rows, enabled, monkeypatch):
         batch._sx_mtp_batch_config.cache_clear()
 
 
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 6, 8, 12, 15, 16, 20, 24])
+def test_other_widths_match_the_original_compiled_path(rows):
+    """Verify widths outside M5/M10 (and M1/M2.. decode) keep their numerics.
+
+    Under decode semantics the hook sends every width through the opaque op
+    (the width is a symbolic dimension at trace time); outside M5/M10 it must
+    return exactly what the module's own F.linear + _C.silu_and_mul return,
+    eagerly and under torch.compile with a dynamic batch dimension.
+    """
+    _require_native()
+    torch.manual_seed(rows)
+    weight = torch.randn(320, 2560, device="cuda", dtype=torch.float16) * 0.03
+    packed = batch._pack_shared_batch_weight(weight)
+    x = torch.randn(rows, 2560, device="cuda", dtype=torch.float16)
+
+    def module_path(x, weight):
+        gate_up = torch.nn.functional.linear(x, weight)
+        out = gate_up.new_empty((*gate_up.shape[:-1], 160))
+        torch.ops._C.silu_and_mul(out, gate_up)
+        return out
+
+    with _mtp_verify_capture():
+        assert not batch._shared_batch_runtime_ok(x, packed)
+        actual = batch._qwen38_sm70_shared_up(x, weight, packed)
+    expected = module_path(x, weight)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    try:
+        compiled = torch.compile(module_path, dynamic=True)(x, weight)
+    except Exception as error:  # noqa: BLE001 - no usable compiler here
+        pytest.skip(f"torch.compile unavailable: {error}")
+    assert torch.equal(actual.view(torch.int16), compiled.view(torch.int16))
+
+
 @pytest.mark.parametrize("rows", [5, 10])
 def test_native_output_canaries(rows):
     _require_native()

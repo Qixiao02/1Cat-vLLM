@@ -124,6 +124,10 @@ def _install_stubs() -> None:
     exec(code, config_vllm.__dict__)  # noqa: S102
     sys.modules["vllm.config.vllm"] = config_vllm
     config.vllm = config_vllm
+    config_utils = types.ModuleType("vllm.config.utils")
+    config_utils.normalize_value = lambda value: value
+    sys.modules["vllm.config.utils"] = config_utils
+    config.utils = config_utils
 
     _package("vllm.model_executor")
     _package("vllm.model_executor.layers")

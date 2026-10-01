@@ -37,7 +37,17 @@ def _mtp_verify_capture():
 def mtp_env(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_QWEN38_DUAL_COMPILE", "1")
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
-    for name in ("SX_OPT_MTP_ROUTER_BATCH", "SX_OPT_MTP_BATCH_OVER_ROWS"):
+    # The default multi-row table decides which widths the batch route may
+    # take; a container that sets SX_OPT_ROWS* must not change these tests.
+    for name in (
+        "SX_OPT_MTP_ROUTER_BATCH",
+        "VLLM_SM70_MTP_ROUTER_BATCH",
+        "SX_OPT_MTP_BATCH_OVER_ROWS",
+        "SX_OPT_ROWS",
+        "SX_OPT_ROWS_TABLE",
+        "SX_OPT_ROWS_MAX_M",
+        "SX_OPT_MTP_ROWS",
+    ):
         monkeypatch.delenv(name, raising=False)
     envs.disable_envs_cache()
     gemv._sx_mtp_batch_config.cache_clear()

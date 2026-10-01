@@ -53,11 +53,13 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from .sm70_fp16_gemv import (
     Qwen38SM70FP16LinearMethod,
+    Qwen38SM70PackOnlyLinearMethod,
     _exact_runtime_contract,
     _sx_decode_graph_active,
     _sx_mtp_batch_config,
     _sx_mtp_batch_contract,
     _sx_mtp_batch_rows_ok,
+    _sx_mtp_batch_takes_width,
     _sx_rows_config,
     _sx_rows_max_m,
     _sx_rows_reduce,
@@ -135,9 +137,12 @@ def _batch_runtime_ok(
     x: torch.Tensor,
     packed_down: torch.Tensor | None,
     packed_up: torch.Tensor | None,
+    rows_tile: int = 0,
 ) -> bool:
     # Packed copies exist only where the loader admitted the MTP lane, so
-    # every other deployment stops at the first two checks.
+    # every other deployment stops at the first two checks. rows_tile > 0:
+    # an admitted SX_OPT_ROWS multi-row HC kernel already serves this width
+    # (SX_OPT_ROWS_TABLE hc >= M) and keeps it unless OVER_ROWS is set.
     return bool(
         packed_down is not None
         and packed_up is not None
@@ -157,6 +162,7 @@ def _batch_runtime_ok(
             and w.data_ptr() % 16 == 0
             for w in (packed_down, packed_up)
         )
+        and _sx_mtp_batch_takes_width(rows_tile)
     )
 
 
@@ -1119,11 +1125,12 @@ def _qwen38_sm70_fp16_fused_hc(
     # SX_OPT_MTP_HC_BATCH: the MTP lane's M5/M10 verify batches (packed
     # copies exist only when the loader admitted the lane); every other
     # width keeps the routes below unchanged.
-    if _batch_runtime_ok(x, packed_down, packed_up):
-        assert packed_down is not None and packed_up is not None
-        batch = _sx_hc_batch_forward(x, packed_down, packed_up)
-        if batch is not None:
-            return batch
+    if packed_down is not None and packed_up is not None:
+        rows_plan = _sx_hc_rows_plan(x, down_weight, up_weight)
+        if _batch_runtime_ok(x, packed_down, packed_up, int(rows_plan is not None)):
+            batch = _sx_hc_batch_forward(x, packed_down, packed_up)
+            if batch is not None:
+                return batch
     if not _runtime_ok(x, down_weight, up_weight):
         # SX MR3: exact multi-row replicated chain for admitted decode widths
         # inside the FULL decode graph (rows == M=1 route, bitwise).
@@ -1325,7 +1332,7 @@ def enable_qwen38_sm70_fp16_fused_hc(
                 ("up", child.input_mix_weight_up),
             ):
                 if type(layer.quant_method) is UnquantizedLinearMethod:
-                    layer.quant_method = Qwen38SM70FP16LinearMethod()
+                    layer.quant_method = Qwen38SM70PackOnlyLinearMethod()
                 if not isinstance(layer.quant_method, Qwen38SM70FP16LinearMethod):
                     raise RuntimeError("Batched HC requires checkpoint-FP16 linears")
                 layer._sm70_qwen38_hc_batch_role = role
