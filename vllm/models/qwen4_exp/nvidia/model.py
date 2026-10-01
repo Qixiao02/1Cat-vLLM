@@ -3,6 +3,7 @@
 """Inference-only Qwen4Exp model."""
 
 import copy
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -114,6 +115,28 @@ def without_modelopt_fp4(
     return quant_config
 
 
+# SX_OPT_LOAD_QSA_REMAP (default on, "0" = scan every QSA layer for every
+# tensor as before). A name can only be remapped if it ends in one of these
+# keys, so the ~150k expert tensors per rank return at once instead of paying
+# one f-string and one find() per QSA layer each.
+_SX_LOAD_QSA_REMAP = os.environ.get("SX_OPT_LOAD_QSA_REMAP", "1").strip() != "0"
+_QSA_CACHE_SCALE_SUFFIXES = {
+    "k_proj.k_scale": "k_scale",
+    "k_proj.output_scale": "k_scale",
+    "attn.k_scale": "k_scale",
+    "attn._k_scale": "k_scale",
+    "k_scale": "k_scale",
+    "_k_scale": "k_scale",
+    "v_proj.v_scale": "v_scale",
+    "v_proj.output_scale": "v_scale",
+    "attn.v_scale": "v_scale",
+    "attn._v_scale": "v_scale",
+    "v_scale": "v_scale",
+    "_v_scale": "v_scale",
+}
+_QSA_CACHE_SCALE_SUFFIX_KEYS = tuple(_QSA_CACHE_SCALE_SUFFIXES)
+
+
 def _remap_qsa_cache_scale_name(
     name: str,
     qsa_layer_ids: frozenset[int],
@@ -125,20 +148,12 @@ def _remap_qsa_cache_scale_name(
     moved to the owner's invalid-until-loaded ``k_scale``/``v_scale`` slots.
     """
 
-    scale_suffixes = {
-        "k_proj.k_scale": "k_scale",
-        "k_proj.output_scale": "k_scale",
-        "attn.k_scale": "k_scale",
-        "attn._k_scale": "k_scale",
-        "k_scale": "k_scale",
-        "_k_scale": "k_scale",
-        "v_proj.v_scale": "v_scale",
-        "v_proj.output_scale": "v_scale",
-        "attn.v_scale": "v_scale",
-        "attn._v_scale": "v_scale",
-        "v_scale": "v_scale",
-        "_v_scale": "v_scale",
-    }
+    if _SX_LOAD_QSA_REMAP and not name.endswith(_QSA_CACHE_SCALE_SUFFIX_KEYS):
+        # The loop below only returns something other than ``name`` when the
+        # tail of ``name`` after a layer marker is a key of the table, and
+        # that tail is a suffix of ``name``.
+        return name
+    scale_suffixes = _QSA_CACHE_SCALE_SUFFIXES
     for layer_id in qsa_layer_ids:
         marker = f"layers.{layer_id}.self_attn."
         marker_start = name.find(marker)
