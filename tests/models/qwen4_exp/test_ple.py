@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import mmap
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from torch.nn import functional as F
 
 import vllm.model_executor.layers.vocab_parallel_embedding as embedding_module
 import vllm.model_executor.parameter as parameter_module
+import vllm.models.qwen4_exp.nvidia.exact_pin as exact_pin_module
 import vllm.models.qwen4_exp.nvidia.ple_layer as ple_module
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.model_loader.utils import device_loading_context
@@ -99,6 +101,10 @@ def test_pinned_host_ple_splits_the_shard_by_host_budget(
     assert layer.ple_device_table.device.type == "cuda"
     assert layer.ple_host_storage.shape == (3, 8)
     assert layer.ple_host_storage.is_pinned()
+    if exact_pin_module.exact_pin_enabled():
+        # SX_OPT_PLE_EXACT_PIN (default on) pins exactly the table's bytes.
+        assert layer.ple_host_storage.untyped_storage().nbytes() == 3 * 8
+        assert layer.ple_host_storage.data_ptr() % mmap.PAGESIZE == 0
     assert (layer._device_rows, layer._host_rows) == (5, 3)
     # Idempotent: a second call keeps the tables.
     device_table = layer.ple_device_table
@@ -130,10 +136,13 @@ def test_pinned_host_ple_without_budget_keeps_everything_on_device(
     reason="requires an exact SM70 CUDA device",
 )
 @pytest.mark.parametrize("host_rows", [0, 4, 8])
+@pytest.mark.parametrize("exact_pin", ["0", "1"])
 def test_pinned_host_ple_fp8_rows_are_gatherable_across_the_split_on_sm70(
     monkeypatch: pytest.MonkeyPatch,
     host_rows: int,
+    exact_pin: str,
 ) -> None:
+    monkeypatch.setenv(exact_pin_module.EXACT_PIN_ENV, exact_pin)
     _patch_tp(monkeypatch, rank=0, world_size=1)
     monkeypatch.setattr(
         embedding_module, "tensor_model_parallel_all_reduce", lambda tensor: tensor
@@ -220,7 +229,17 @@ def test_ple_budget_rejects_invalid_values(monkeypatch, kind, value):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_ple_host_allocation_failure_keeps_materialization_retryable(monkeypatch):
+@pytest.mark.parametrize("exact_pin", ["0", "1"])
+def test_ple_host_allocation_failure_keeps_materialization_retryable(
+    monkeypatch, exact_pin
+):
+    monkeypatch.setenv(exact_pin_module.EXACT_PIN_ENV, exact_pin)
+    if exact_pin == "1":
+        # The exact path falls back to pin_memory=True, which fails below too.
+        def failing_register(address, nbytes, device_index):
+            raise RuntimeError("injected cuMemHostRegister failure")
+
+        monkeypatch.setattr(exact_pin_module, "_host_register", failing_register)
     _patch_tp(monkeypatch, rank=0, world_size=1)
     monkeypatch.setattr(ple_module, "_ple_host_budget_bytes", lambda: 4 * 8)
     layer = _pinned_layer(num_embeddings=8)
