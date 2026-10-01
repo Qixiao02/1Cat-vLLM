@@ -112,6 +112,30 @@ SX_OPT_MTP_MOE_DIRECT (default "1"), design_4 [MTP-K4] phase A: 1Cat's direct
 SX_OPT_MOE_EAGER_IOTA is also admitted in the lane (bitwise; 320 KiB).
 SX_OPT_MOE_PERSIST32 stays off in the lane (design_1 / design_4 rejected:
     ~79 MB/rank of KV for no FULL-graph gain).
+
+Upstream 1Cat ports (group "mtp-port-moe"; same MTP lane and master switches
+SX_OPT_MTP_MOE_ROUTES / SX_OPT_MTP_LANE as batch 3a above):
+
+SX_OPT_MTP_MOE_GROUPED_MTP5 (default "1"), upstream 45248dc8d
+    (VLLM_SM70_NVFP4_MOE_GROUPED_MTP5): lane layers with k = 4 whose W5
+    verify takes the QPN-MTP5 route (SX_OPT_MTP_MOE_DIRECT) run exactly five
+    verify rows, in a uniform verify forward only, through the legacy
+    grouped W13 at the MTP5 split 4 and the grouped W2 with the fused,
+    ordered FP32 weighted reduce (nvfp4_grouped_w2_batch_reduce_sm70_out:
+    FP16 W2 outputs kept in CTA shared memory, one launch, no routed
+    scatter). Per route this is the QPN-MTP5 arithmetic (four ordered FP32
+    K partitions, FP16 SwiGLU boundaries, FP16 W2 output, fixed slot-order
+    fmaf reduce, one FP16 rounding), so the W5 output stays bitwise equal
+    (upstream: zero bit differences on all four TP weight slices and
+    captured routes); routes that pick the same expert share its weight
+    loads. W10 and wider keep their routes (grouped v2 from
+    SX_OPT_MTP_MOE_GROUPED_MIN_TOKENS); upstream screens this op for
+    M5/M8/M16 but admits only W5. Needs a rebuilt vllm._C (the sidecar does
+    not carry the op); without it the lane logs a warning and keeps the
+    QPN-MTP5 route. An explicitly set VLLM_SM70_NVFP4_MOE_GROUPED_MTP5 keeps
+    upstream's global meaning (shape-only W5 admission together with
+    VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE=1 or the lane's MTP5 default;
+    a missing op raises); the lane default only applies when it is absent.
 """
 
 from __future__ import annotations
@@ -202,6 +226,11 @@ _SX_MOE_GROUPED32_SPLIT: Final = _grouped32_split_from_env()
 # SX_OPT_MTP_MOE_ROUTES lives in sx_sm70_qwen38_mtp_verify_q).
 _SX_OPT_MTP_MOE_GROUPED: Final = os.environ.get("SX_OPT_MTP_MOE_GROUPED", "1") != "0"
 _SX_OPT_MTP_MOE_DIRECT: Final = os.environ.get("SX_OPT_MTP_MOE_DIRECT", "1") != "0"
+# Upstream-port switch (see the docstring): grouped W5 verify experts.
+_SX_OPT_MTP_MOE_GROUPED_MTP5: Final = (
+    os.environ.get("SX_OPT_MTP_MOE_GROUPED_MTP5", "1") != "0"
+)
+_GROUPED_MTP5_ENV: Final = "VLLM_SM70_NVFP4_MOE_GROUPED_MTP5"
 # W13 splits the native grouped kernels are instantiated for.
 _GROUPED_NATIVE_SPLITS: Final = (1, 2, 4, 5, 8)
 _MTP_GROUPED_DEFAULT_MIN_TOKENS: Final = 8
@@ -1071,15 +1100,21 @@ def _mtp_verify_route_table(layer, max_width: int = 40) -> dict[int, str]:
     if verify_q <= 1:
         return table
     for width in range(verify_q, max_width + 1, verify_q):
+        mtp5 = width == 5 and bool(
+            envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE
+            or (getattr(layer, "sx_mtp_qpn_mtp5", False) and verify_q == 5)
+        )
+        if mtp5 and getattr(layer, "sm70_nvfp4_grouped_mtp5", False):
+            # SX_OPT_MTP_MOE_GROUPED_MTP5: checked before the grouped route.
+            table[width] = (
+                f"grouped-mtp5-split{_QWEN38_QPN_MTP5_W13_SPLIT_K}+batch-reduce"
+            )
+            continue
         if getattr(layer, "sm70_nvfp4_grouped_decode", False) and (
             _mtp_verify_grouped_q(layer, width)
         ):
             table[width] = f"grouped-split{_grouped_decode_width_split(layer, width)}"
             continue
-        mtp5 = width == 5 and bool(
-            envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE
-            or (getattr(layer, "sx_mtp_qpn_mtp5", False) and verify_q == 5)
-        )
         split = None
         if envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE:
             split = (
@@ -1153,6 +1188,45 @@ def _use_qwen38_qpn_mtp5_decode(
         and int(layer.sm70_nvfp4_top_k) == 10
         and (not lane or _grouped_verify_context_ok(5))
     )
+
+
+def _use_grouped_mtp5(layer, x: torch.Tensor, topk_ids: torch.Tensor) -> bool:
+    """Keep MTP's admitted split4 arithmetic while sharing expert weights."""
+    return bool(
+        getattr(layer, "sm70_nvfp4_grouped_mtp5", False)
+        and x.shape[0] == 5  # cheap pre-check; the MTP5 admission is exact
+        and _use_qwen38_qpn_mtp5_decode(layer, x, topk_ids)
+    )
+
+
+def _grouped_mtp5_requested(layer, grouped_supported: bool) -> tuple[bool, bool]:
+    """Load time: (admitted, explicit) for the grouped W5 verify route.
+
+    ``explicit``: VLLM_SM70_NVFP4_MOE_GROUPED_MTP5 is set, which keeps
+    upstream's global meaning. Otherwise SX_OPT_MTP_MOE_GROUPED_MTP5 admits
+    lane layers built for k = 4. Either way the W5 call must also be on the
+    QPN-MTP5 route (VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE=1 or the lane's
+    MTP5 default, ``sx_mtp_qpn_mtp5``), with TP4 and the grouped-kernel
+    contract (E512/H2560/I160/top-10, prepared scales, no SwiGLU limit).
+    """
+    explicit = _GROUPED_MTP5_ENV in os.environ
+    if explicit:
+        requested = bool(envs.VLLM_SM70_NVFP4_MOE_GROUPED_MTP5)
+    else:
+        requested = bool(
+            _SX_OPT_MTP_MOE_GROUPED_MTP5 and _layer_mtp_verify_q(layer) == 5
+        )
+    mtp5_route = bool(
+        envs.VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE
+        or getattr(layer, "sx_mtp_qpn_mtp5", False)
+    )
+    admitted = bool(
+        requested
+        and mtp5_route
+        and int(layer.moe_config.tp_size) == 4
+        and grouped_supported
+    )
+    return admitted, explicit
 
 
 @triton.jit
@@ -2006,18 +2080,40 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                 "(nvfp4_moe_qpn_mtp5_sm70_out) is absent; the W5 verify keeps "
                 "its previous route."
             )
-        grouped_requested = bool(
-            envs.VLLM_SM70_NVFP4_MOE_GROUPED_DECODE
-            and (num_experts, hidden, intermediate, layer.sm70_nvfp4_top_k)
+        grouped_supported = bool(
+            (num_experts, hidden, intermediate, layer.sm70_nvfp4_top_k)
             == (512, 2560, 160, 10)
             and not raw_scale
             and layer.swiglu_limit is None
+        )
+        grouped_requested = bool(
+            envs.VLLM_SM70_NVFP4_MOE_GROUPED_DECODE and grouped_supported
         )
         if grouped_requested and not sm70_ops.has_nvfp4_grouped_decode_dispatch():
             raise RuntimeError(
                 "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE requires a matching native build."
             )
         layer.sm70_nvfp4_grouped_decode = grouped_requested
+        # SX_OPT_MTP_MOE_GROUPED_MTP5 (upstream VLLM_SM70_NVFP4_MOE_GROUPED_MTP5):
+        # the W5 verify through the grouped W13 + fused batch-reduce W2.
+        grouped_mtp5, grouped_mtp5_explicit = _grouped_mtp5_requested(
+            layer, grouped_supported
+        )
+        if grouped_mtp5 and not (
+            sm70_ops.has_nvfp4_grouped_decode_dispatch()
+            and sm70_ops.has_nvfp4_grouped_batch_reduce_dispatch()
+        ):
+            if grouped_mtp5_explicit:
+                raise RuntimeError(
+                    "SM70 grouped MoE decode requires a matching native build."
+                )
+            logger.warning_once(
+                "SX_OPT_MTP_MOE_GROUPED_MTP5: the SM70 grouped W13 / batch-reduce "
+                "W2 ops (nvfp4_grouped_w2_batch_reduce_sm70_out) are absent from "
+                "vllm._C; the W5 verify keeps the QPN-MTP5 route."
+            )
+            grouped_mtp5 = False
+        layer.sm70_nvfp4_grouped_mtp5 = grouped_mtp5
         # SX_OPT_MOE_GROUPED32 / SX_OPT_MOE_GROUPED_MASK (batch 2): widths
         # 17..32 and padded-row masking through the v2 grouped-decode ops.
         layer.sm70_nvfp4_grouped_max_tokens = 16
@@ -2060,7 +2156,7 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
                     namespace,
                     int(max_routes),
                 )
-        if grouped_requested:
+        if grouped_requested or grouped_mtp5:
             # Layer-owned metadata; W2 reuses sorted_output. No process-global
             # cache or additional activation buffer inside graph capture.
             # 160 routes (B16) unless SX_OPT_MOE_GROUPED32 admits B17..B32.
@@ -2455,6 +2551,42 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         buffers = self._get_buffers(layer, num_tokens, indexed_w13)
         output = buffers["output"]
         slots = num_tokens * top_k
+        if _use_grouped_mtp5(layer, x, topk_ids):
+            # SX_OPT_MTP_MOE_GROUPED_MTP5 (upstream 45248dc8d): the W5 verify
+            # keeps the QPN-MTP5 W13 split and shares expert weight loads;
+            # the W2 kernel performs the ordered FP32 weighted reduce itself.
+            sm70_ops.nvfp4_grouped_w13_sm70_out(
+                buffers["intermediate"],
+                x,
+                layer.w13_tm_weight,
+                layer.w13_tm_scales,
+                topk_ids.view(-1),
+                layer._nvfp4_grouped_rows,
+                layer._nvfp4_grouped_experts,
+                layer._nvfp4_grouped_sizes,
+                layer._nvfp4_grouped_total,
+                _QWEN38_QPN_MTP5_W13_SPLIT_K,
+                interleaved_w13,
+            )
+            sm70_ops.nvfp4_grouped_w2_batch_reduce_sm70_out(
+                output,
+                buffers["sorted_output"],
+                buffers["intermediate"],
+                layer.w2_tm_weight,
+                layer.w2_tm_scales,
+                topk_weights,
+                layer._nvfp4_grouped_rows,
+                layer._nvfp4_grouped_experts,
+                layer._nvfp4_grouped_sizes,
+                layer._nvfp4_grouped_total,
+            )
+            logger.info_once(
+                "SX_OPT_MTP_MOE_GROUPED_MTP5: SM70 grouped native-NVFP4 MTP5 "
+                "experts selected (tokens=%d, W13 split%d, W2 batch reduce).",
+                num_tokens,
+                _QWEN38_QPN_MTP5_W13_SPLIT_K,
+            )
+            return output
         grouped_route = _grouped_decode_route(layer, x, topk_ids)
         if grouped_route is not None:
             # rows_per_request: 1 = pure decode; q = batch-3a uniform verify.

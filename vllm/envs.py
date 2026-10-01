@@ -205,6 +205,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE: bool = False
     VLLM_SM70_NVFP4_MOE_GROUPED_DECODE: bool = False
+    VLLM_SM70_NVFP4_MOE_GROUPED_MTP5: bool = False
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE: bool = False
@@ -2045,6 +2046,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default off pending endpoint and model-quality admission.
     "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_DECODE", "0"))
+    ),
+    # Reuse the batched expert grouping for the exact TP4 MTP4 verifier.
+    # Preserve its W13 split4 and ordered FP16 W2/FP32 weighted reduction.
+    # (Upstream 1Cat 45248dc8d. In the SM70 Qwen3.8 native-MTP lane the fork
+    # defaults it through SX_OPT_MTP_MOE_GROUPED_MTP5 when this is unset.)
+    "VLLM_SM70_NVFP4_MOE_GROUPED_MTP5": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_MTP5", "0"))
     ),
     # Split-preserving M4/M8/M16 specializations for the direct Qwen3.8 expert
     # route. They fuse the FP16 SwiGLU epilogue into W13 while reading the
