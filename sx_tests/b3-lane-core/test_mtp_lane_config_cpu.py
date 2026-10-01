@@ -77,9 +77,12 @@ DEFAULT_KEYS = (
 SPLIT_KEY = "VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS"
 # MTP-lane defaults of the upstream d30469863 port (_sx_mtp_lane_port_defaults)
 # and the _C capability probe each one needs.
-PORT_KEYS = ("VLLM_SM70_RMSNORM_GATED_EXACT",)
-PORT_PROBES = ("_sm70_rmsnorm_gated_exact_available",)
-PORT_SWITCHES = ("SX_OPT_MTP_RMSNORM_GATED_EXACT",)
+PORT_KEYS = ("VLLM_SM70_RMSNORM_GATED_EXACT", "VLLM_SM70_MTP_PLE_CONV")
+PORT_PROBES = (
+    "_sm70_rmsnorm_gated_exact_available",
+    "_sm70_ple_spec_conv_available",
+)
+PORT_SWITCHES = ("SX_OPT_MTP_RMSNORM_GATED_EXACT", "SX_OPT_MTP_PLE_CONV")
 SX_KEYS = (
     "SX_OPT_MTP_LANE",
     "SX_OPT_MTP_ROWS",

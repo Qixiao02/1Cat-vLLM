@@ -125,6 +125,24 @@ def _sx_ple_prefill_groups(
     return groups
 
 
+# Fused MTP4 PLE rollback/conv op (upstream 763189d9a, csrc/sm70_turbomind/ops/
+# qwen38_ple_spec_sm70.cu). Probed once, at the first fully admitted call, so
+# Python on an older _C keeps the generic spec path instead of failing.
+_SM70_PLE_SPEC_CONV_OP: bool | None = None
+
+
+def _sm70_ple_spec_conv_op_available() -> bool:
+    global _SM70_PLE_SPEC_CONV_OP
+    if _SM70_PLE_SPEC_CONV_OP is None:
+        _SM70_PLE_SPEC_CONV_OP = hasattr(torch.ops._C, "qwen38_ple_spec_sm70_out")
+        if not _SM70_PLE_SPEC_CONV_OP:
+            logger.warning_once(
+                "VLLM_SM70_MTP_PLE_CONV is set but _C lacks "
+                "qwen38_ple_spec_sm70_out; keeping the generic MTP PLE path."
+            )
+    return _SM70_PLE_SPEC_CONV_OP
+
+
 
 def _advise_random_file_access(tensor: torch.Tensor) -> str:
     """Require a lazy file mapping and disable destructive mmap read-around."""
@@ -2037,6 +2055,51 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         """
         num_reqs = spec_state_indices_tensor.numel()
         hidden_size = x_spec.size(-1)
+        # SX MTP port of upstream 763189d9a (gate unchanged): one exact kernel
+        # for the single-request MTP4 rollback, the four dilated taps, the
+        # FP16 conv boundary, SiLU and the state commit. Same values as the
+        # generic path below: output bits for the live rows, zero padding rows
+        # (zero sign not promised) and every state bit; null state IDs never
+        # write. Requested by VLLM_SM70_MTP_PLE_CONV (native-MTP lane default,
+        # SX_OPT_MTP_PLE_CONV); a _C without the op keeps the generic path.
+        if (
+            envs.VLLM_SM70_MTP_PLE_CONV
+            and num_reqs == 1
+            and spec_query_len == 5
+            and self.conv_state_len == 9
+            and self.short_conv_dilation == 3
+            and x_spec.shape in ((5, 10240), (10, 10240))
+            and x_spec.is_cuda
+            and x_spec.dtype == torch.float16
+            and x_spec.is_contiguous()
+            and conv_weights.shape == (10240, 4)
+            and conv_weights.dtype == torch.float16
+            and conv_weights.is_contiguous()
+            and conv_state.shape[1:] == (10240, 13)
+            and conv_state.dtype in (torch.float16, torch.float32)
+            and all(
+                t.dtype == torch.int32 and t.is_cuda and t.is_contiguous()
+                for t in (
+                    spec_state_indices_tensor,
+                    spec_query_start_loc,
+                    num_accepted_tokens,
+                )
+            )
+            and current_platform.is_device_capability((7, 0))
+            and _sm70_ple_spec_conv_op_available()
+        ):
+            output = torch.empty_like(x_spec)
+            torch.ops._C.qwen38_ple_spec_sm70_out(
+                output,
+                conv_state,
+                x_spec,
+                conv_weights,
+                spec_state_indices_tensor,
+                spec_query_start_loc,
+                num_accepted_tokens,
+            )
+            logger.info_once("SM70 MTP4 PLE rollback/conv/SiLU/state fusion enabled.")
+            return output
         # Use a fixed packing width instead of synchronizing on lengths.max().
         max_len = spec_query_len
         # Full CUDA graphs can pad these buffers. Only the first num_reqs

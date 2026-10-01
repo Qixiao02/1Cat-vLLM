@@ -44,6 +44,7 @@ NORM = "VLLM_SM70_RMSNORM_GATED_EXACT"
 # Port defaults: (upstream variable, SX switch, capability probe).
 PORT = (
     (NORM, "SX_OPT_MTP_RMSNORM_GATED_EXACT", "_sm70_rmsnorm_gated_exact_available"),
+    ("VLLM_SM70_MTP_PLE_CONV", "SX_OPT_MTP_PLE_CONV", "_sm70_ple_spec_conv_available"),
 )
 PORT_KEYS = tuple(key for key, _, _ in PORT)
 ALL_KEYS = (*BASE, SPLIT, *PORT_KEYS)
@@ -94,7 +95,8 @@ def test_nomtp_unchanged(cfg_ns):
     assert applied == BASE
     # The SX port switches never touch the no-MTP lane.
     cfg_ns["state"]["_sm70_rmsnorm_gated_exact_available"] = True
-    os.environ["SX_OPT_MTP_RMSNORM_GATED_EXACT"] = "0"
+    for switch in SWITCHES:
+        os.environ[switch] = "0"
     applied, _ = _apply(cfg_ns, mtp=False)
     assert applied == (*BASE, NORM)
 

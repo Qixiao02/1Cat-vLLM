@@ -363,6 +363,7 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_PROFILE: bool = False
     VLLM_SM70_MTP_PROFILE_INTERVAL: int = 16
     VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS: bool = False
+    VLLM_SM70_MTP_PLE_CONV: bool = False
     VLLM_SM70_MTP_CONCURRENCY_WARMUP: bool = False
     VLLM_SM70_MTP_CONTEXT_BUCKETS: str | None = None
     VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS: str | None = None
@@ -2798,6 +2799,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS": lambda: bool(
         int(os.getenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "0"))
+    ),
+    # Fuse the MTP4 PLE rollback, depthwise convolution, SiLU and state commit
+    # (upstream 763189d9a). The SM70 Qwen3.8 native-MTP lane sets it by default
+    # (SX_OPT_MTP_PLE_CONV, vllm/config/vllm.py).
+    "VLLM_SM70_MTP_PLE_CONV": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_PLE_CONV", "0"))
     ),
     # Compile alternate single/concurrent MTP helper signatures at startup.
     # Default-off until matched cold-start and steady-state evidence is complete.
