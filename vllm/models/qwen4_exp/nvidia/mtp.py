@@ -36,6 +36,11 @@ same topology check as the no-MTP fast paths) the drafter
   Not installed with online QPN8 or VLLM_BATCH_INVARIANT; an explicit
   VLLM_SM70_QWEN38_FP16_GEMV=0 / VLLM_SM70_QWEN38_FUSED_HC_FP16=0 also keeps
   the drafter off that kernel family.
+* inside the native-MTP lane (``_is_sm70_qwen38_mtp_lane_contract``, which
+  also honours SX_OPT_MTP_LANE=0) arms upstream 1Cat's exact FP16 M1/M5 draft
+  MoE projections (``SX_OPT_MTP_MOE_FP16_EXACT``, default on; see
+  fused_moe.py). They reproduce the BM2 Triton tile bit for bit, so draft
+  proposals do not change either.
 
 All of this changes draft proposals only.  The target model and the
 rejection sampler are untouched, so the output distribution is unchanged.
@@ -316,6 +321,20 @@ def _sx_mtp_draft_contract(vllm_config) -> bool:
     return _exact_runtime_contract(view)
 
 
+def _sx_mtp_lane_contract(vllm_config) -> bool:
+    """The SM70 Qwen3.8 native-MTP lane (SX_OPT_MTP_LANE) of this drafter."""
+    try:
+        from vllm.config.vllm import _is_sm70_qwen38_mtp_lane_contract
+
+        return _is_sm70_qwen38_mtp_lane_contract(
+            vllm_config.model_config,
+            vllm_config.speculative_config,
+            vllm_config.parallel_config,
+        )
+    except Exception:  # noqa: BLE001 - fail closed on partial configs
+        return False
+
+
 def _sx_install_mtp_draft_fp16_routes(
     model: nn.Module, *, gemv: bool = True, hc: bool = True
 ) -> dict[str, int]:
@@ -413,10 +432,13 @@ def _sx_prepare_mtp_draft_sm70(model: nn.Module, vllm_config) -> dict[str, int]:
     if not _sx_mtp_draft_contract(vllm_config):
         return {}
     from vllm.model_executor.layers.fused_moe.fused_moe import (
+        arm_sm70_mtp_draft_moe_fp16,
         arm_sm70_mtp_draft_moe_tiles,
     )
 
     arm_sm70_mtp_draft_moe_tiles(True)
+    # SX_OPT_MTP_MOE_FP16_EXACT (upstream 0930fd3b6): native-MTP lane only.
+    arm_sm70_mtp_draft_moe_fp16(_sx_mtp_lane_contract(vllm_config))
     if os.environ.get("SX_OPT_MTP_DRAFT_GEMV", "1").strip() == "0":
         return {}
     if envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8:

@@ -256,7 +256,13 @@ def test_load_time(layers):
     assert nomtp.sm70_nvfp4_persistent_max_tokens == 32
     table = moe._mtp_verify_route_table(lane)
     print(f"\n[b3-moe] k=4 verify routes: {table}")
-    assert table[5].startswith("qpn-mtp5-split4")
+    # mtp-port-moe: W5 takes the ported grouped MTP5 route once vllm._C
+    # carries nvfp4_grouped_w2_batch_reduce_sm70_out.
+    if lane.sm70_nvfp4_grouped_mtp5:
+        assert table[5] == "grouped-mtp5-split4+batch-reduce"
+    else:
+        assert table[5].startswith("qpn-mtp5-split4")
+    assert not nomtp.sm70_nvfp4_grouped_mtp5
     assert table[10] == "grouped-split4" and table[15] == "grouped-split8"
     assert all(table[w] == "grouped-split8" for w in (20, 25, 30))
     assert table[35] == "turbomind"
@@ -337,7 +343,9 @@ def test_direct_routes_equal_env_optins(layers, q, width):
     worst = 0.0
     for kind in ("random", "pool113", "shared10"):
         x, w, ids = _routes(kind, width, seed=500 + 7 * width + len(kind))
-        with as_q(lane, q):
+        # The direct route (mtp-port-moe's grouped MTP5 route is covered by
+        # sx_tests/mtp-port-moe/test_grouped_mtp5_gpu.py).
+        with as_q(lane, q), C.layer_attrs(lane, sm70_nvfp4_grouped_mtp5=False):
             route = moe._mtp_verify_route_table(lane)[width]
             got = _apply_verify(layers.lane_method, lane, x, w, ids, q)
             # The same forward with the lane defaults off but 1Cat's global
@@ -366,9 +374,10 @@ def test_w5_mtp5_variants(layers):
     + weighted reduce) vs no-MTP QPN M8 rows (informational)."""
     lane, nomtp = layers.lane, layers.nomtp
     x, w, ids = _routes("pool113", 5, seed=555)
-    got = _apply_verify(layers.lane_method, lane, x, w, ids, 5)
-    with C.layer_attrs(lane, sx_mtp_qpn_dynamic=False):
-        mtp5_only = _apply_verify(layers.lane_method, lane, x, w, ids, 5)
+    with C.layer_attrs(lane, sm70_nvfp4_grouped_mtp5=False):
+        got = _apply_verify(layers.lane_method, lane, x, w, ids, 5)
+        with C.layer_attrs(lane, sx_mtp_qpn_dynamic=False):
+            mtp5_only = _apply_verify(layers.lane_method, lane, x, w, ids, 5)
     xs, ws, idss = _windows(x, w, ids, 0, 5, 8, seed=8)
     with C.layer_attrs(nomtp, sm70_nvfp4_grouped_decode=False):
         qpn8 = _apply_decode(layers.nomtp_method, nomtp, xs, ws, idss)[:5]
@@ -388,7 +397,7 @@ def test_verify_full_graph_replay(layers, q, width):
     lane = layers.lane
     with as_q(lane, q):
         route = moe._mtp_verify_route_table(lane)[width]
-        grouped = route.startswith("grouped")
+        grouped = route.startswith("grouped-split")  # masked v2 routes only
         x0, w0, ids0 = _routes("pool113", width, seed=7000 + width)
         sx, sw, sids = x0.clone(), w0.clone(), ids0.clone()
         buf = C.qsl_buffer()
@@ -461,6 +470,7 @@ def test_lane_master_off_builds_dev2_mtp_layer(layers):
         assert dev2.sm70_nvfp4_grouped_max_tokens == 16
         assert dev2._nvfp4_sm70_eager_iota is None
         assert dev2.sm70_nvfp4_persistent_max_tokens == 18
+        assert not dev2.sm70_nvfp4_grouped_mtp5
         for width in (5, 8, 10, 15, 16, 20, 30):
             x, w, ids = _routes("pool113", width, seed=1300 + width)
             previous = _apply_plain(method, dev2, x, w, ids)
@@ -532,8 +542,10 @@ def test_microbench(layers):
         new = _graph_round(layers, tokens, q, live)
         alts = []
         if tokens == 5:
-            alts.append(("mtp5+sepW2", dict(sx_mtp_qpn_dynamic=False)))
-            alts.append(("grouped-s4", dict(sx_mtp_grouped_min_tokens=5)))
+            direct = dict(sm70_nvfp4_grouped_mtp5=False)
+            alts.append(("mtp5+batchW2", direct))
+            alts.append(("mtp5+sepW2", dict(direct, sx_mtp_qpn_dynamic=False)))
+            alts.append(("grouped-s4", dict(direct, sx_mtp_grouped_min_tokens=5)))
         if tokens in (10, 15):
             alts.append(("qpn-dyn", dict(sx_mtp_grouped_min_tokens=16)))
         if tokens == 10:

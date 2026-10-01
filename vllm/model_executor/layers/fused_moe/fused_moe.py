@@ -830,6 +830,162 @@ def invoke_fused_moe_triton_kernel(
     )
 
 
+# ---------------------------------------------------------------------------
+# Upstream 1Cat 0930fd3b6 / 6bcffbb79 (group "mtp-port-moe"): exact FP16 draft
+# MoE projections of the SM70 Qwen3.8-Flash-Next TP4 MTP drafter.
+#
+# SX_OPT_MTP_MOE_FP16_EXACT (default "1"; "0" = previous behaviour): in a
+#   process whose Qwen4ExpMTP drafter was built in the SM70 Qwen3.8 native-MTP
+#   lane (vllm/config/vllm.py _is_sm70_qwen38_mtp_lane_contract, armed by
+#   arm_sm70_mtp_draft_moe_fp16 from models/qwen4_exp/nvidia/mtp.py), the M1
+#   and M5 draft MoE projections (E512, H2560, local I160, top-10, FP16, the
+#   tuned BM2/BN128/BK64/4-warp tile, naive block assignment, no quantization
+#   or bias) run torch.ops._C.sm70_mtp_moe_fp16_out instead of the Triton
+#   fused_moe_kernel. The native kernels keep that kernel's sequential FP32
+#   FMA order over K, the FP16 W13 output and W2's router-weight multiply in
+#   FP32 before the FP16 store, so no output bit changes (upstream: zero
+#   FP16-bit differences on all four TP weight slices, M1/M5, W13/W2, six
+#   activation scales, changed routes). Other widths (draft step 0 or
+#   continuation steps with two or more requests) keep the SX draft tile
+#   table (SX_OPT_MTP_DRAFT_TILES, below). An explicitly set
+#   VLLM_SM70_MTP_MOE_FP16_EXACT keeps upstream's global meaning (shape and
+#   tile gates only); the lane default only applies when it is absent.
+#   TritonExperts (the modular experts the drafter runs) tries this dispatch
+#   before its Triton projections (upstream 6bcffbb79) and otherwise keeps
+#   its calls unchanged.
+# ---------------------------------------------------------------------------
+_SX_OPT_MTP_MOE_FP16_EXACT = (
+    os.environ.get("SX_OPT_MTP_MOE_FP16_EXACT", "1").strip() != "0"
+)
+_SM70_MTP_MOE_FP16_EXACT_ENV = "VLLM_SM70_MTP_MOE_FP16_EXACT"
+_sx_mtp_moe_fp16_exact_armed = False
+
+
+def arm_sm70_mtp_draft_moe_fp16(armed: bool = True) -> bool:
+    """Admit the exact FP16 draft projections in this process (lane drafter).
+
+    ``armed`` is the native-MTP lane contract of the drafter being built. The
+    lane default needs SX_OPT_MTP_MOE_FP16_EXACT on and
+    VLLM_SM70_MTP_MOE_FP16_EXACT unset (an explicit value decides globally).
+    """
+    global _sx_mtp_moe_fp16_exact_armed
+    _sx_mtp_moe_fp16_exact_armed = bool(
+        armed
+        and _SX_OPT_MTP_MOE_FP16_EXACT
+        and _SM70_MTP_MOE_FP16_EXACT_ENV not in os.environ
+    )
+    if _sx_mtp_moe_fp16_exact_armed:
+        logger.info_once(
+            "SX_OPT_MTP_MOE_FP16_EXACT: exact SM70 FP16 draft MoE projections "
+            "armed for the native-MTP lane (M1/M5, E512, H2560, I160)."
+        )
+    return _sx_mtp_moe_fp16_exact_armed
+
+
+def _sm70_mtp_moe_fp16_shape_supported(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    weights: torch.Tensor | None,
+    ids: torch.Tensor,
+    top_k: int,
+    weighted: bool,
+) -> bool:
+    if weights is None or weights.ndim != 2 or weights.shape[1] != 10:
+        return False
+    m = weights.shape[0]
+    if m not in (1, 5):
+        return False
+    n, k = (2560, 160) if weighted else (320, 2560)
+    return (
+        top_k == (1 if weighted else 10)
+        and a.shape == (m * 10 if weighted else m, k)
+        and b.shape == (512, n, k)
+        and c.shape == (m, 10, n)
+        and ids.shape == (m * 10,)
+        and a.dtype == b.dtype == c.dtype == torch.float16
+        and weights.dtype == torch.float32
+        and ids.dtype == torch.int32
+        and all(
+            t.device == a.device and t.is_contiguous() for t in (a, b, c, weights, ids)
+        )
+    )
+
+
+def sm70_mtp_moe_fp16_dispatch(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    A_scale: torch.Tensor | None,
+    B_scale: torch.Tensor | None,
+    B_zp: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    sorted_token_ids: torch.Tensor | None,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: dict[str, Any],
+    compute_type: tl.dtype,
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    use_int8_w8a16: bool,
+    use_int4_w4a16: bool,
+    block_shape: list[int] | None = None,
+    B_bias: torch.Tensor | None = None,
+) -> bool:
+    """Run the exact SM70 FP16 MTP draft projection if admitted.
+
+    Returns False, with nothing launched, unless the lane default
+    (SX_OPT_MTP_MOE_FP16_EXACT) or VLLM_SM70_MTP_MOE_FP16_EXACT is on and the
+    call is upstream's qualified M1/M5 geometry and tile. ``topk_weights``
+    is also passed for W13 (``mul_routed_weight`` False): it only supplies M.
+    """
+    if not (
+        (_sx_mtp_moe_fp16_exact_armed or envs.VLLM_SM70_MTP_MOE_FP16_EXACT)
+        and not envs.VLLM_BATCH_INVARIANT
+        and not _force_sm70_mtp_moe_legacy_config
+        and envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG
+        and sorted_token_ids is None
+        and not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+        and A_scale is None
+        and B_scale is None
+        and B_zp is None
+        and B_bias is None
+        and block_shape is None
+        and compute_type == tl.float16
+        and config.get("BLOCK_SIZE_M") == 2
+        and config.get("BLOCK_SIZE_N") == 128
+        and config.get("BLOCK_SIZE_K") == 64
+        and config.get("num_warps") == 4
+        and A.is_cuda
+        and current_platform.is_device_capability(70)
+        and _sm70_mtp_moe_fp16_shape_supported(
+            A, B, C, topk_weights, expert_ids, top_k, mul_routed_weight
+        )
+        and B.data_ptr() % 16 == 0
+        and num_tokens_post_padded.device == A.device
+        and num_tokens_post_padded.dtype == torch.int32
+        and num_tokens_post_padded.numel() == 1
+        and num_tokens_post_padded.is_contiguous()
+        and hasattr(torch.ops._C, "sm70_mtp_moe_fp16_out")
+    ):
+        return False
+    logger.info_once(
+        "Using exact SM70 FP16 MTP MoE projections (M1/M5, E512, H2560, I160)."
+    )
+    torch.ops._C.sm70_mtp_moe_fp16_out(
+        C,
+        A,
+        B,
+        expert_ids,
+        topk_weights,
+        num_tokens_post_padded,
+        mul_routed_weight,
+    )
+    return True
+
+
 def dispatch_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -859,6 +1015,31 @@ def dispatch_fused_moe_kernel(
 
     M = A.size(0)
     num_tokens = M * top_k
+
+    # SX_OPT_MTP_MOE_FP16_EXACT / VLLM_SM70_MTP_MOE_FP16_EXACT (see above).
+    if sm70_mtp_moe_fp16_dispatch(
+        A,
+        B,
+        C,
+        A_scale,
+        B_scale,
+        B_zp,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        mul_routed_weight,
+        top_k,
+        config,
+        compute_type,
+        use_fp8_w8a8,
+        use_int8_w8a8,
+        use_int8_w8a16,
+        use_int4_w4a16,
+        block_shape,
+        B_bias,
+    ):
+        return
 
     if (use_int8_w8a16 or use_int4_w4a16) and (
         block_shape is not None and block_shape[1] > 0

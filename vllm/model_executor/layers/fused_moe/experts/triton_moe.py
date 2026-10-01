@@ -19,6 +19,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
     _prepare_expert_assignment,
     invoke_fused_moe_triton_kernel,
     invoke_fused_moe_wna16_triton_kernel,
+    sm70_mtp_moe_fp16_dispatch,
     try_get_optimal_moe_config,
 )
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
@@ -261,6 +262,32 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         lora_context = self._lora_context
 
         def _base_w13_fn():
+            # SX_OPT_MTP_MOE_FP16_EXACT (upstream 6bcffbb79): the exact SM70
+            # FP16 draft projection when admitted, else the unchanged Triton
+            # call. The routing weights only supply M here (no multiply).
+            if sm70_mtp_moe_fp16_dispatch(
+                hidden_states,
+                w1,
+                intermediate_cache1,
+                a1q_scale if a1q_scale is not None else self.a1_scale,
+                self.w1_scale,
+                None,  # B_zp
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                False,  # mul_routed_weights
+                top_k_num,
+                config,
+                compute_type,
+                self.quant_config.use_fp8_w8a8,
+                self.quant_config.use_int8_w8a8,
+                self.quant_config.use_int8_w8a16,
+                self.quant_config.use_int4_w4a16,
+                self.block_shape,
+                self.w1_bias,
+            ):
+                return
             invoke_fused_moe_triton_kernel(
                 hidden_states,
                 w1,
@@ -379,6 +406,30 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         # the w13 pair: base GEMM on default stream, LoRA delta on aux,
         # join via .add_() into intermediate_cache3.
         def _base_w2_fn():
+            # SX_OPT_MTP_MOE_FP16_EXACT (upstream 6bcffbb79), see _base_w13_fn.
+            if sm70_mtp_moe_fp16_dispatch(
+                qintermediate_cache2,
+                w2,
+                intermediate_cache3,
+                a2q_scale,
+                self.w2_scale,
+                None,  # B_zp
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                not apply_router_weight_on_input,
+                1,
+                config,
+                compute_type,
+                self.quant_config.use_fp8_w8a8,
+                self.quant_config.use_int8_w8a8,
+                self.quant_config.use_int8_w8a16,
+                self.quant_config.use_int4_w4a16,
+                self.block_shape,
+                self.w2_bias,
+            ):
+                return
             invoke_fused_moe_triton_kernel(
                 qintermediate_cache2,
                 w2,

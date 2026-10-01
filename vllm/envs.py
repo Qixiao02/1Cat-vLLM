@@ -205,6 +205,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE: bool = False
     VLLM_SM70_NVFP4_MOE_GROUPED_DECODE: bool = False
+    VLLM_SM70_NVFP4_MOE_GROUPED_MTP5: bool = False
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2: bool = True
     VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE: bool = False
@@ -215,6 +216,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE: bool = False
     VLLM_SM70_NVFP4_QPN_M1_LIBRARY: str | None = None
     VLLM_SM70_QWEN38_ROUTER_TOPK: bool = True
+    VLLM_SM70_MTP_ROUTER_TOP16: bool = False
     VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE: bool = False
     VLLM_SM70_AWQ_WARMUP: bool = True
     VLLM_SM70_AWQ_WARMUP_MAX_M: int = 16
@@ -621,6 +623,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP: bool = False
     VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG: bool = True
     VLLM_SM70_MTP_MOE_TUNED_CONFIG: bool = True
+    VLLM_SM70_MTP_MOE_FP16_EXACT: bool = False
     VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE: bool = False
     VLLM_SM70_USE_BREAKABLE_CUDAGRAPH: bool = False
     VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH: bool = False
@@ -2049,6 +2052,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE": lambda: bool(
         int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_DECODE", "0"))
     ),
+    # Reuse the batched expert grouping for the exact TP4 MTP4 verifier.
+    # Preserve its W13 split4 and ordered FP16 W2/FP32 weighted reduction.
+    # (Upstream 1Cat 45248dc8d. In the SM70 Qwen3.8 native-MTP lane the fork
+    # defaults it through SX_OPT_MTP_MOE_GROUPED_MTP5 when this is unset.)
+    "VLLM_SM70_NVFP4_MOE_GROUPED_MTP5": lambda: bool(
+        int(os.getenv("VLLM_SM70_NVFP4_MOE_GROUPED_MTP5", "0"))
+    ),
     # Split-preserving M4/M8/M16 specializations for the direct Qwen3.8 expert
     # route. They fuse the FP16 SwiGLU epilogue into W13 while reading the
     # existing interleaved native-NVFP4 layout. M2 retains its faster separate
@@ -2117,6 +2127,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Next. All other shapes and scoring modes retain the generic CUDA op.
     "VLLM_SM70_QWEN38_ROUTER_TOPK": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN38_ROUTER_TOPK", "1"))
+    ),
+    # Select only the first 16 lossless keys before the unchanged top-10 norm.
+    # (Upstream 1Cat 1ef9f45a5; FP16 M5/M10. MTP-lane routers of the fork
+    # default it through SX_OPT_MTP_ROUTER_TOP16 when this is unset.)
+    "VLLM_SM70_MTP_ROUTER_TOP16": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_ROUTER_TOP16", "0"))
     ),
     "VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE": lambda: bool(
         int(os.getenv("VLLM_SM70_AWQ_REUSE_IMPORTED_CACHE", "0"))
@@ -3709,6 +3725,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # variable to zero is the explicit rollback.
     "VLLM_SM70_MTP_MOE_TUNED_CONFIG": lambda: bool(
         int(os.getenv("VLLM_SM70_MTP_MOE_TUNED_CONFIG", "1"))
+    ),
+    # Opt-in exact FP16 Flash-Next TP4 draft projections; retains the tuned
+    # BM2 Triton accumulation order, original weights, and FP16 boundaries.
+    # (Upstream 1Cat 0930fd3b6. In the SM70 Qwen3.8 native-MTP lane the fork
+    # defaults it through SX_OPT_MTP_MOE_FP16_EXACT when this is unset.)
+    "VLLM_SM70_MTP_MOE_FP16_EXACT": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_MOE_FP16_EXACT", "0"))
     ),
     # Legacy SM70 CUDA-graph capture-size tuning from 0.0.3. Default-off
     # because dense capture can increase startup/compile cost; when enabled on
