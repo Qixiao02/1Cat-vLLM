@@ -59,12 +59,23 @@ def _top_level_segments(path: str, names: tuple[str, ...]) -> dict[str, str]:
     return found
 
 
-def cut(path: str, names: tuple[str, ...], namespace: dict[str, Any]) -> dict[str, Any]:
-    """Exec the named top-level definitions of ``path`` into ``namespace``."""
+def cut(
+    path: str,
+    names: tuple[str, ...],
+    namespace: dict[str, Any],
+    transform: Any = None,
+) -> dict[str, Any]:
+    """Exec the named top-level definitions of ``path`` into ``namespace``.
+
+    ``transform`` (optional) rewrites the cut source first; tests use it only
+    for explicitly named, minimal harness substitutions.
+    """
     found = _top_level_segments(path, names)
     missing = [name for name in names if name not in found]
     assert not missing, f"{os.path.basename(path)}: not found {missing}"
     code = "\n\n".join(found[name] for name in names) + "\n"
+    if transform is not None:
+        code = transform(code)
     exec(compile(code, path, "exec"), namespace)  # noqa: S102
     return namespace
 

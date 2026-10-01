@@ -29,6 +29,8 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
     prepare_dflash2_gdn_group_metadata,
+    sx_mtp_fused_gdn_metadata_admitted,
+    sx_prepare_mtp_fused_gdn_metadata,
 )
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.short_conv_attn import (
@@ -149,6 +151,19 @@ class MambaHybridModelState(DefaultModelState):
             and device.type == "cuda"
             and current_platform.is_device_capability(70)
         )
+        # SX_OPT_MTP_GDN_FUSED_META (upstream 98b81ea69 + cfe8490a8, see
+        # gdn_attn.py): pure native-MTP verify batches in FULL graphs classify
+        # once and write every GDN group's state rows in one launch; every
+        # other step keeps the per-group SX_OPT_SPEC_META_NOSYNC builds.
+        self._sx_mtp_fused_gdn_metadata = bool(
+            not self._use_dflash2_common_gdn_metadata
+            and sx_mtp_fused_gdn_metadata_admitted(vllm_config, device)
+        )
+        if self._sx_mtp_fused_gdn_metadata:
+            logger.info_once(
+                "SM70 MTP fused GDN metadata enabled for pure verify graph "
+                "batches (SX_OPT_MTP_GDN_FUSED_META)."
+            )
         self._dflash2_gdn_builders: (
             list[tuple[int, GDNAttentionMetadataBuilder]] | None
         ) = None
@@ -379,6 +394,37 @@ class MambaHybridModelState(DefaultModelState):
                         envs.VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING
                     ),
                 )
+
+            if (
+                self._sx_mtp_fused_gdn_metadata
+                and cudagraph_mode == CUDAGraphMode.FULL
+            ):
+                # Shared metadata only when the fused write succeeded; the
+                # builders' per-group path stays sync-free otherwise.
+                sx_result = sx_prepare_mtp_fused_gdn_metadata(
+                    builders_by_group=self._get_dflash2_gdn_builders(attn_groups),
+                    block_tables=block_tables,
+                    num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+                    query_start_loc=input_batch.query_start_loc,
+                    query_start_loc_cpu=query_start_loc_cpu,
+                    num_accepted_tokens=num_accepted_tokens,
+                    num_actual_tokens=num_tokens,
+                    descriptor=self._dflash2_gdn_group_descriptor,
+                    seq_lens=input_batch.seq_lens if self._align_mode else None,
+                )
+                if sx_result is not None:
+                    (
+                        common_gdn_metadata,
+                        prepared_dflash2_gdn_metadata,
+                        self._dflash2_gdn_group_descriptor,
+                    ) = sx_result
+                    if not self._dflash2_fused_gdn_metadata_logged:
+                        logger.info(
+                            "Fused speculative GDN metadata active for %d cache "
+                            "groups (MTP).",
+                            len(prepared_dflash2_gdn_metadata),
+                        )
+                        self._dflash2_fused_gdn_metadata_logged = True
 
             if (
                 self._use_dflash2_fused_gdn_metadata

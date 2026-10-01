@@ -243,6 +243,8 @@ if TYPE_CHECKING:
     VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER: bool = False
     VLLM_SM70_DFLASH2_VERIFY_FASTPATH: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_METADATA: bool = False
+    VLLM_SM70_MTP4_SHARED_GDN_METADATA: bool = True
+    VLLM_SM70_MTP4_FUSED_GDN_METADATA: bool = True
     VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW: bool = False
     VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT: bool = False
     VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY: bool = False
@@ -2243,6 +2245,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gate until the fixed-trajectory and mixed-batch Graph checks pass.
     "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "0"))
+    ),
+    # Upstream d30469863 (98b81ea69 / cfe8490a8) rollback switches for native
+    # MTP GDN metadata (any draft depth; the MTP4 prefix is historical). The
+    # fork uses them only together, as kill switches of the fused all-group
+    # write of the SM70 Qwen3.8 native-MTP lane (SX_OPT_MTP_GDN_FUSED_META in
+    # gdn_attn.py): either "0" restores the per-group builds.
+    "VLLM_SM70_MTP4_SHARED_GDN_METADATA": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP4_SHARED_GDN_METADATA", "1"))
+    ),
+    "VLLM_SM70_MTP4_FUSED_GDN_METADATA": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP4_FUSED_GDN_METADATA", "1"))
     ),
     # Debug-only oracle: materialize the legacy advanced-indexing contract and
     # compare it with the fused persistent buffers before graph replay.

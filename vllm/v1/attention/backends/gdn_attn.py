@@ -247,6 +247,143 @@ class _SxGDNSpecParts(NamedTuple):
     spec_qsl_last: int
 
 
+# ---------------------------------------------------------------------------
+# SX_OPT_MTP_GDN_FUSED_META (SX MTP port of upstream main@d30469863:
+# 98b81ea69 + cfe8490a8, native MTP at any draft depth)
+#
+# Every GDN cache group used to build its own verify metadata per step: the
+# same request classification, the same query offsets and accepted counts,
+# and a gather/copy pipeline for its own state rows. For a pure verify batch
+# in a FULL graph (spec rows first, graph padding last) the step is now
+# classified once on the host (sx_mtp_pure_common_gdn_metadata) and one
+# pointer-table launch writes every group's state rows plus the shared graph
+# buffers (prepare_dflash2_gdn_group_metadata with enable_mtp4=True). The
+# align-mode state column is the sequence-length column of
+# mamba_get_block_table_tensor, which the per-group build uses as well; the
+# fork's multi-block align prefill only adds null interior columns and keeps
+# the running + speculative columns at that position. Values equal the
+# per-group build field for field (upstream: three groups, MTP4 width 5,
+# metadata submission 1.434 -> 0.120 ms per step with shared classification).
+#
+# Upstream's shared-only route (VLLM_SM70_MTP4_SHARED_GDN_METADATA without the
+# fused write) is not used: compute_common_gdn_attn_metadata and the builder's
+# common branch gather with device boolean masks and pageable copies, which
+# SX_OPT_SPEC_META_NOSYNC removed from the per-group build. Mixed / prefill /
+# eager steps, non-prefix batches and anything prepare rejects therefore keep
+# the per-group SX_OPT_SPEC_META_NOSYNC builds unchanged.
+#
+# Admission: the native-MTP lane (_is_sm70_qwen38_mtp_lane_contract) on SM70,
+# mamba_cache_mode none/align, SX_OPT_MTP_GDN_FUSED_META (default "1"; "0" =
+# per-group builds) and upstream's rollback switches
+# VLLM_SM70_MTP4_SHARED_GDN_METADATA / VLLM_SM70_MTP4_FUSED_GDN_METADATA
+# (default "1"; either "0" also restores the per-group builds).
+# ---------------------------------------------------------------------------
+def _sx_mtp_fused_gdn_meta_switch() -> bool:
+    return os.environ.get("SX_OPT_MTP_GDN_FUSED_META", "1") != "0"
+
+
+def _sx_mtp_gdn_lane_contract(vllm_config: object) -> bool:
+    """The native-MTP lane contract on an SM70 device (fails closed)."""
+    try:
+        from vllm.config.vllm import _is_sm70_qwen38_mtp_lane_contract
+        from vllm.platforms import current_platform
+
+        return bool(
+            _is_sm70_qwen38_mtp_lane_contract(
+                getattr(vllm_config, "model_config", None),
+                getattr(vllm_config, "speculative_config", None),
+                getattr(vllm_config, "parallel_config", None),
+            )
+            and current_platform.is_device_capability(70)
+        )
+    except Exception:  # noqa: BLE001 - partial configs fail closed
+        return False
+
+
+def sx_mtp_fused_gdn_metadata_admitted(
+    vllm_config: object, device: torch.device | str
+) -> bool:
+    cache_config = getattr(vllm_config, "cache_config", None)
+    return bool(
+        _sx_mtp_fused_gdn_meta_switch()
+        and envs.VLLM_SM70_MTP4_SHARED_GDN_METADATA
+        and envs.VLLM_SM70_MTP4_FUSED_GDN_METADATA
+        and torch.device(device).type == "cuda"
+        and getattr(cache_config, "mamba_cache_mode", None) in ("none", "align")
+        and _sx_mtp_gdn_lane_contract(vllm_config)
+    )
+
+
+def sx_mtp_pure_common_gdn_metadata(
+    *,
+    num_decode_draft_tokens_cpu: torch.Tensor | None,
+    query_start_loc: torch.Tensor,
+    query_start_loc_cpu: torch.Tensor,
+    num_spec_state_tokens: int,
+    spec_token_indx_buffer: torch.Tensor | None = None,
+) -> CommonGDNSpecMetadata | None:
+    """Host-only classification of a pure verify batch, spec rows first.
+
+    The same values as ``compute_common_gdn_attn_metadata`` for such a batch
+    (its pure branch), without device boolean masks or pageable copies: the
+    spec mask goes through pinned memory, the token indices are a prefix of
+    ``spec_token_indx_buffer`` (the shared arange buffer) when it is long
+    enough. Any other batch returns None and keeps the per-group builds.
+    """
+    if num_spec_state_tokens <= 0 or num_decode_draft_tokens_cpu is None:
+        return None
+    num_reqs = query_start_loc_cpu.numel() - 1
+    if (
+        num_decode_draft_tokens_cpu.ndim != 1
+        or num_decode_draft_tokens_cpu.numel() != num_reqs
+    ):
+        return None
+    spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
+    num_spec_decodes = int(spec_sequence_masks_cpu.sum().item())
+    if num_spec_decodes == 0 or not SxSpecRows.is_prefix(
+        spec_sequence_masks_cpu, num_spec_decodes
+    ):
+        return None
+    if int(num_decode_draft_tokens_cpu[:num_spec_decodes].sum().item()) == 0:
+        return None
+    query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+    if bool(query_lens_cpu[num_spec_decodes:].any().item()):
+        # A non-spec row with tokens (decode or prefill): not a pure batch.
+        return None
+    device = query_start_loc.device
+    spec_token_size = min(
+        num_spec_decodes * (num_spec_state_tokens + 1),
+        int(query_start_loc_cpu[-1].item()),
+    )
+    if (
+        spec_token_indx_buffer is not None
+        and spec_token_indx_buffer.device == device
+        and spec_token_indx_buffer.dtype == torch.int32
+        and spec_token_indx_buffer.numel() >= spec_token_size
+    ):
+        spec_token_indx = spec_token_indx_buffer[:spec_token_size]
+    else:
+        spec_token_indx = torch.arange(
+            spec_token_size, dtype=torch.int32, device=device
+        )
+    return CommonGDNSpecMetadata(
+        num_prefills=0,
+        num_prefill_tokens=0,
+        num_decodes=0,
+        num_decode_tokens=0,
+        num_spec_decodes=num_spec_decodes,
+        num_spec_decode_tokens=int(query_lens_cpu.sum().item()),
+        # Padded sequences are always at the back.
+        spec_query_start_loc=query_start_loc[: num_spec_decodes + 1],
+        non_spec_query_start_loc=None,
+        non_spec_query_start_loc_cpu=None,
+        spec_sequence_masks_cpu=spec_sequence_masks_cpu,
+        spec_sequence_masks=sx_h2d_nosync(spec_sequence_masks_cpu, device),
+        spec_token_indx=spec_token_indx,
+        non_spec_token_indx=torch.empty(0, dtype=torch.int32, device=device),
+    )
+
+
 @dataclass
 class _GDNDdTreeFastCommonBuffers:
     spec_sequence_masks: torch.Tensor
@@ -292,7 +429,8 @@ def _get_ddtree_gdn_fast_common_buffers(
     buffers = _GDN_DDTREE_FAST_COMMON_BUFFERS.get(key)
     if buffers is not None:
         return buffers
-    spec_sequence_masks = torch.empty(
+    # Zeroed so rows past a step's batch never read as live speculative rows.
+    spec_sequence_masks = torch.zeros(
         (decode_cudagraph_max_bs,),
         dtype=torch.bool,
         device=device,
@@ -378,6 +516,7 @@ def _dflash2_gdn_group_metadata_kernel(
     block_table_strides,
     state_start_indices,
     req_index_mapping,
+    seq_lens,
     spec_query_start_loc_src,
     num_accepted_src,
     state_selector_src,
@@ -391,6 +530,8 @@ def _dflash2_gdn_group_metadata_kernel(
     PAD_ID: tl.constexpr,
     BLOCK: tl.constexpr,
     USE_STATE_START: tl.constexpr,
+    USE_SEQ_LEN_START: tl.constexpr,
+    MAMBA_BLOCK_SIZE: tl.constexpr,
 ):
     """Write every GDN group's state IDs and the shared graph metadata."""
     group_id = tl.program_id(0)
@@ -418,6 +559,11 @@ def _dflash2_gdn_group_metadata_kernel(
         )
         state_columns = columns + state_starts
         live_state_mask &= (state_starts >= 0) & (state_columns < block_table_stride)
+    if USE_SEQ_LEN_START:
+        # Native MTP in align mode: mamba_get_block_table_tensor's column.
+        seq_len = tl.load(seq_lens + rows, mask=live_state_mask, other=0)
+        state_columns = columns + tl.maximum((seq_len - 1) // MAMBA_BLOCK_SIZE, 0)
+        live_state_mask &= state_columns < block_table_stride
     state_ids = tl.load(
         block_table + rows * block_table_stride + state_columns,
         mask=live_state_mask,
@@ -1065,6 +1211,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self._sx_spec_meta_nosync: bool = (
             self.use_spec_decode and sx_spec_meta_nosync_admitted(vllm_config)
         )
+        # SX_OPT_MTP_GDN_FUSED_META: the fused all-group write needs the
+        # shared graph buffers below at capture time already.
+        self._sx_mtp_fused_gdn_meta: bool = (
+            self.use_spec_decode
+            and sx_mtp_fused_gdn_metadata_admitted(vllm_config, device)
+        )
 
         self.use_full_cuda_graph: bool = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
@@ -1133,6 +1285,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and (
                 envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
                 or envs.VLLM_SM70_DFLASH2_FUSED_GDN_METADATA
+                or self._sx_mtp_fused_gdn_meta
             )
             and _dflash_ddtree_gdn_shared_common_enabled()
         ):
@@ -2781,6 +2934,8 @@ def prepare_dflash2_gdn_group_metadata(
     descriptor: DFlash2GDNGroupDescriptor | None,
     state_start_indices: torch.Tensor | None = None,
     req_index_mapping: torch.Tensor | None = None,
+    seq_lens: torch.Tensor | None = None,
+    enable_mtp4: bool = False,
 ) -> (
     tuple[
         dict[int, GDNAttentionMetadata],
@@ -2788,16 +2943,25 @@ def prepare_dflash2_gdn_group_metadata(
     ]
     | None
 ):
-    """Prepare all pure-MRV2 DFlash2 GDN graph metadata in one launch.
+    """Prepare pure-speculative GDN graph metadata for all groups in one launch.
 
     ``mamba_cache_mode=none`` reads the first speculative state columns.
     ``mamba_cache_mode=align`` supplies the authoritative, post-precopy state
-    column for each live request. DFlash2 batches keep live speculative rows at
-    the front and CUDA-graph padding at the back, so one pointer-table kernel can
-    perform the same state selection and tail fill without ten independent
-    gather/copy pipelines.
+    column for each live request. Native MTP, at any draft depth, uses the
+    legacy sequence-length-derived align column instead (``seq_lens``,
+    ``enable_mtp4``; upstream 98b81ea69 / cfe8490a8, SX_OPT_MTP_GDN_FUSED_META).
+    Both paths keep live speculative rows at the front and CUDA-graph padding
+    at the back, so one pointer-table kernel can perform the same state
+    selection and tail fill without ten independent gather/copy pipelines.
     """
-    if not envs.VLLM_SM70_DFLASH2_FUSED_GDN_METADATA:
+    if enable_mtp4:
+        if not (
+            _sx_mtp_fused_gdn_meta_switch()
+            and envs.VLLM_SM70_MTP4_SHARED_GDN_METADATA
+            and envs.VLLM_SM70_MTP4_FUSED_GDN_METADATA
+        ):
+            return None
+    elif not envs.VLLM_SM70_DFLASH2_FUSED_GDN_METADATA:
         return None
     if not builders_by_group or num_actual_tokens <= 0:
         return None
@@ -2807,6 +2971,11 @@ def prepare_dflash2_gdn_group_metadata(
         return None
 
     use_state_start = state_start_indices is not None
+    use_seq_len_start = seq_lens is not None
+    if use_seq_len_start and not enable_mtp4:
+        return None
+    if use_state_start and use_seq_len_start:
+        return None
     if use_state_start != (req_index_mapping is not None):
         return None
     if use_state_start:
@@ -2819,6 +2988,14 @@ def prepare_dflash2_gdn_group_metadata(
             or req_index_mapping.device != num_accepted_tokens.device
             or req_index_mapping.dtype != torch.int32
             or req_index_mapping.ndim != 1
+        ):
+            return None
+    if use_seq_len_start:
+        assert seq_lens is not None
+        if (
+            seq_lens.device != num_accepted_tokens.device
+            or seq_lens.dtype != torch.int32
+            or seq_lens.ndim != 1
         ):
             return None
 
@@ -2857,7 +3034,16 @@ def prepare_dflash2_gdn_group_metadata(
     mamba_cache_mode = first_builder.vllm_config.cache_config.mamba_cache_mode
     if mamba_cache_mode not in ("none", "align"):
         return None
-    if use_state_start != (mamba_cache_mode == "align"):
+    if enable_mtp4:
+        if use_state_start or use_seq_len_start != (mamba_cache_mode == "align"):
+            return None
+    elif use_state_start != (mamba_cache_mode == "align"):
+        return None
+    if (
+        use_seq_len_start
+        and seq_lens is not None
+        and seq_lens.numel() < num_spec_decodes
+    ):
         return None
     width = first_builder.num_spec_state_tokens + 1
     common_buffers = first_builder._ddtree_fast_common_buffers
@@ -2934,6 +3120,8 @@ def prepare_dflash2_gdn_group_metadata(
         tuple(state.data_ptr() for state in output_states),
         tuple(table.stride(0) for table in input_tables),
         use_state_start,
+        use_seq_len_start,
+        first_builder.kv_cache_spec.block_size,
         common_buffers.spec_sequence_masks.data_ptr(),
         common_buffers.spec_token_indx.data_ptr(),
         common_buffers.non_spec_token_indx.data_ptr(),
@@ -2970,6 +3158,7 @@ def prepare_dflash2_gdn_group_metadata(
         descriptor.block_table_strides,
         num_accepted_tokens if state_start_indices is None else state_start_indices,
         num_accepted_tokens if req_index_mapping is None else req_index_mapping,
+        num_accepted_tokens if seq_lens is None else seq_lens,
         query_start_loc,
         num_accepted_tokens,
         num_accepted_tokens,
@@ -2983,6 +3172,8 @@ def prepare_dflash2_gdn_group_metadata(
         PAD_ID=PAD_SLOT_ID,
         BLOCK=block,
         USE_STATE_START=use_state_start,
+        USE_SEQ_LEN_START=use_seq_len_start,
+        MAMBA_BLOCK_SIZE=first_builder.kv_cache_spec.block_size,
         num_warps=1,
     )
     common_buffers.initialized_key = (
@@ -3058,6 +3249,17 @@ def prepare_dflash2_gdn_group_metadata(
                     device=source_table.device,
                 )
                 expected_state = torch.gather(source_table, 1, columns)
+            elif use_seq_len_start:
+                assert seq_lens is not None
+                starts = torch.clamp(
+                    (seq_lens[:num_spec_decodes] - 1)
+                    // first_builder.kv_cache_spec.block_size,
+                    min=0,
+                ).to(torch.long)
+                columns = starts[:, None] + torch.arange(
+                    width, dtype=torch.long, device=source_table.device
+                )
+                expected_state = torch.gather(source_table, 1, columns)
             else:
                 expected_state = source_table[:, :width]
             torch.testing.assert_close(
@@ -3081,7 +3283,68 @@ def prepare_dflash2_gdn_group_metadata(
             rtol=0,
             atol=0,
         )
-        if torch.any(common_buffers.spec_sequence_masks[num_spec_decodes:]).item():
+        # Only this step's graph rows are written and replayed; rows past
+        # num_actual_tokens belong to larger batches and are never read here.
+        padded_rows = common_buffers.spec_sequence_masks[
+            num_spec_decodes:num_actual_tokens
+        ]
+        if torch.any(padded_rows).item():
             raise AssertionError("DFlash2 fused GDN metadata left a live padded row")
 
     return prepared, descriptor
+
+
+def sx_prepare_mtp_fused_gdn_metadata(
+    *,
+    builders_by_group: list[tuple[int, GDNAttentionMetadataBuilder]],
+    block_tables: tuple[torch.Tensor, ...],
+    num_decode_draft_tokens_cpu: torch.Tensor | None,
+    query_start_loc: torch.Tensor,
+    query_start_loc_cpu: torch.Tensor,
+    num_accepted_tokens: torch.Tensor,
+    num_actual_tokens: int,
+    descriptor: DFlash2GDNGroupDescriptor | None,
+    seq_lens: torch.Tensor | None,
+) -> (
+    tuple[
+        CommonGDNSpecMetadata,
+        dict[int, GDNAttentionMetadata],
+        DFlash2GDNGroupDescriptor,
+    ]
+    | None
+):
+    """One SX_OPT_MTP_GDN_FUSED_META step: classify once, write all groups once.
+
+    ``seq_lens`` holds the batch's device sequence lengths in align mode and is
+    None in none mode. A None result keeps the per-group builds for the step;
+    otherwise every GDN builder returns its prepared metadata unchanged.
+    """
+    if not builders_by_group:
+        return None
+    first_builder = builders_by_group[0][1]
+    common_buffers = first_builder._ddtree_fast_common_buffers
+    common_gdn_metadata = sx_mtp_pure_common_gdn_metadata(
+        num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc_cpu,
+        num_spec_state_tokens=first_builder.num_spec_state_tokens,
+        spec_token_indx_buffer=(
+            None if common_buffers is None else common_buffers.spec_token_indx
+        ),
+    )
+    if common_gdn_metadata is None:
+        return None
+    result = prepare_dflash2_gdn_group_metadata(
+        builders_by_group=builders_by_group,
+        block_tables=block_tables,
+        common_gdn_metadata=common_gdn_metadata,
+        num_accepted_tokens=num_accepted_tokens,
+        num_actual_tokens=num_actual_tokens,
+        descriptor=descriptor,
+        seq_lens=seq_lens,
+        enable_mtp4=True,
+    )
+    if result is None:
+        return None
+    prepared, descriptor = result
+    return common_gdn_metadata, prepared, descriptor
