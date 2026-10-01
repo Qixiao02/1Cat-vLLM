@@ -24,6 +24,17 @@ Asserted (SX_OPT_MTP_HC_BATCH):
   (FP16 partials, cooperative / full unroll from the switches); no packed
   copy (every non-MTP deployment) never reads the MTP switches;
 * the opaque op keeps its fake shapes and forwards both packed buffers.
+
+Asserted (SX_OPT_MTP_ROUTER_BATCH, SX_OPT_MTP_BATCH_OVER_ROWS):
+* switch parsing (router default on, OVER_ROWS default off);
+* packing keeps every router weight bit, bad geometries are rejected;
+* runtime admission: packed copy, CUDA FP16 aligned [M5/M10, 2560] inside
+  the verify capture, and precedence: an admitted SX_OPT_ROWS kernel keeps
+  its width unless OVER_ROWS=1;
+* dispatch: only the router role at (512, 2560) reaches the native op, with
+  the rows tile of that call; everything else keeps its old route;
+* the loader tags only routers, only in the admitted lane; packing happens
+  only for tagged layers with the native op; apply() forwards the pack.
 """
 
 from __future__ import annotations
@@ -53,6 +64,9 @@ SWITCHES = (
     "VLLM_SM70_MTP_HC_COOPERATIVE",
     "SX_OPT_MTP_HC_FULL_UNROLL",
     "VLLM_SM70_MTP_HC_FULL_UNROLL",
+    "SX_OPT_MTP_ROUTER_BATCH",
+    "VLLM_SM70_MTP_ROUTER_BATCH",
+    "SX_OPT_MTP_BATCH_OVER_ROWS",
 )
 PRECISION = (
     "allow_fp16_reduced_precision_reduction",
@@ -459,6 +473,223 @@ def test_registered_op_accepts_the_packed_arguments():
     for args in ((x, down, up), (x, down, up, pd, pu), (x, down, up, None, None)):
         block, injection = torch.ops.vllm.qwen38_sm70_fp16_fused_hc(*args)
         assert block.shape == (5, 2560) and injection.shape == (5, 4)
+
+
+# ---------------------------------------------------------------------------
+# Router batch projection
+# ---------------------------------------------------------------------------
+ROUTER = "model.layers.3.mlp.gate"
+
+
+class _NativeC:
+    """Recording stand-in for torch.ops._C (only the named ops exist)."""
+
+    def __init__(self, *names: str):
+        self.calls: list[tuple[str, tuple]] = []
+        for name in names:
+            setattr(self, name, self._recorder(name))
+
+    def _recorder(self, name):
+        def call(*args):
+            self.calls.append((name, args))
+
+        return call
+
+
+def _swap_native(monkeypatch, native: _NativeC, vllm_ops=None) -> None:
+    """Replace torch.ops for the module under test (restored by monkeypatch)."""
+    monkeypatch.setattr(
+        gemv.torch, "ops", SimpleNamespace(_C=native, vllm=vllm_ops or SimpleNamespace())
+    )
+
+
+@pytest.mark.parametrize(
+    "env,router,over_rows",
+    [
+        ({}, True, False),
+        ({"SX_OPT_MTP_ROUTER_BATCH": "0"}, False, False),
+        ({"VLLM_SM70_MTP_ROUTER_BATCH": "0"}, False, False),
+        ({"SX_OPT_MTP_ROUTER_BATCH": "1", "VLLM_SM70_MTP_ROUTER_BATCH": "0"}, True, False),
+        ({"SX_OPT_MTP_BATCH_OVER_ROWS": "1"}, True, True),
+        ({"SX_OPT_MTP_BATCH_OVER_ROWS": "0"}, True, False),
+    ],
+)
+def test_router_switches(monkeypatch, env, router, over_rows):
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    _reset_env_cache()
+    config = gemv._sx_mtp_batch_config()
+    assert (config.router, config.over_rows) == (router, over_rows)
+
+
+def test_router_pack_preserves_every_weight_bit():
+    raw = torch.randint(-(2**15), 2**15, (512, 2560), dtype=torch.int16)
+    packed = gemv._pack_router_batch_weight(raw.view(torch.float16))
+    assert packed.shape == (64, 40, 2, 4, 8, 8)
+    restored = packed.permute(0, 4, 3, 1, 2, 5).contiguous().view(512, 2560)
+    assert torch.equal(restored.view(torch.int16), raw)
+
+
+@pytest.mark.parametrize(
+    "shape,dtype", [((512, 2561), torch.float16), ((511, 2560), torch.float16),
+                    ((512, 2560), torch.float32)]
+)
+def test_router_bad_pack_rejected(shape, dtype):
+    with pytest.raises(ValueError):
+        gemv._pack_router_batch_weight(torch.empty(shape, dtype=dtype))
+
+
+@pytest.mark.parametrize(
+    "tile,over_rows,admitted", [(0, "0", True), (5, "0", False), (5, "1", True)]
+)
+def test_router_runtime_admission_and_precedence(monkeypatch, tile, over_rows, admitted):
+    monkeypatch.setenv("SX_OPT_MTP_BATCH_OVER_ROWS", over_rows)
+    _reset_env_cache()
+    x = _fake_cuda(torch.zeros(5, 2560, dtype=torch.float16))
+    packed = _fake_cuda(torch.zeros(64, 40, 2, 4, 8, 8, dtype=torch.float16))
+    with _verify_capture():
+        assert gemv._router_batch_runtime_ok(x, packed, tile) == admitted
+        assert not gemv._router_batch_runtime_ok(x, None, tile)
+        # CPU tensors, wrong widths and wrong packs are never admitted.
+        assert not gemv._router_batch_runtime_ok(x.as_subclass(torch.Tensor), packed)
+        assert not gemv._router_batch_runtime_ok(x[:4], packed)
+        assert not gemv._router_batch_runtime_ok(x, packed[:32])
+        assert not gemv._router_batch_runtime_ok(x, packed.float())
+    assert not gemv._router_batch_runtime_ok(x, packed, 0)  # outside the capture
+    monkeypatch.setenv("SX_OPT_MTP_ROUTER_BATCH", "0")
+    _reset_env_cache()
+    with _verify_capture():
+        assert not gemv._router_batch_runtime_ok(x, packed, 0)
+
+
+@pytest.mark.parametrize("admit", [True, False])
+@pytest.mark.parametrize("rows_tile", [0, 5])
+def test_router_dispatch(monkeypatch, admit, rows_tile):
+    seen = []
+
+    def runtime_ok(x, packed, tile):
+        seen.append(tile)
+        return admit
+
+    monkeypatch.setattr(gemv, "_router_batch_runtime_ok", runtime_ok)
+    monkeypatch.setattr(gemv, "_sx_rows_tile", lambda *a: rows_tile)
+    rows_calls = []
+    monkeypatch.setattr(
+        gemv, "_sx_rows_gemv", lambda x, w, plan, tile: rows_calls.append(tile) or "rows"
+    )
+    native = _NativeC("qwen38_router_batch_sm70_out")
+    x = torch.randn(5, 2560).half()
+    w = torch.randn(512, 2560).half()
+    packed = torch.empty(64, 40, 2, 4, 8, 8, dtype=torch.float16)
+    _swap_native(monkeypatch, native)
+    out = gemv._qwen38_sm70_fp16_gemv(x, w, ROUTER, packed)
+    assert seen == [rows_tile]
+    if admit:
+        ((name, args),) = native.calls
+        assert args[1] is x and args[2] is packed and args[0] is out
+        assert out.shape == (5, 512) and out.dtype == torch.float16
+    else:
+        assert not native.calls
+        assert out == "rows" if rows_tile else out.shape == (5, 512)
+    # Other roles never consult the router route.
+    seen.clear()
+    gemv._qwen38_sm70_fp16_gemv(x, torch.randn(640, 2560).half(),
+                                "model.layers.3.self_attn.indexer.index_qk_proj", packed)
+    assert not seen
+
+
+class _Dense(torch.nn.Module):
+    def __init__(self, prefix: str, shape: tuple[int, int]):
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.empty(shape, dtype=torch.float16, device="meta"), requires_grad=False
+        )
+        self.prefix = prefix
+        self.quant_method = UnquantizedLinearMethod()
+
+
+@pytest.mark.parametrize(
+    "config,switch,tagged",
+    [(4, None, True), (4, "0", False), (2, None, False), (None, None, False)],
+)
+def test_router_loader_tags_only_routers_in_the_lane(monkeypatch, config, switch, tagged):
+    monkeypatch.setattr(gemv, "LinearBase", _Dense)
+    monkeypatch.setattr(gemv.current_platform, "is_device_capability", lambda _: True)
+    monkeypatch.setenv("VLLM_SM70_QWEN38_FP16_GEMV", "1")
+    monkeypatch.setenv("VLLM_SM70_QWEN4_EXP_ONLINE_QPN8", "0")
+    monkeypatch.setenv("VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16", "0")
+    if switch is not None:
+        monkeypatch.setenv("SX_OPT_MTP_ROUTER_BATCH", switch)
+    _reset_env_cache()
+    model = torch.nn.Module()
+    model.router = _Dense(ROUTER, (512, 2560))
+    model.index = _Dense("model.layers.3.self_attn.indexer.index_qk_proj", (640, 2560))
+    model.other = _Dense("model.layers.3.mlp.gate", (513, 2560))
+    gemv.enable_qwen38_sm70_fp16_gemv(model, torch.float16, boot.lane_config(config))
+    assert isinstance(model.router.quant_method, gemv.Qwen38SM70FP16LinearMethod)
+    assert getattr(model.router, "_sm70_mtp_prepare_router_batch", False) == tagged
+    assert not hasattr(model.index, "_sm70_mtp_prepare_router_batch")
+    assert not hasattr(model.other, "_sm70_mtp_prepare_router_batch")
+    assert type(model.other.quant_method) is UnquantizedLinearMethod
+    if config is None:
+        assert gemv._sx_mtp_batch_config.cache_info().misses == 0
+
+
+@pytest.mark.parametrize("op_present", [True, False])
+def test_router_process_weights(monkeypatch, op_present):
+    layer = torch.nn.Module()
+    raw = torch.randint(-(2**15), 2**15, (512, 2560), dtype=torch.int16)
+    layer.weight = torch.nn.Parameter(_fake_cuda(raw.view(torch.float16)),
+                                      requires_grad=False)
+    layer._sm70_mtp_prepare_router_batch = True
+    native = _NativeC(*(["qwen38_router_batch_sm70_out"] if op_present else []))
+    _swap_native(monkeypatch, native)
+    gemv.Qwen38SM70FP16LinearMethod().process_weights_after_loading(layer)
+    assert hasattr(layer, "_sm70_mtp_router_packed") == op_present
+    if op_present:
+        expected = gemv._pack_router_batch_weight(raw.view(torch.float16))
+        assert torch.equal(
+            layer._sm70_mtp_router_packed.as_subclass(torch.Tensor).view(torch.int16),
+            expected.view(torch.int16),
+        )
+        assert "_sm70_mtp_router_packed" not in layer.state_dict()
+    # Untagged layers: nothing, whatever the op.
+    del layer._sm70_mtp_prepare_router_batch
+    if op_present:
+        del layer._sm70_mtp_router_packed
+    gemv.Qwen38SM70FP16LinearMethod().process_weights_after_loading(layer)
+    assert not hasattr(layer, "_sm70_mtp_router_packed")
+
+
+def test_apply_forwards_the_router_pack(monkeypatch):
+    calls = []
+
+    class _VllmOps:
+        @staticmethod
+        def qwen38_sm70_fp16_gemv(*args):
+            calls.append(args)
+            return "out"
+
+    monkeypatch.setattr(gemv, "use_sm70_decode_graph_semantics", lambda: True)
+    layer = _Dense(ROUTER, (512, 2560))
+    x = torch.empty(5, 2560, dtype=torch.float16, device="meta")
+    packed = torch.empty(64, 40, 2, 4, 8, 8, dtype=torch.float16, device="meta")
+    _swap_native(monkeypatch, _NativeC(), SimpleNamespace(
+        qwen38_sm70_fp16_gemv=_VllmOps.qwen38_sm70_fp16_gemv))
+    method = gemv.Qwen38SM70FP16LinearMethod()
+    assert method.apply(layer, x) == "out"
+    assert calls[-1][2] == ROUTER and calls[-1][3] is None
+    layer.register_buffer("_sm70_mtp_router_packed", packed, persistent=False)
+    assert method.apply(layer, x) == "out"
+    assert calls[-1][3] is packed
+
+
+def test_registered_gemv_op_accepts_the_router_pack():
+    x = torch.empty(10, 2560, dtype=torch.float16, device="meta")
+    w = torch.empty(512, 2560, dtype=torch.float16, device="meta")
+    packed = torch.empty(64, 40, 2, 4, 8, 8, dtype=torch.float16, device="meta")
+    for args in ((x, w), (x, w, ROUTER), (x, w, ROUTER, packed), (x, w, ROUTER, None)):
+        assert torch.ops.vllm.qwen38_sm70_fp16_gemv(*args).shape == (10, 512)
 
 
 if __name__ == "__main__":

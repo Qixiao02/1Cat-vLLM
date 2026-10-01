@@ -87,6 +87,18 @@ wins over the upstream alias, whose name keeps working):
     of four launches (identical arithmetic and transport).
 ``SX_OPT_MTP_HC_FULL_UNROLL=1`` (alias ``VLLM_SM70_MTP_HC_FULL_UNROLL``)
     Fully unrolled K loops of the cooperative kernel (same K order).
+``SX_OPT_MTP_ROUTER_BATCH=1`` (alias ``VLLM_SM70_MTP_ROUTER_BATCH``)
+    Packed-MMA E512 router projection (qwen38_router_batch_sm70_out): the
+    cuBLAS path's four contiguous K640 FP32 partitions, one per m8n8k4 quad
+    pair, reduced left to right by warp shuffles, FP16 output. +120 MiB/rank
+    for the 48 target routers (upstream counts 122.5 MiB with its draft).
+``SX_OPT_MTP_BATCH_OVER_ROWS=0``
+    Where an SX_OPT_ROWS multi-row kernel already serves a role at that
+    width (router and fused GDN input at M5 with the default table), it keeps
+    the width and the MTP batch route only takes the widths that would
+    otherwise fall back to cuBLAS (M10). ``1`` lets the MTP batch routes take
+    M5 from the multi-row kernels too (cuBLAS-exact instead of
+    row-equals-M1 numerics), e.g. for an A/B on the V100s.
 """
 
 from __future__ import annotations
@@ -336,6 +348,8 @@ class _SxMtpBatchConfig(NamedTuple):
     hc: bool
     hc_cooperative: bool
     hc_full_unroll: bool
+    router: bool
+    over_rows: bool
 
 
 def _sx_mtp_switch(name: str, alias: str, default: str) -> bool:
@@ -355,6 +369,11 @@ def _sx_mtp_batch_config() -> _SxMtpBatchConfig:
         hc_full_unroll=_sx_mtp_switch(
             "SX_OPT_MTP_HC_FULL_UNROLL", "VLLM_SM70_MTP_HC_FULL_UNROLL", "1"
         ),
+        router=_sx_mtp_switch(
+            "SX_OPT_MTP_ROUTER_BATCH", "VLLM_SM70_MTP_ROUTER_BATCH", "1"
+        ),
+        over_rows=os.environ.get("SX_OPT_MTP_BATCH_OVER_ROWS", "0").strip()
+        not in ("", "0"),
     )
     logger.info("SX MTP batch route configuration: %r", config)
     return config
@@ -412,6 +431,48 @@ def _sx_tp4_custom_ar():
         return getattr(get_tp_group().device_communicator, "ca_comm", None)
     except (AssertionError, AttributeError, RuntimeError, ValueError):
         return None
+
+
+def _sx_mtp_batch_takes_width(rows_tile: int) -> bool:
+    """Precedence against an admitted SX_OPT_ROWS kernel (rows_tile > 0)."""
+    return rows_tile == 0 or _sx_mtp_batch_config().over_rows
+
+
+_ROUTER_BATCH_PACKED_SHAPE = (64, 40, 2, 4, 8, 8)
+
+
+def _pack_router_batch_weight(weight: torch.Tensor) -> torch.Tensor:
+    """Keep four K640 partitions contiguous for each N8 output tile."""
+    if weight.dtype != torch.float16 or weight.shape != (512, 2560):
+        raise ValueError("Batch router packing requires FP16 [512, 2560]")
+    return (
+        weight.detach()
+        .reshape(64, 8, 4, 40, 2, 8)
+        .permute(0, 3, 4, 2, 1, 5)
+        .contiguous()
+    )
+
+
+def _router_batch_runtime_ok(
+    x: torch.Tensor, packed: torch.Tensor | None, rows_tile: int = 0
+) -> bool:
+    # The packed copy exists only where the loader admitted the MTP lane.
+    return bool(
+        packed is not None
+        and _sx_mtp_batch_config().router
+        and _sx_mtp_batch_rows_ok(x)
+        and x.shape[1] == 2560
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.is_contiguous()
+        and x.data_ptr() % 16 == 0
+        and tuple(packed.shape) == _ROUTER_BATCH_PACKED_SHAPE
+        and packed.device == x.device
+        and packed.dtype == x.dtype
+        and packed.is_contiguous()
+        and packed.data_ptr() % 16 == 0
+        and _sx_mtp_batch_takes_width(rows_tile)
+    )
 
 
 @triton.jit
@@ -1043,7 +1104,10 @@ def _sx_rows_gemv(
 
 
 def _qwen38_sm70_fp16_gemv(
-    x: torch.Tensor, weight: torch.Tensor, role: str = ""
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    role: str = "",
+    packed_router: torch.Tensor | None = None,
 ) -> torch.Tensor:
     shape = (weight.shape[0], weight.shape[1])
     plan = _plan_for(role, shape) if role else _SHAPE_PLANS.get(shape)
@@ -1053,6 +1117,20 @@ def _qwen38_sm70_fp16_gemv(
             if plan is not None
             else 0
         )
+        # SX_OPT_MTP_ROUTER_BATCH: the MTP lane's M5/M10 verify router.
+        if (
+            role.endswith(_ROUTER_SUFFIX)
+            and shape == (512, 2560)
+            and _router_batch_runtime_ok(x, packed_router, tile)
+        ):
+            assert packed_router is not None
+            out = x.new_empty((x.shape[0], 512))
+            torch.ops._C.qwen38_router_batch_sm70_out(out, x, packed_router)
+            logger.info_once(
+                "SM70 Qwen3.8 MTP batch router with ordered FP32 splits enabled "
+                "(SX_OPT_MTP_ROUTER_BATCH)."
+            )
+            return out
         if tile:
             logger.info_once(
                 "SM70 Qwen3.8 exact multi-row FP16 GEMV route enabled (SX_OPT_ROWS)."
@@ -1075,7 +1153,10 @@ def _qwen38_sm70_fp16_gemv(
 
 
 def _qwen38_sm70_fp16_gemv_fake(
-    x: torch.Tensor, weight: torch.Tensor, role: str = ""
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    role: str = "",
+    packed_router: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return x.new_empty((*x.shape[:-1], weight.shape[0]))
 
@@ -1205,6 +1286,25 @@ direct_register_custom_op(
 )
 
 
+def _sx_prepare_packed(
+    layer: nn.Module, name: str, op_name: str, pack, switch: str
+) -> None:
+    """Register an SX MTP batch route's packed copy of the loaded weight."""
+    weight = layer.weight
+    if not weight.is_cuda or weight.dtype != torch.float16:
+        return  # A PLE-only/meta loader never executes these GPU routes.
+    if not hasattr(torch.ops._C, op_name):
+        # An extension built before the route: allocate nothing, the route
+        # can never run and the original projection keeps the width.
+        logger.warning_once(
+            "%s: the loaded _C has no %s; keeping the original projection.",
+            switch,
+            op_name,
+        )
+        return
+    layer.register_buffer(name, pack(weight), persistent=False)
+
+
 class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
     """Use the row-GEMV custom op for admitted single-token projections.
 
@@ -1218,6 +1318,14 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
             from .sm70_fp16_hc import _prepare_hc_batch_weight
 
             _prepare_hc_batch_weight(layer)
+        if getattr(layer, "_sm70_mtp_prepare_router_batch", False):
+            _sx_prepare_packed(
+                layer,
+                "_sm70_mtp_router_packed",
+                "qwen38_router_batch_sm70_out",
+                _pack_router_batch_weight,
+                "SX_OPT_MTP_ROUTER_BATCH",
+            )
 
     def apply(
         self,
@@ -1230,7 +1338,10 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
         # prefill branch.
         if bias is None and use_sm70_decode_graph_semantics():
             return torch.ops.vllm.qwen38_sm70_fp16_gemv(
-                x, layer.weight, getattr(layer, "prefix", "")
+                x,
+                layer.weight,
+                getattr(layer, "prefix", ""),
+                getattr(layer, "_sm70_mtp_router_packed", None),
             )
         return super().apply(layer, x, bias)
 
@@ -1314,7 +1425,12 @@ def enable_qwen38_sm70_fp16_gemv(
         )
         return
 
+    # SX MTP batch routes: tag the projections whose packed copies the FP16
+    # method makes once the checkpoint is loaded (admitted lane only).
+    mtp_batch = _sx_mtp_batch_contract(vllm_config)
+    router_batch = bool(mtp_batch and _sx_mtp_batch_config().router)
     replaced = 0
+    router_tagged = 0
     for child in module.modules():
         if not (
             isinstance(child, LinearBase)
@@ -1325,9 +1441,13 @@ def enable_qwen38_sm70_fp16_gemv(
         if weight is None or weight.ndim != 2:
             continue
         shape = (int(weight.shape[0]), int(weight.shape[1]))
-        if _plan_for(str(getattr(child, "prefix", "")), shape) is None:
+        prefix = str(getattr(child, "prefix", ""))
+        if _plan_for(prefix, shape) is None:
             continue
         child.quant_method = Qwen38SM70FP16LinearMethod()
+        if router_batch and prefix.endswith(_ROUTER_SUFFIX):
+            child._sm70_mtp_prepare_router_batch = True
+            router_tagged += 1
         replaced += 1
 
     fused_gdn_inputs = 0
@@ -1375,6 +1495,12 @@ def enable_qwen38_sm70_fp16_gemv(
     elif envs.VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16:
         logger.warning_once(
             "Qwen3.8 fused checkpoint-FP16 GDN input opt-in found no targets."
+        )
+    if router_tagged:
+        logger.info_once(
+            "SX_OPT_MTP_ROUTER_BATCH: %d routers will carry packed copies "
+            "(2.5 MiB each) for the M5/M10 MTP verify.",
+            router_tagged,
         )
 
 
