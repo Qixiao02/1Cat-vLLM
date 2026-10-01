@@ -43,8 +43,13 @@ def read(path: str) -> str:
 def _top_level_segments(path: str, names: tuple[str, ...]) -> dict[str, str]:
     source = read(path)
     found: dict[str, str] = {}
+    lines = source.splitlines(keepends=True)
     for node in ast.parse(source).body:
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names:
+        if isinstance(node, ast.ClassDef) and node.name in names:
+            # Keep class decorators (``@dataclass``); functions drop theirs.
+            first = min([node.lineno, *(d.lineno for d in node.decorator_list)])
+            found[node.name] = "".join(lines[first - 1 : node.end_lineno])
+        elif isinstance(node, ast.FunctionDef) and node.name in names:
             found[node.name] = ast.get_source_segment(source, node)
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
