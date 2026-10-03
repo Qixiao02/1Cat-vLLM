@@ -1,0 +1,85 @@
+# Swift 1.5 Qwen3.8-Flash-Next (UkisAI post-trained derivative) NVFP4, TP4/PP1 on GPU0-3.
+# Same engine settings as compose.flashnext-tp4-gpu0123.yaml; only the model changes.
+# The model dir is a graft: Swift 1.5 weights + RadixArk's FP8 PLE table via symlinks
+# (Swift ships the PLE table in BF16, which the SM70 hybrid PLE lane rejects; its PLE shards are
+# byte-identical to the Qwen base, which RadixArk's FP8 table was built from). See
+# /mnt/2t/models/Swift-1.5-Qwen3.8-Flash-Next-NVFP4/GRAFT_NOTES.md and graft_swift15.py.
+# Shares the cache dir with the RadixArk Flash-Next container (never run both at once) so the
+# TileLang/Triton JIT caches are reused.
+name: shixiang-swift15-flashnext-tp4
+services:
+  swift15-flashnext-tp4:
+    image: shixiang/1cat-vllm-v100:1.7.2-sm70main
+    container_name: shixiang-inference-swift15-flashnext-tp4
+    restart: "no"   # bring-up only; the 09-22 attempt crash-looped 372 times under unless-stopped. Switch after it is healthy.
+    init: true
+    ipc: host       # host IPC namespace, so /dev/shm is the host's (no shm_size needed, same as swift-tp4)
+    user: "997:983"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    tmpfs: ["/tmp:exec,mode=1777", "/run:mode=0755"]
+    ulimits: {memlock: {soft: -1, hard: -1}, stack: 67108864}   # memlock -1: 47.7 GiB of PLE is pinned host memory
+    ports: ["0.0.0.0:8031:8001"]
+    volumes:
+      - {type: bind, source: /mnt/2t/models, target: /models, read_only: true}
+      - {type: bind, source: /opt/shixiang-inference/cache-flashnext-tp4, target: /cache}
+      - {type: bind, source: /usr/local/cuda-12.8, target: /usr/local/cuda, read_only: true}
+      - {type: bind, source: /opt/shixiang-aihub/deploy/inference/entrypoint.sh, target: /app/entrypoint.sh, read_only: true}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      MODEL_PATH: /models/Swift-1.5-Qwen3.8-Flash-Next-NVFP4
+      SERVED_MODEL_NAME: Swift-1.5-Qwen3.8-Flash-Next
+      # Entrypoint default is awq (wrong). "none" -> no --quantization flag -> vLLM auto-detects
+      # modelopt_fp4 (09-22 log: "Detected ModelOpt NVFP4 checkpoint", quantization=modelopt_fp4).
+      # The no-MTP fast lane requires the resolved method to be exactly modelopt_fp4.
+      QUANTIZATION: "none"
+      VLLM_HOST: 0.0.0.0
+      VLLM_PORT: "8001"
+      TENSOR_PARALLEL_SIZE: "4"   # only validated topology; TP8 is rejected by the NVFP4 SM70 MoE contract
+      MAX_MODEL_LEN: "131072"
+      MAX_NUM_SEQS: "24"          # raised from 16 to test true C24 (1Cat validates batch QPN routes to 16; MoE graph-safe route covers <=18 tokens/step, above that the eager-buffer route is used; full graphs validated to B32)
+      MAX_NUM_BATCHED_TOKENS: "8192"
+      GPU_MEMORY_UTILIZATION: "0.90"
+      KV_CACHE_DTYPE: auto        # FP16 KV (entrypoint hardcodes --dtype half)
+      ATTENTION_BACKEND: FLASH_ATTN_V100
+      MTP_METHOD: mtp
+      MTP_SPECULATIVE_TOKENS: "0" # entrypoint: 0 -> no --speculative-config (logs "MTP disabled"); its default 1 would enable MTP
+      DFLASH_MODEL: ""            # DFlash is not supported for Qwen4Exp; must stay empty
+      VLLM_QWEN4EXP_PLE_HOST_GIB: "12"      # whole 11.92 GiB/rank PLE shard on pinned host; auto split can leave rows on GPU
+      VLLM_ENGINE_READY_TIMEOUT_S: "1200"   # default 600; 126 GB load + PLE pinning + compile
+      OMP_NUM_THREADS: "8"
+      # No PYTORCH_ALLOC_CONF=expandable_segments here: hybrid PLE shares CUDA tensors with its CPU
+      # worker, and expandable-segment IPC needs pidfd_getfd (CAP_SYS_PTRACE), which cap_drop ALL denies
+      # ("RuntimeError: pidfd_getfd: Operation not permitted" on the 2026-09-25 first start).
+      HOME: /cache/home
+      XDG_CACHE_HOME: /cache
+      HF_HOME: /cache/huggingface
+      HUGGINGFACE_HUB_CACHE: /cache/huggingface/hub
+      TORCH_HOME: /cache/torch
+      TRITON_CACHE_DIR: /cache/triton
+      TILELANG_CACHE_DIR: /cache/tilelang
+      CUDA_HOME: /usr/local/cuda
+      USER: sx-inference
+      LOGNAME: sx-inference
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0","1","2","3"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "/app/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 40
+      start_period: 30m
+    stop_grace_period: 2m
+    entrypoint: ["/app/entrypoint.sh"]
+    command:
+      - --language-model-only   # required by the SM70 fast lane; skips building the vision tower
+      # The entrypoint always adds --enable-prefix-caching (Mamba 'align' mode, as in the measured
+      # C1-C16 concurrency lane). To match the prefix-cache-off reference baseline, uncomment:
+      # - --no-enable-prefix-caching
