@@ -826,7 +826,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.ple_host_storage = host_storage
         self._device_rows = placement.vram_rows
         self._host_rows = placement.host_rows
-        if self._sx_gather_by_name:
+        if getattr(self, "_sx_gather_by_name", False):
             # The row split is a literal in the traced gather (the host/device
             # boundary) and, with an automatic host budget, depends on the free
             # memory of this run: it belongs in the compile cache key.
@@ -930,7 +930,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             device=input_.device,
         )
         out_flat = output.reshape(-1, self.embedding_dim)
-        if self._sx_gather_by_name:
+        if getattr(self, "_sx_gather_by_name", False):
             return self._embedding_lookup_by_name(
                 flat_ids, output, out_flat, self._host_rows, self._device_rows
             )
