@@ -98,3 +98,23 @@ def test_switch_on_with_v2_leaves_the_estimator_on(monkeypatch):
     value, text = run(monkeypatch, v2=True, switch="1", explicit=None)
     assert value is None
     assert "SX_OPT_KV_STEADY_BUDGET=1: keeping the graph memory estimate on" in text
+
+
+class _SelfWithProperty:
+    """``use_v2_model_runner`` is a property that can raise for an invalid config."""
+
+    @property
+    def use_v2_model_runner(self):
+        raise AssertionError("read the V2 property with the switch off")
+
+
+@pytest.mark.parametrize("switch", [None, "0"])
+def test_switch_off_does_not_evaluate_the_v2_property(monkeypatch, switch):
+    for name in (NAME, "SX_OPT_KV_STEADY_BUDGET"):
+        monkeypatch.delenv(name, raising=False)
+    if switch is not None:
+        monkeypatch.setenv("SX_OPT_KV_STEADY_BUDGET", switch)
+    namespace = {"os": os, "logger": boot.RecordingLogger(), "self": _SelfWithProperty()}
+    exec(HELPER, namespace)  # noqa: S102
+    exec(STATEMENT, namespace)  # noqa: S102
+    assert os.environ[NAME] == "0"

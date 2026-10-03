@@ -2776,7 +2776,7 @@ class VllmConfig:
                     )
                 if "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" in os.environ:
                     pass
-                elif self.use_v2_model_runner and _sx_kv_steady_budget_enabled():
+                elif _sx_kv_steady_budget_enabled() and self.use_v2_model_runner:
                     # SX_OPT_KV_STEADY_BUDGET (vllm/v1/worker/kv_steady_budget.py):
                     # V2 reserves its graph pool before the KV cache is sized
                     # (upstream 4bbaf64fc), so the legacy estimator stays on.
