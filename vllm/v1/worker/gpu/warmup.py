@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from vllm import PoolingParams, SamplingParams
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -23,7 +24,20 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.request import Request
+from vllm.v1.worker import kv_steady_budget
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+
+logger = init_logger(__name__)
+
+
+def _steady_warmup_tokens(model_runner: GPUModelRunner) -> int:
+    """Prompt length of the SX_OPT_KV_STEADY_BUDGET full-chunk warm-up, or 0."""
+    if not kv_steady_budget.steady_budget_enabled():
+        return 0
+    return kv_steady_budget.steady_warmup_tokens(
+        model_runner.scheduler_config.max_num_batched_tokens,
+        model_runner.max_model_len,
+    )
 
 
 def _kernel_prefill_warmup_token_counts(
@@ -45,6 +59,12 @@ def _kernel_prefill_warmup_token_counts(
                 and default_prompt_len < token_count <= max_tokens
             ):
                 token_counts.add(token_count)
+    # SX_OPT_KV_STEADY_BUDGET: one full prefill chunk, so the workspaces that a
+    # long real request would allocate (indexer score buffers, grouped page4
+    # workspace, GDN chunk temporaries) exist before serving and are measured.
+    steady_tokens = _steady_warmup_tokens(model_runner)
+    if default_prompt_len < steady_tokens <= max_tokens:
+        token_counts.add(steady_tokens)
     return tuple(sorted(token_counts))
 
 
@@ -111,6 +131,7 @@ def warmup_kernels(
     prompt_lengths = _kernel_prefill_warmup_token_counts(
         model_runner, default_prompt_len
     )
+    steady_tokens = _steady_warmup_tokens(model_runner)
 
     kv_cache_groups = model_runner.kv_cache_config.kv_cache_groups
     num_kv_cache_groups = len(kv_cache_groups)
@@ -157,6 +178,21 @@ def warmup_kernels(
             if profile_idx:
                 num_reqs = min(num_reqs, 1)
             if num_reqs <= 0:
+                continue
+            if (
+                profile_idx
+                and prompt_len == steady_tokens
+                and not kv_steady_budget.steady_warmup_fits(
+                    model_runner.kv_cache_config.num_blocks, max_blocks_per_req
+                )
+            ):
+                logger.warning(
+                    "Skipping the %d-token SX_OPT_KV_STEADY_BUDGET warm-up: one "
+                    "such request needs %d KV blocks and the cache has %d.",
+                    prompt_len,
+                    max_blocks_per_req,
+                    model_runner.kv_cache_config.num_blocks - 1,
+                )
                 continue
 
             req_ids = [f"_warmup_{profile_idx}_{i}_" for i in range(num_reqs)]
