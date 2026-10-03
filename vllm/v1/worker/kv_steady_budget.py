@@ -102,6 +102,7 @@ ENV_LOAD_MIB = "SX_OPT_KV_STEADY_LOAD_MIB"
 ENV_STRICT = "SX_OPT_KV_STEADY_STRICT"
 ENV_WARMUP_TOKENS = "SX_OPT_KV_STEADY_WARMUP_TOKENS"
 ENV_EMPTY_CACHE = "SX_OPT_KV_STEADY_EMPTY_CACHE"
+ENV_EXTRA_MIB = "SX_OPT_KV_STEADY_EXTRA_MIB"  # only for lanes without a reference
 
 # Free device memory (CUDA's view: total minus used) the steady state must
 # still have at its peak. The task this was built for asked for ~500 MiB and a
@@ -257,9 +258,7 @@ def estimate_post_sizing(
         return explicit * MiB, f"{ENV_RESERVE_MIB}={explicit} MiB"
     ref = LANE_REFERENCES.get(inputs.lane)
     if ref is None:
-        extra = read_mib(
-            "SX_OPT_KV_STEADY_EXTRA_MIB", DEFAULT_UNREFERENCED_EXTRA_MIB, environ
-        )
+        extra = read_mib(ENV_EXTRA_MIB, DEFAULT_UNREFERENCED_EXTRA_MIB, environ)
         assert extra is not None
         return (
             inputs.graph_reserve + extra * MiB,

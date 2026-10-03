@@ -206,6 +206,48 @@ def test_switch_one_only_skips_the_baseline(rig):
     assert not (out / "mtp-s1-u093" / "stress.json").exists()
 
 
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_patch_repo_overlays_the_files_that_differ(rig):
+    repo = rig["tmp"] / "repo"
+    (repo / "vllm" / "v1").mkdir(parents=True)
+    (repo / "vllm" / "v1" / "same.py").write_text("same\n")
+    (repo / "vllm" / "v1" / "changed.py").write_text("old\n")
+
+    def git(*args):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+
+    git("init", "-q")
+    git("config", "core.autocrlf", "false")
+    git("add", "-A")
+    git("commit", "-q", "-m", "base")
+    git("tag", "base")
+    (repo / "vllm" / "v1" / "changed.py").write_text("new\n")
+    (repo / "vllm" / "v1" / "added.py").write_text("added\n")
+    git("add", "-A")
+    git("commit", "-q", "-m", "change")
+
+    proc, out = run_script(
+        rig, "--switch", "1", "--no-stress",
+        "--patch-repo", str(repo).replace("\\", "/"), "--patch-base", "base",
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "overlaying 2 changed file(s)" in proc.stdout
+    patch = out / "patch" / "vllm" / "v1"
+    assert sorted(p.name for p in patch.iterdir()) == ["added.py", "changed.py"]
+    assert (patch / "changed.py").read_text() == "new\n"
+    compose = (out / "mtp-s1-u093" / "compose.yaml").read_text()
+    assert "site-packages/vllm/v1/changed.py" in compose
+    assert "site-packages/vllm/v1/added.py" in compose
+    assert "same.py" not in compose
+
+
+def test_patch_repo_and_patch_dir_are_exclusive(rig):
+    proc, _ = run_script(rig, "--patch-repo", "/x", "--patch-dir", "/y")
+    assert proc.returncode == 2
+
+
 def test_a_peak_above_the_limit_fails_the_run(rig):
     Engine.peak = 32500
     proc, out = run_script(rig, "--switch", "1")

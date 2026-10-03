@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 SERVED_NAME = "Swift-1.5-Qwen3.8-Flash-Next"
@@ -52,6 +53,10 @@ COMMON_ENV = {
     "VLLM_PLE_DISK_OFFLOAD": "0",
     "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE": "1",
 }
+
+# Where the image's vLLM lives (the layout of the fork's V100 images; see
+# sx_bench/as_run/mtp_compose.py, which overlays files the same way).
+DEFAULT_SITE_PACKAGES = "/opt/venv/lib/python3.12/site-packages"
 
 LANES = {
     "MTP": {
@@ -137,6 +142,28 @@ def _q(text: str) -> str:
     return json.dumps(text)
 
 
+def overlay_files(patch_dir: str) -> dict[str, str]:
+    """``{path relative to patch_dir: absolute host path}`` of every file under
+    ``patch_dir/vllm`` (sorted), for a read-only overlay of the image's package.
+    A change that only touches Python needs no image build: copy the changed
+    files into ``patch_dir/vllm/...`` and the engine runs them."""
+    root = os.path.join(patch_dir, "vllm")
+    if not os.path.isdir(root):
+        raise ValueError(f"{patch_dir} has no vllm/ directory to overlay")
+    files: dict[str, str] = {}
+    for base, _, names in os.walk(root):
+        for name in names:
+            if name.endswith((".pyc", ".pyo")) or "__pycache__" in base:
+                continue
+            path = os.path.join(base, name)
+            files[os.path.relpath(path, patch_dir).replace(os.sep, "/")] = os.path.abspath(
+                path
+            )
+    if not files:
+        raise ValueError(f"no files under {root}")
+    return dict(sorted(files.items()))
+
+
 def render(
     *,
     image: str,
@@ -154,6 +181,8 @@ def render(
     extra_env: dict[str, str] | None = None,
     extra_flags: list[str] | None = None,
     shm: str = "16gb",
+    overlay: dict[str, str] | None = None,
+    site_packages: str = DEFAULT_SITE_PACKAGES,
 ) -> str:
     if switch not in ("0", "1"):
         raise ValueError(f"switch must be 0 or 1, got {switch!r}")
@@ -188,8 +217,13 @@ def render(
         "    volumes:",
         f"      - {{type: bind, source: {_q(models_dir)}, target: /models, read_only: true}}",
         f"      - {{type: bind, source: {_q(cache_dir)}, target: /cache}}",
-        "    environment:",
     ]
+    for rel, host in (overlay or {}).items():
+        lines.append(
+            f"      - {{type: bind, source: {_q(host)}, "
+            f"target: {_q(site_packages + '/' + rel)}, read_only: true}}"
+        )
+    lines.append("    environment:")
     for key, value in env.items():
         lines.append(f"      {key}: {_q(value)}")
     lines += [
@@ -240,6 +274,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
     parser.add_argument("--env", action="append", default=[], metavar="K=V")
     parser.add_argument("--serve-arg", action="append", default=[], metavar="FLAG")
+    parser.add_argument(
+        "--patch-dir",
+        help="overlay every file of PATCH_DIR/vllm/ read-only over the image's package",
+    )
+    parser.add_argument("--site-packages", default=DEFAULT_SITE_PACKAGES)
     parser.add_argument("--out", required=True)
     args = parser.parse_args(argv)
 
@@ -264,6 +303,8 @@ def main(argv: list[str] | None = None) -> int:
         max_num_batched_tokens=args.max_num_batched_tokens,
         extra_env=extra_env,
         extra_flags=args.serve_arg,
+        overlay=overlay_files(args.patch_dir) if args.patch_dir else None,
+        site_packages=args.site_packages,
     )
     with open(args.out, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(text)

@@ -152,6 +152,34 @@ def test_cli_writes_the_file(tmp_path):
     assert rc == 0 and 'A: "b"' in text and '"--x=1"' in text
 
 
+def test_overlay_mounts_every_file_under_vllm(tmp_path):
+    (tmp_path / "vllm" / "v1" / "worker").mkdir(parents=True)
+    (tmp_path / "vllm" / "v1" / "worker" / "kv_steady_budget.py").write_text("x")
+    (tmp_path / "vllm" / "config.py").write_text("y")
+    (tmp_path / "vllm" / "__pycache__").mkdir()
+    (tmp_path / "vllm" / "__pycache__" / "config.cpython-312.pyc").write_text("z")
+    (tmp_path / "other.py").write_text("not under vllm")
+    files = compose_gen.overlay_files(str(tmp_path))
+    assert list(files) == ["vllm/config.py", "vllm/v1/worker/kv_steady_budget.py"]
+    text = render(overlay=files, site_packages="/sp")
+    for rel, host in files.items():
+        assert f'target: "/sp/{rel}", read_only: true' in text
+        assert json.dumps(host) in text
+    assert "pyc" not in text and "other.py" not in text
+
+
+def test_overlay_without_a_vllm_directory_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="no vllm/"):
+        compose_gen.overlay_files(str(tmp_path))
+
+
+def test_overlay_default_target_is_the_fork_image_layout(tmp_path):
+    (tmp_path / "vllm").mkdir()
+    (tmp_path / "vllm" / "a.py").write_text("x")
+    text = render(overlay=compose_gen.overlay_files(str(tmp_path)))
+    assert "/opt/venv/lib/python3.12/site-packages/vllm/a.py" in text
+
+
 # ------------------------------------------------------------------ analyze
 
 

@@ -42,6 +42,15 @@
 #   --sample-interval S   seconds between nvidia-smi samples (default 2)
 #   --max-num-seqs N / --max-model-len N   override the lane shape
 #   --env K=V             extra container environment (repeatable)
+#   --patch-repo REPO [--patch-base REF]
+#                         the change is Python only: run the image with the
+#                         vllm/ files that differ between REF (default
+#                         sx/mtp-integrate) and REPO's HEAD overlaid read-only,
+#                         instead of building an image that contains them
+#   --patch-dir DIR       same with an explicit directory: every file under
+#                         DIR/vllm/ is overlaid on the image's package
+#   --site-packages DIR   where the image keeps vllm
+#                         (default /opt/venv/lib/python3.12/site-packages)
 #   --no-stress           only start and idle (no requests)
 #   --force               do not refuse to start on GPUs that are in use
 #   -h, --help
@@ -75,6 +84,10 @@ MAXLEN=""
 STRESS=1
 FORCE=0
 EXTRA_ENV=()
+PATCH_DIR=""
+PATCH_REPO=""
+PATCH_BASE="sx/mtp-integrate"
+SITE_PACKAGES=""
 SERVED_MODEL="Swift-1.5-Qwen3.8-Flash-Next"
 SAMPLE_INTERVAL=2
 
@@ -99,6 +112,10 @@ while [ $# -gt 0 ]; do
     --max-num-seqs) SEQS=${2:?}; shift 2 ;;
     --max-model-len) MAXLEN=${2:?}; shift 2 ;;
     --env) EXTRA_ENV+=("${2:?}"); shift 2 ;;
+    --patch-dir) PATCH_DIR=${2:?}; shift 2 ;;
+    --patch-repo) PATCH_REPO=${2:?}; shift 2 ;;
+    --patch-base) PATCH_BASE=${2:?}; shift 2 ;;
+    --site-packages) SITE_PACKAGES=${2:?}; shift 2 ;;
     --no-stress) STRESS=0; shift ;;
     --force) FORCE=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -121,6 +138,21 @@ done
 mkdir -p "$OUT" "$CACHE_DIR" || die "cannot create $OUT or $CACHE_DIR"
 OUT=$(cd "$OUT" && pwd)
 
+if [ -n "$PATCH_REPO" ]; then
+  [ -z "$PATCH_DIR" ] || die "--patch-repo and --patch-dir are exclusive"
+  command -v git >/dev/null 2>&1 || die "--patch-repo needs git"
+  PATCH_DIR="$OUT/patch"
+  rm -rf "$PATCH_DIR"; mkdir -p "$PATCH_DIR"
+  changed=$(git -C "$PATCH_REPO" diff --name-only --diff-filter=AM "$PATCH_BASE"...HEAD -- vllm) \
+    || die "git diff $PATCH_BASE...HEAD failed in $PATCH_REPO"
+  [ -n "$changed" ] || die "no vllm/ files differ between $PATCH_BASE and HEAD in $PATCH_REPO"
+  while IFS= read -r f; do
+    mkdir -p "$PATCH_DIR/$(dirname "$f")"
+    git -C "$PATCH_REPO" show "HEAD:$f" > "$PATCH_DIR/$f"
+  done <<< "$changed"
+  echo "overlaying $(echo "$changed" | wc -l) changed file(s) from $PATCH_REPO ($PATCH_BASE...HEAD) over the image"
+fi
+[ -z "$PATCH_DIR" ] || [ -d "$PATCH_DIR/vllm" ] || die "$PATCH_DIR has no vllm/ directory"
 LANE_TAG=$(echo "$LANE_NORM" | tr 'A-Z' 'a-z' | tr -d '-')
 SAMPLER_PID=""
 CURRENT_COMPOSE=""
@@ -184,6 +216,8 @@ run_trial() {  # run_trial <switch> <util>
     --port "$PORT" --out "$compose")
   [ -n "$SEQS" ] && gen+=(--max-num-seqs "$SEQS")
   [ -n "$MAXLEN" ] && gen+=(--max-model-len "$MAXLEN")
+  [ -n "$PATCH_DIR" ] && gen+=(--patch-dir "$PATCH_DIR")
+  [ -n "$SITE_PACKAGES" ] && gen+=(--site-packages "$SITE_PACKAGES")
   local kv
   for kv in "${EXTRA_ENV[@]:-}"; do [ -n "$kv" ] && gen+=(--env "$kv"); done
   "${gen[@]}" || { echo "compose generation failed" >&2; return 2; }
