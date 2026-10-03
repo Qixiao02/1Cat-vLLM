@@ -253,7 +253,12 @@ def _sx_env_on(name: str) -> bool:
 
 
 def _sx_kv_steady_budget_enabled() -> bool:
-    """SX_OPT_KV_STEADY_BUDGET=1 (default off): steady-state KV budgeting."""
+    """SX_OPT_KV_STEADY_BUDGET=1: steady-state KV budgeting.
+
+    Unset means off here; ``VllmConfig`` sets it to "1" for the two admitted
+    SM70 Qwen3.8 TP4 lanes (no-MTP and native MTP) on the V2 model runner, and
+    ``SX_OPT_KV_STEADY_BUDGET=0`` turns that off.
+    """
     return os.environ.get("SX_OPT_KV_STEADY_BUDGET", "0").strip() == "1"
 
 
@@ -2786,6 +2791,26 @@ class VllmConfig:
                     logger.info_once(
                         "Auto-setting VLLM_MQ_BROADCASTER_MAX_CHUNKS=64 for "
                         "SM70 Flash-V100 0.0.3 compile graph startup."
+                    )
+                if (
+                    "SX_OPT_KV_STEADY_BUDGET" not in os.environ
+                    and _is_sm70_qwen38_lane_contract(
+                        self.model_config,
+                        self.speculative_config,
+                        self.parallel_config,
+                    )
+                    and self.use_v2_model_runner
+                ):
+                    # Default on for the two admitted lanes (they have a
+                    # measured lane reference); every other model keeps the
+                    # old sizing. SX_OPT_KV_STEADY_BUDGET=0 opts out.
+                    os.environ["SX_OPT_KV_STEADY_BUDGET"] = "1"
+                    logger.info_once(
+                        "Auto-enabling the KV steady-state budget "
+                        "(SX_OPT_KV_STEADY_BUDGET=1) for the SM70 Qwen3.8 TP4 "
+                        "lane: the KV cache is also bounded by the memory the "
+                        "steady state still needs. Set "
+                        "SX_OPT_KV_STEADY_BUDGET=0 to size it the old way."
                     )
                 if "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" in os.environ:
                     pass

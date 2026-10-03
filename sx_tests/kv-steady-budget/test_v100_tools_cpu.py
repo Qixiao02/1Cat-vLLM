@@ -127,6 +127,43 @@ def test_rendered_file_is_valid_yaml_with_the_same_flags():
     assert service["ulimits"]["memlock"] == -1
 
 
+def test_auto_switch_leaves_the_variable_unset():
+    assert "SX_OPT_KV_STEADY_BUDGET" not in compose_gen.build_env("MTP", "auto")
+    assert "SX_OPT_KV_STEADY_BUDGET" not in compose_gen.build_env("no-MTP", "auto")
+    text = render(switch="auto")
+    assert "SX_OPT_KV_STEADY_BUDGET:" not in text and "(unset" in text
+    assert compose_gen.build_env("MTP", "auto", {"SX_OPT_KV_STEADY_BUDGET": "0"})[
+        "SX_OPT_KV_STEADY_BUDGET"
+    ] == "0"
+
+
+def _verdict_for(switch, *, auto_enabled, planned):
+    result = {
+        "ready": True,
+        "switch": switch,
+        "memory": {"peak_mib": 31400, "idle_mib": 31000},
+        "log": {
+            "plan": {"total": str(32510 * 1024 * 1024)} if planned else {},
+            "end_of_warmup_free_mib": [],
+            "error_lines": [],
+            "audit_short_mib": [],
+            "auto_enabled": auto_enabled,
+        },
+    }
+    return analyze.verdict(result, peak_limit_mib=32200, headroom_mib=500)
+
+
+def test_auto_switch_needs_the_auto_enable_line_and_a_plan():
+    ok, reasons = _verdict_for("auto", auto_enabled=True, planned=True)
+    assert ok, reasons
+    ok, reasons = _verdict_for("auto", auto_enabled=False, planned=True)
+    assert not ok and any("auto-enable" in r for r in reasons)
+    ok, reasons = _verdict_for("auto", auto_enabled=True, planned=False)
+    assert not ok and any("never planned" in r for r in reasons)
+    ok, reasons = _verdict_for("1", auto_enabled=False, planned=True)
+    assert ok, reasons
+
+
 @pytest.mark.parametrize("over", [{"switch": "2"}, {"gpus": "4,5"}])
 def test_bad_arguments_raise(over):
     with pytest.raises(ValueError):

@@ -8,7 +8,8 @@ Run (CPU is enough, no vLLM install and no GPU needed; see ``kv_budget_boot.py``
 Every number is bytes of one GPU rank, built from the V100-SXM2-32GB figures of
 the 2026-10-01 runs (sx_bench/results/2026-10-01-fork-vs-official-best/): the
 native-MTP lane at --gpu-memory-utilization 0.87 had a KV cache of ~2.0 GiB per
-rank and a highest nvidia-smi memory.used of 31811 MiB. The activation peak,
+rank and a highest nvidia-smi memory.used of 31811 MiB (the lane reference is
+now the 1003 value, 31467 MiB; the relations below do not depend on it). The activation peak,
 the CUDA context and the card's usable total are assumptions (named below) and
 only change the absolute values, not the relations that are asserted:
 
@@ -259,11 +260,13 @@ def test_estimate_table_for_the_four_utilisations():
         plan = kb.plan_kv_budget(inputs(util))
         rows[util] = (plan.kv_bytes / MiB, plan.limiting)
     # 0.87/0.90 are bound by the utilisation (graph reserve now charged);
-    # 0.93 and up by the physical bound, which is 123 MiB above today's 2048
-    # (card total 32510 MiB, reference peak 31811 MiB, headroom 576 MiB).
+    # 0.93 and up by the physical bound, which is 467 MiB above today's 2048
+    # (card total 32510 MiB, reference peak 31467 MiB, headroom 576 MiB).
     assert rows[0.87][1] == rows[0.90][1] == "utilisation"
     assert rows[0.93][1] == rows[0.95][1] == "physical"
-    assert rows[0.93][0] == rows[0.95][0] == pytest.approx(2048 + 123, abs=1)
+    gain = 32510 - kb.LANE_REFERENCES["mtp"].peak_mib - kb.DEFAULT_HEADROOM_MIB
+    assert gain == 467
+    assert rows[0.93][0] == rows[0.95][0] == pytest.approx(2048 + gain, abs=1)
     assert rows[0.93][0] > KV_TODAY / MiB
 
 

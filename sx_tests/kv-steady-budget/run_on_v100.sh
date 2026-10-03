@@ -30,9 +30,14 @@
 #                         no-MTP: production shape, max-num-seqs 24, max-model-len 131072
 #   --utils "0.87 0.90 0.93 0.95"
 #                         utilisations to run (default per lane)
-#   --switch 1|0|both     SX_OPT_KV_STEADY_BUDGET for the trials. "both" (default)
+#   --switch 1|0|auto|both
+#                         SX_OPT_KV_STEADY_BUDGET for the trials. "both" (default)
 #                         runs every util with 1 and, first, the first util with 0
-#                         as the "today" baseline
+#                         as the "today" baseline. "auto" runs every util with the
+#                         variable UNSET (the engine's default, which must switch
+#                         the budget on for the Qwen3.8 lanes) after the same
+#                         switch-0 baseline; the run fails when the engine does
+#                         not log the auto-enable line
 #   --gpus 4,5,6,7        GPUs to use (must be idle)
 #   --port 8141           host port bound on 127.0.0.1
 #   --out DIR             results directory (default ./kv-steady-<time>)
@@ -125,7 +130,7 @@ done
 
 [ -n "$IMAGE" ] || die "--image is required"
 [ -n "$MODELS_DIR" ] || die "--models-dir is required"
-case "$SWITCH" in 0|1|both) ;; *) die "--switch must be 1, 0 or both" ;; esac
+case "$SWITCH" in 0|1|auto|both) ;; *) die "--switch must be 1, 0, auto or both" ;; esac
 LANE_INFO=$(python3 "$HERE/compose_gen.py" --lane-info "$LANE" 2>/dev/null) \
   || die "--lane must be MTP or no-MTP"
 LANE_NORM=${LANE_INFO%%|*}
@@ -210,7 +215,7 @@ run_trial() {  # run_trial <switch> <util>
   : > "$dir/samples.csv"; : > "$dir/events.log"
 
   echo
-  echo "=== $tag: lane $LANE_NORM, util $util, SX_OPT_KV_STEADY_BUDGET=$sw  $(date +%T)"
+  echo "=== $tag: lane $LANE_NORM, util $util, SX_OPT_KV_STEADY_BUDGET=$sw (auto = unset)  $(date +%T)"
   local used
   used=$(gpu_used_max)
   if [ "$FORCE" != 1 ] && [ "${used:-0}" -gt 1500 ]; then
@@ -270,7 +275,7 @@ run_trial() {  # run_trial <switch> <util>
 
 first_util=${UTIL_LIST[0]}
 any_fail=0
-if [ "$SWITCH" = both ] || [ "$SWITCH" = 0 ]; then
+if [ "$SWITCH" = both ] || [ "$SWITCH" = auto ] || [ "$SWITCH" = 0 ]; then
   if [ "$SWITCH" = 0 ]; then
     for u in "${UTIL_LIST[@]}"; do run_trial 0 "$u" || any_fail=1; done
   else
@@ -279,6 +284,9 @@ if [ "$SWITCH" = both ] || [ "$SWITCH" = 0 ]; then
 fi
 if [ "$SWITCH" = both ] || [ "$SWITCH" = 1 ]; then
   for u in "${UTIL_LIST[@]}"; do run_trial 1 "$u" || any_fail=1; done
+fi
+if [ "$SWITCH" = auto ]; then
+  for u in "${UTIL_LIST[@]}"; do run_trial auto "$u" || any_fail=1; done
 fi
 
 echo

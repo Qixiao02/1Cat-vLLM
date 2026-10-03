@@ -9,8 +9,9 @@ Why this exists. ``Worker.determine_available_memory`` sizes the KV cache from
 two ``profile_run()`` calls. That run has no KV cache and skips attention, so
 everything the engine allocates afterwards is invisible to the budget. On the
 4x V100-SXM2-32GB native-MTP lane the highest nvidia-smi ``memory.used`` is
-31811 MiB at ``--gpu-memory-utilization 0.87``: ~3.3-3.5 GiB above the
-utilisation budget, so the utilisation cannot simply be raised.
+31467 MiB at ``--gpu-memory-utilization 0.87`` (1003 code; 31811 MiB with the
+1001 code): ~3.1-3.5 GiB above the utilisation budget, so the utilisation
+cannot simply be raised.
 
 Where that overshoot comes from (read from the code, nothing here is measured
 on a GPU; the first three rows are not post-sizing at all):
@@ -72,8 +73,8 @@ What the switch does (everything else in the worker stays as it is):
 
 What it can and cannot give. The physical bound reproduces today's footprint at
 the reference point, so the KV cache grows by exactly the headroom today's
-sizing leaves unused: ``total - reference_peak - H`` (MTP lane: ~120 MiB if the
-card's CUDA total is 32510 MiB, ~380 MiB if it is 32768 MiB), plus whatever the
+sizing leaves unused: ``total - reference_peak - H`` (MTP lane: ~470 MiB if the
+card's CUDA total is 32510 MiB, ~730 MiB if it is 32768 MiB), plus whatever the
 idle-cache release frees once ``P`` is calibrated from the audit. Budgeting
 cannot create memory: upstream's 139015-token KV cache at util 0.95 needs a
 smaller non-KV footprint, not a better formula.
@@ -144,21 +145,21 @@ class LaneReference:
     max_num_seqs: int = 0  # --max-num-seqs of the measured run (decides the graph set)
 
 
-# Both rows come from the 2026-10-01 fork-vs-official runs on 4x V100-SXM2-32GB,
-# TP4, Swift-1.5 Qwen3.8-Flash-Next NVFP4, fork 1001 (+ MTP ports for the MTP
-# row): sx_bench/results/2026-10-01-fork-vs-official-best/. The peak is the
-# highest ``memory.used`` of any GPU over the whole run, including the four
-# concurrent 8K prefills. The MTP row predates the 2026-10-02 MTP ports (KV
-# 94332 -> 88870 tokens at util 0.87, peak reported as still ~31.8 GB): re-measure
-# the baseline row with sx_tests/kv-steady-budget/run_on_v100.sh before trusting
-# it for a new build.
+# Both rows are the highest ``memory.used`` of any GPU over a whole run on 4x
+# V100-SXM2-32GB, TP4, Swift-1.5 Qwen3.8-Flash-Next NVFP4, including the four
+# concurrent 8K prefills, from the 2026-10-03 runs of the 1003 code
+# (sx_bench/results/2026-10-03-fork-vs-official-v1.5.1/, REPORT_TABLES.md
+# section 5): MTP = arm FM, no-MTP = arm F1. The 2026-10-01 runs (1001 code)
+# gave 31811 MiB (MTP) and 31839 MiB (no MTP); the MTP ports of 1003 lowered the
+# MTP peak. Re-measure the baseline rows with sx_tests/kv-steady-budget/run_on_v100.sh
+# before trusting them for a new build.
 LANE_REFERENCES: dict[str, LaneReference] = {
     "mtp": LaneReference(
         "mtp",
-        31811,
+        31467,
         0.87,
-        "FM_mtp_c4_8k.json: fork + native MTP k=4, max-num-seqs 16, util 0.87, "
-        "idle 31499 MiB, peak 31811 MiB under 4x8K",
+        "arm FM (1003 code): fork + native MTP k=4, max-num-seqs 16, util 0.87, "
+        "peak 31467 MiB over 4x8K, long prompts and the answers check",
         spec_tokens=4,
         max_num_seqs=16,
     ),
@@ -167,7 +168,8 @@ LANE_REFERENCES: dict[str, LaneReference] = {
         31839,
         0.90,
         "F1_sweep_c8/c16/c24.json: fork production no-MTP, max-num-seqs 24, "
-        "util 0.90, idle 31681 MiB, peak 31839 MiB",
+        "util 0.90, idle 31681 MiB, peak 31839 MiB (arm F1 of the 1003 code: "
+        "31831 MiB)",
         spec_tokens=0,
         max_num_seqs=24,
     ),

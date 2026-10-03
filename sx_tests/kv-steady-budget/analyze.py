@@ -147,6 +147,7 @@ def parse_log(path: str) -> dict:
     end_free: list[int] = []
     steady_lines: list[str] = []
     errors: list[str] = []
+    auto_enabled = False
     with open(path, encoding="utf-8", errors="replace") as handle:
         for raw in handle:
             line = _clean(raw)
@@ -172,6 +173,8 @@ def parse_log(path: str) -> dict:
                 audit_ok += 1
             if "KV steady audit" in line and (m := AUDIT_SUGGEST.search(line)):
                 audit_suggest.append(int(m.group(1)))
+            if "Auto-enabling the KV steady-state budget" in line:
+                auto_enabled = True
             if "KV steady" in line and line not in steady_lines:
                 steady_lines.append(line)
             if m := PHASE_END.search(line):
@@ -193,6 +196,7 @@ def parse_log(path: str) -> dict:
         "audit_suggested_reserve_mib": audit_suggest,
         "end_of_warmup_free_mib": end_free,
         "steady_lines": steady_lines,
+        "auto_enabled": auto_enabled,
         "error_lines": errors,
     }
 
@@ -238,6 +242,13 @@ def verdict(
             "engine audit: reservation SHORT by up to %.0f MiB"
             % max(log["audit_short_mib"])
         )
+    switch = result.get("switch")
+    planned = bool(log["plan"])
+    if switch == "auto":
+        if not log["auto_enabled"]:
+            reasons.append("switch unset but the engine never logged the auto-enable line")
+        if not planned:
+            reasons.append("switch unset but the engine never planned a steady budget")
     return not reasons, reasons
 
 

@@ -62,6 +62,7 @@ INFO 10-02 12:00:00 [kv_cache_utils.py:1] GPU KV cache size: 97,000 tokens
 INFO 10-02 12:00:00 [kv_cache_utils.py:2] Maximum concurrency for 32,768 tokens per request: 2.96x
 (Worker_TP0 pid=11) INFO [gpu_worker.py:1] Available KV cache memory: 2.19 GiB
 (Worker_TP0 pid=11) INFO Graph capturing finished in 126 secs, took 1.04 GiB
+(Worker_TP0 pid=11) INFO Auto-enabling the KV steady-state budget (SX_OPT_KV_STEADY_BUDGET=1) for the SM70 Qwen3.8 TP4 lane: the KV cache is also bounded by the memory the steady state still needs. Set SX_OPT_KV_STEADY_BUDGET=0 to size it the old way.
 (Worker_TP0 pid=11) INFO KV steady budget [kv=2295000000 total=34089730048 requested=1 free_after_profile=2 activation=3 graph_reserve=4 post_sizing=5 headroom=6 limiting=physical]
 (Worker_TP0 pid=11) INFO KV steady audit: OK, 100 MiB above the headroom. Setting SX_OPT_KV_STEADY_RESERVE_MIB=2900 would size the KV cache exactly to the measurement.
 """
@@ -196,6 +197,30 @@ def test_both_trials_run_and_the_summary_lists_them(rig):
     summary = (out / "summary.txt").read_text()
     assert "PASS" in summary and summary.count("97000") == 2
     assert "ok (2900)" in summary
+
+
+def test_auto_runs_the_baseline_then_a_trial_with_the_variable_unset(rig):
+    proc, out = run_script(rig, "--switch", "auto", "--no-stress")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    c0 = (out / "mtp-s0-u093" / "compose.yaml").read_text()
+    ca = (out / "mtp-sauto-u093" / "compose.yaml").read_text()
+    assert 'SX_OPT_KV_STEADY_BUDGET: "0"' in c0
+    assert "SX_OPT_KV_STEADY_BUDGET:" not in ca and "(unset" in ca
+    assert not (out / "mtp-s1-u093").exists()
+    result = json.loads((out / "result.mtp-sauto-u093.json").read_text())
+    assert result["pass"] and result["switch"] == "auto" and result["log"]["auto_enabled"]
+
+
+def test_auto_fails_when_the_engine_never_enables_the_budget(rig):
+    no_auto = "".join(
+        line for line in ENGINE_LOG.splitlines(keepends=True) if "Auto-enabling" not in line
+    )
+    (rig["state"] / "engine.log").write_text(no_auto)
+    proc, out = run_script(rig, "--switch", "auto", "--no-stress")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    result = json.loads((out / "result.mtp-sauto-u093.json").read_text())
+    assert not result["pass"]
+    assert any("auto-enable" in reason for reason in result["fail_reasons"])
 
 
 def test_switch_one_only_skips_the_baseline(rig):
