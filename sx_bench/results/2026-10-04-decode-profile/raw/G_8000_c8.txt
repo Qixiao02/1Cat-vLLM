@@ -1,0 +1,40 @@
+== PROF_G 8000 x C8
+span 3034.8 ms | GPU busy 2772.7 ms (91%) | kernels 267111 | graph launches 143 | step markers {}
+GPU idle gaps > 0.1 ms: 15, total 13.2 ms; > 1 ms: 2
+  gap 6.28 ms: aten::slice x1, aten::as_strided x1, cudaGraphLaunch x1, cudaDriverGetVersion x1
+  gap 4.20 ms: aten::slice x1, aten::as_strided x1, aten::new_full x1, aten::new_empty x1, aten::empty x1
+  gap 0.41 ms: aten::as_strided x14, aten::slice x9, aten::copy_ x5, aten::select x3, aten::fill_ x3
+  gap 0.29 ms: aten::as_strided x8, aten::slice x7, aten::copy_ x1, aten::lift_fresh x1, aten::select x1
+  gap 0.25 ms: aten::as_strided x6, aten::slice x4, aten::select x2, aten::item x1, aten::_local_scalar_dense x1
+  gap 0.25 ms: aten::as_strided x5, aten::slice x4, aten::div x1, aten::select x1, aten::item x1
+  gap 0.23 ms: aten::as_strided x9, aten::slice x7, aten::select x2, aten::fill_ x1, aten::copy_ x1
+  gap 0.20 ms: aten::as_strided x5, aten::slice x3, aten::copy_ x2, aten::select x1, aten::sub x1
+  gap 0.20 ms: aten::as_strided x5, aten::slice x3, aten::copy_ x2, aten::gather x1, aten::select x1
+  gap 0.17 ms: aten::as_strided x5, aten::slice x3, aten::copy_ x2, aten::select x1, aten::sub x1
+kernel time per step by family (ms): gemm 1126.59, moe 486.02, gdn/fla 381.01, qsa/attn 306.70, allreduce 158.63, hc 137.37, other 120.54, router/topk 104.54, copy/elementwise 103.18, ple 40.32, norm 19.22, sampler 1.31
+top kernels (total ms per step, calls per step):
+  497.701 ms 28028.0  void cutlass::Kernel2<cutlass_70_wmma_tensorop_f16_s161616gemm_f16_16x16_64x2_tn_align8>(c
+  312.120 ms 6864.0  void (anonymous namespace)::w13_kernel<4, true>(__half const*, unsigned int const*, __half
+  258.959 ms 5148.0  _qwen38_fp16_gdn_input_rows_kernel
+  235.735 ms 10296.0  _qwen38_fp16_rows_gemv_kernel
+  171.733 ms 6864.0  (anonymous namespace)::w2_kernel(__half const*, unsigned int const*, __half const*, int co
+  163.653 ms 1716.0  _qsa_sparse_paged_gqa_splitk_kernel
+  151.547 ms 7007.0  void cutlass::Kernel2<cutlass_70_wmma_tensorop_s161616gemm_f16_32x32_64x2_tn_align8>(cutla
+  151.412 ms 13728.0  void cutlass::Kernel2<cutlass_70_wmma_tensorop_f16_s161616gemm_f16_32x32_64x2_tn_align8>(c
+  102.410 ms 5148.0  void (anonymous namespace)::gdn_decode_mixed_qkv_global_state_kernel<c10::Half, c10::Half,
+   91.462 ms 1716.0  _qsa_mqa_paged_kernel
+   82.160 ms 6864.0  _sm70_qwen38_router_topk_runtime_m_kernel
+   80.889 ms 7150.0  void vllm::sm70_cross_device_reduce_1stage_push<4>(vllm::sm70_tile_runtime::RankData, __ha
+   64.599 ms 6864.0  void vllm::sm70_cross_device_reduce_sum2_1stage_push<4>(vllm::sm70_tile_runtime::RankData,
+   63.246 ms 13585.0  _hc_combine_norm_kernel
+   63.007 ms 20735.0  void cublasLt::splitKreduce_kernel<32, 16, int, __half, __half, float, __half, false, __ha
+   44.385 ms 13871.0  _hc_gate_mix_kernel
+   34.629 ms 6864.0  (anonymous namespace)::plan_v2_kernel(int const*, int*, int*, int*, int*, int, int const*)
+   29.275 ms 13871.0  _hc_silu_kernel
+   28.040 ms 6864.0  (anonymous namespace)::qwen38_shared_gate_exact_kernel(__half*, __half const*, __half cons
+   27.473 ms 6864.0  void vllm::act_and_mul_kernel<c10::Half, __half2, &(c10::Half vllm::silu_kernel<c10::Half>
+   27.189 ms 7007.0  void cublasLt::splitKreduce_kernel<32, 16, int, float, __half, float, __half, false, __hal
+   21.956 ms  143.0  _gumbel_sample_kernel
+   21.911 ms 1716.0  void vllm::qsa::qsa_lexicographic_decode_topk_rows_kernel<512>(float const*, int const*, i
+   20.914 ms 1716.0  _qsa_merge_splitk_kernel
+   19.639 ms 5148.0  _causal_conv1d_update_kernel

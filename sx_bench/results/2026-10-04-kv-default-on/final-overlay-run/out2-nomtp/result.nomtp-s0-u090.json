@@ -1,0 +1,143 @@
+{
+ "tag": "nomtp-s0-u090",
+ "util": "0.90",
+ "switch": "0",
+ "lane": "no-MTP",
+ "ready": true,
+ "memory": {
+  "start_peak_mib": 30205,
+  "idle_mib": 30205,
+  "stress_peak_mib": 32159,
+  "peak_mib": 32159,
+  "smi_total_mib": 32768,
+  "per_gpu": {
+   "4": {
+    "start": 30205,
+    "idle": 30205,
+    "stress": 32159
+   },
+   "5": {
+    "start": 30205,
+    "idle": 30205,
+    "stress": 32159
+   },
+   "6": {
+    "start": 30205,
+    "idle": 30205,
+    "stress": 32159
+   },
+   "7": {
+    "start": 30205,
+    "idle": 30205,
+    "stress": 32159
+   }
+  }
+ },
+ "log": {
+  "kv_tokens": 410988,
+  "available_kv_gib": [
+   5.3
+  ],
+  "max_concurrency": 3.14,
+  "graph_capture": [
+   {
+    "secs": 52,
+    "gib": 1.04
+   },
+   {
+    "secs": 52,
+    "gib": 1.04
+   },
+   {
+    "secs": 52,
+    "gib": 1.04
+   },
+   {
+    "secs": 52,
+    "gib": 1.04
+   }
+  ],
+  "plan": {},
+  "audit_measured_mib": [],
+  "audit_planned_mib": [],
+  "audit_short_mib": [],
+  "audit_ok_ranks": 0,
+  "audit_suggested_reserve_mib": [],
+  "end_of_warmup_free_mib": [],
+  "steady_lines": [],
+  "auto_enabled": false,
+  "error_lines": []
+ },
+ "stress": {
+  "requests": [
+   {
+    "phase": "A",
+    "target": 8000,
+    "tokens": 7941,
+    "status": 200,
+    "seconds": 10.69,
+    "prompt_tokens": 7941,
+    "completion_tokens": 64
+   },
+   {
+    "phase": "A",
+    "target": 8000,
+    "tokens": 8028,
+    "status": 200,
+    "seconds": 10.76,
+    "prompt_tokens": 8028,
+    "completion_tokens": 64
+   },
+   {
+    "phase": "A",
+    "target": 8000,
+    "tokens": 7997,
+    "status": 200,
+    "seconds": 10.73,
+    "prompt_tokens": 7997,
+    "completion_tokens": 64
+   },
+   {
+    "phase": "A",
+    "target": 8000,
+    "tokens": 7975,
+    "status": 200,
+    "seconds": 10.74,
+    "prompt_tokens": 7975,
+    "completion_tokens": 64
+   },
+   {
+    "phase": "A",
+    "target": 16000,
+    "tokens": 15934,
+    "status": 200,
+    "seconds": 10.8,
+    "prompt_tokens": 15934,
+    "completion_tokens": 64
+   },
+   {
+    "phase": "A",
+    "target": 16000,
+    "tokens": 16010,
+    "status": 200,
+    "seconds": 10.81,
+    "prompt_tokens": 16010,
+    "completion_tokens": 64
+   },
+   {
+    "phase": "B",
+    "target": 32000,
+    "tokens": 32137,
+    "status": 200,
+    "seconds": 5.88,
+    "prompt_tokens": 32137,
+    "completion_tokens": 64
+   }
+  ],
+  "failed": 0,
+  "total": 7
+ },
+ "pass": true,
+ "fail_reasons": [],
+ "peak_limit_mib": 32200
+}

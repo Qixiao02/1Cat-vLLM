@@ -1,0 +1,69 @@
+{
+ "requests": [
+  {
+   "phase": "A",
+   "target": 8000,
+   "tokens": 7941,
+   "status": 200,
+   "seconds": 10.66,
+   "prompt_tokens": 7941,
+   "completion_tokens": 64
+  },
+  {
+   "phase": "A",
+   "target": 8000,
+   "tokens": 8028,
+   "status": 200,
+   "seconds": 10.71,
+   "prompt_tokens": 8028,
+   "completion_tokens": 64
+  },
+  {
+   "phase": "A",
+   "target": 8000,
+   "tokens": 7997,
+   "status": 200,
+   "seconds": 10.7,
+   "prompt_tokens": 7997,
+   "completion_tokens": 64
+  },
+  {
+   "phase": "A",
+   "target": 8000,
+   "tokens": 7975,
+   "status": 200,
+   "seconds": 10.73,
+   "prompt_tokens": 7975,
+   "completion_tokens": 64
+  },
+  {
+   "phase": "A",
+   "target": 16000,
+   "tokens": 15934,
+   "status": 200,
+   "seconds": 10.78,
+   "prompt_tokens": 15934,
+   "completion_tokens": 64
+  },
+  {
+   "phase": "A",
+   "target": 16000,
+   "tokens": 16010,
+   "status": 200,
+   "seconds": 10.76,
+   "prompt_tokens": 16010,
+   "completion_tokens": 64
+  },
+  {
+   "phase": "B",
+   "target": 32000,
+   "tokens": 32137,
+   "status": 200,
+   "seconds": 5.88,
+   "prompt_tokens": 32137,
+   "completion_tokens": 64
+  }
+ ],
+ "failed": 0,
+ "total": 7
+}

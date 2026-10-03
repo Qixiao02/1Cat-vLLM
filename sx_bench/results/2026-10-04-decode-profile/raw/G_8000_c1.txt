@@ -1,0 +1,40 @@
+== PROF_G 8000 x C1
+span 1724.8 ms | GPU busy 1506.3 ms (87%) | kernels 228540 | graph launches 156 | step markers {}
+GPU idle gaps > 0.1 ms: 20, total 6.8 ms; > 1 ms: 2
+  gap 1.86 ms: cudaThreadExchangeStreamCaptureMode x18, cudaEventQuery x18, aten::slice x1, aten::as_strided x1, cudaGraphLaunch x1
+  gap 1.41 ms: cudaGraphLaunch x1
+  gap 0.43 ms: aten::slice x1, aten::as_strided x1, cudaDriverGetVersion x1
+  gap 0.42 ms: aten::select x6, aten::as_strided x6, aten::lift_fresh x2, aten::empty x2, aten::unbind x1
+  gap 0.31 ms: aten::arange x2, aten::copy_ x1, aten::empty x1, aten::resize_ x1, cudaLaunchKernel x1
+  gap 0.28 ms: aten::as_strided x12, aten::slice x9, aten::copy_ x6, aten::to x5, aten::select x3
+  gap 0.19 ms: aten::as_strided x8, aten::slice x7, aten::lift_fresh x1, aten::select x1, aten::div x1
+  gap 0.18 ms: aten::copy_ x1, aten::slice x1, aten::as_strided x1
+  gap 0.17 ms: aten::clamp x1, aten::to x1, cudaLaunchKernel x1
+  gap 0.16 ms: aten::as_strided x9, aten::slice x7, aten::select x2, aten::fill_ x1, aten::copy_ x1
+kernel time per step by family (ms): gemm 465.25, hc 335.44, gdn/fla 224.25, moe 179.03, qsa/attn 146.92, other 97.89, allreduce 96.87, router/topk 84.17, copy/elementwise 51.48, norm 18.26, ple 5.21, sampler 1.15
+top kernels (total ms per step, calls per step):
+  224.064 ms 18720.0  _qwen38_fp16_row_gemv_kernel
+  162.739 ms 5616.0  _qwen38_fp16_gdn_input_kernel
+  108.935 ms 14976.0  vllm::sm70_qwen38_hc_up_mix_push(__half const*, __half const*, __half const*, __half*, vll
+  108.021 ms 7488.0  void (anonymous namespace)::nvfp4_qpn_m1_sm70_kernel<16, true, false, false, 1>(__half con
+   86.717 ms 14976.0  _qwen38_hc_down_local_shard_kernel
+   86.512 ms 14976.0  void vllm::sm70_qwen38_hc_down_push_allgather<4, 0>(vllm::sm70_tile_runtime::RankData, __h
+   83.539 ms  312.0  void cutlass::Kernel2<cutlass_70_wmma_tensorop_f16_s161616gemm_f16_16x16_64x2_tn_align8>(c
+   77.100 ms 7644.0  void gemv2T_kernel_val<int, int, __half, float, float, float, 128, 16, 4, 4, false, false,
+   69.153 ms 7488.0  (anonymous namespace)::nvfp4_qwen38_w2_direct_reduce_kernel(__half const*, unsigned int co
+   59.231 ms 1872.0  _qsa_sparse_paged_gqa_splitk_kernel
+   58.261 ms 7488.0  _sm70_qwen38_router_topk_runtime_m_kernel
+   51.715 ms 14820.0  _hc_combine_norm_kernel
+   48.449 ms 7488.0  void gemv2T_kernel_val<int, int, __half, __half, __half, float, 128, 16, 2, 2, false, fals
+   47.300 ms 7488.0  void vllm::sm70_cross_device_reduce_sum2_1stage_push<4>(vllm::sm70_tile_runtime::RankData,
+   44.027 ms 7800.0  void vllm::sm70_cross_device_reduce_1stage_push<4>(vllm::sm70_tile_runtime::RankData, __ha
+   42.573 ms 5616.0  void (anonymous namespace)::gdn_decode_mixed_qkv_global_state_kernel<c10::Half, c10::Half,
+   38.718 ms 1872.0  _qsa_mqa_paged_kernel
+   37.312 ms 7488.0  (anonymous namespace)::qwen38_shared_gate_exact_kernel(__half*, __half const*, __half cons
+   28.654 ms 7488.0  void vllm::act_and_mul_kernel<c10::Half, __half2, &(c10::Half vllm::silu_kernel<c10::Half>
+   26.352 ms 7644.0  void cublasLt::splitKreduce_kernel<32, 16, int, float, __half, float, __half, false, __hal
+   25.908 ms 1872.0  void vllm::qsa::qsa_lexicographic_decode_topk_kernel<512>(float const*, int const*, int*, 
+   18.934 ms 5616.0  _causal_conv1d_update_kernel
+   18.265 ms 5616.0  void (anonymous namespace)::rmsnorm_gated_exact_kernel<false>(__half const*, __half const*
+   18.069 ms 1872.0  _qsa_merge_splitk_kernel
+   10.186 ms 1872.0  void vllm::reshape_and_cache_flash_kernel<unsigned short, unsigned short, (vllm::Fp8KVCach

@@ -1,0 +1,206 @@
+{
+ "tag": "mtp-sauto-u087",
+ "util": "0.87",
+ "switch": "auto",
+ "lane": "MTP",
+ "ready": true,
+ "memory": {
+  "start_peak_mib": 31089,
+  "idle_mib": 31089,
+  "stress_peak_mib": 31091,
+  "peak_mib": 31091,
+  "smi_total_mib": 32768,
+  "per_gpu": {
+   "4": {
+    "start": 31089,
+    "idle": 31089,
+    "stress": 31091
+   },
+   "5": {
+    "start": 31063,
+    "idle": 31063,
+    "stress": 31065
+   },
+   "6": {
+    "start": 31089,
+    "idle": 31089,
+    "stress": 31091
+   },
+   "7": {
+    "start": 31089,
+    "idle": 31089,
+    "stress": 31091
+   }
+  },
+  "cuda_free_at_peak_mib": 1403,
+  "smi_minus_cuda_idle_mib": 1
+ },
+ "log": {
+  "kv_tokens": 89367,
+  "available_kv_gib": [
+   1.94
+  ],
+  "max_concurrency": 2.73,
+  "graph_capture": [
+   {
+    "secs": 65,
+    "gib": 1.31
+   },
+   {
+    "secs": 65,
+    "gib": 1.31
+   },
+   {
+    "secs": 65,
+    "gib": 1.31
+   },
+   {
+    "secs": 65,
+    "gib": 1.31
+   }
+  ],
+  "plan": {
+   "kv": "2084515922",
+   "total": "34072559616",
+   "requested": "29643126866",
+   "free_after_profile": "6551502848",
+   "activation": "1054803968",
+   "graph_reserve": "0",
+   "post_sizing": "2335164335",
+   "headroom": "603979776",
+   "limiting": "utilisation",
+   "kv_utilisation": "2084515922",
+   "kv_physical": "2557554769",
+   "init_cuda": "1017249792"
+  },
+  "audit_measured_mib": [
+   1964.0,
+   1964.0,
+   1964.0,
+   1964.0
+  ],
+  "audit_planned_mib": [
+   2227.0,
+   2227.0,
+   2227.0,
+   2227.0
+  ],
+  "audit_short_mib": [],
+  "audit_ok_ranks": 4,
+  "audit_suggested_reserve_mib": [
+   2348,
+   2348,
+   2348,
+   2348
+  ],
+  "end_of_warmup_free_mib": [
+   1432,
+   1406,
+   1406,
+   1406
+  ],
+  "steady_lines": [
+   "INFO 10-03 20:19:33 [vllm.py:2808] Auto-enabling the KV steady-state budget (SX_OPT_KV_STEADY_BUDGET=1) for the SM70 Qwen3.8 TP4 lane: the KV cache is also bounded by the memory the steady state still needs. Set SX_OPT_KV_STEADY_BUDGET=0 to size it the old way.",
+   "INFO 10-03 20:25:00 [gpu_worker.py:761] KV steady budget: util 0.8700 of 31.73 GiB = 27.61 GiB requested; non-KV 25.67 GiB (activation peak 0.98 GiB), graph reserve 0.00 GiB -> utilisation bound 1.94 GiB (the sizing without this switch gives 1.94 GiB at this utilisation)",
+   "INFO 10-03 20:25:00 [gpu_worker.py:761] KV steady budget: free after profile 6.10 GiB (includes 0.95 GiB context/NCCL), post-sizing allocation P 2.17 GiB [lane reference mtp: peak 31467 MiB at util 0.87 minus its budget minus this device's 970 MiB context/NCCL (arm FM (1003 code): fork + native MTP k=4, max-num-seqs 16, util 0.87, peak 31467 MiB over 4x8K, long prompts and the answers check)], headroom 0.56 GiB -> physical bound 2.38 GiB",
+   "INFO 10-03 20:25:00 [gpu_worker.py:761] KV steady budget: KV cache 1.94 GiB (utilisation bound); predicted free memory at the steady peak 1027 MiB; the utilisation bound stops limiting at --gpu-memory-utilization 0.8839",
+   "INFO 10-03 20:25:00 [gpu_worker.py:761] KV steady budget [kv=2084515922 total=34072559616 requested=29643126866 free_after_profile=6551502848 activation=1054803968 graph_reserve=0 post_sizing=2335164335 headroom=603979776 limiting=utilisation kv_utilisation=2084515922 kv_physical=2557554769 init_cuda=1017249792]",
+   "INFO 10-03 20:25:00 [gpu_worker.py:761] KV steady budget: util 0.8700 of 31.73 GiB = 27.61 GiB requested; non-KV 25.64 GiB (activation peak 0.98 GiB), graph reserve 0.00 GiB -> utilisation bound 1.97 GiB (the sizing without this switch gives 1.97 GiB at this utilisation)",
+   "INFO 10-03 20:25:00 [gpu_worker.py:761] KV steady budget: free after profile 6.13 GiB (includes 0.95 GiB context/NCCL), post-sizing allocation P 2.17 GiB [lane reference mtp: peak 31467 MiB at util 0.87 minus its budget minus this device's 970 MiB context/NCCL (arm FM (1003 code): fork + native MTP k=4, max-num-seqs 16, util 0.87, peak 31467 MiB over 4x8K, long prompts and the answers check)], headroom 0.56 GiB -> physical bound 2.41 GiB",
+   "INFO 10-03 20:25:00 [gpu_worker.py:761] KV steady budget: KV cache 1.97 GiB (utilisation bound); predicted free memory at the steady peak 1027 MiB; the utilisation bound stops limiting at --gpu-memory-utilization 0.8839",
+   "INFO 10-03 20:25:00 [gpu_worker.py:761] KV steady budget [kv=2111778898 total=34072559616 requested=29643126866 free_after_profile=6578765824 activation=1054803968 graph_reserve=0 post_sizing=2335164335 headroom=603979776 limiting=utilisation kv_utilisation=2111778898 kv_physical=2584817745 init_cuda=1017249792]",
+   "INFO 10-03 20:25:00 [gpu_worker.py:775] KV steady phase after_kv_cache: 4376 MiB free (-1872 MiB since the previous phase)",
+   "INFO 10-03 20:25:00 [gpu_worker.py:775] KV steady phase after_kv_cache: 4402 MiB free (-1872 MiB since the previous phase)",
+   "INFO 10-03 20:25:00 [gpu_worker.py:775] KV steady phase dummy_runs: 4376 MiB free (+0 MiB since the previous phase)",
+   "INFO 10-03 20:25:00 [gpu_worker.py:775] KV steady phase dummy_runs: 4402 MiB free (+0 MiB since the previous phase)",
+   "INFO 10-03 20:25:08 [gpu_worker.py:775] KV steady phase kernel_warmup: 4366 MiB free (-10 MiB since the previous phase)",
+   "INFO 10-03 20:25:08 [gpu_worker.py:775] KV steady phase kernel_warmup: 4392 MiB free (-10 MiB since the previous phase)",
+   "INFO 10-03 20:26:13 [gpu_worker.py:775] KV steady phase graph_capture: 3030 MiB free (-1336 MiB since the previous phase)",
+   "INFO 10-03 20:26:13 [gpu_worker.py:775] KV steady phase graph_capture: 3056 MiB free (-1336 MiB since the previous phase)",
+   "INFO 10-03 20:26:14 [gpu_worker.py:775] KV steady phase after_empty_cache: 3030 MiB free (+0 MiB since the previous phase)",
+   "INFO 10-03 20:26:14 [gpu_worker.py:775] KV steady phase after_empty_cache: 3056 MiB free (+0 MiB since the previous phase)",
+   "INFO 10-03 20:26:16 [gpu_worker.py:775] KV steady phase end_of_warmup: 1432 MiB free (-1624 MiB since the previous phase)",
+   "INFO 10-03 20:26:16 [gpu_worker.py:775] KV steady phase end_of_warmup: 1406 MiB free (-1624 MiB since the previous phase)",
+   "INFO 10-03 20:26:16 [gpu_worker.py:866] KV steady audit: after the KV cache the device had 4376 MiB free (KV 1981 MiB, initialize_kv_cache non-KV 0 MiB); the warm-up then took 2970 MiB (CUDA graphs 1338 MiB, allocator cache that holds the activation peak 1006 MiB); 1406 MiB free at the end",
+   "INFO 10-03 20:26:16 [gpu_worker.py:866] KV steady audit: measured post-sizing growth 1964 MiB (plan assumed 2227 MiB); +384 MiB load margin and 0 MiB of the activation peak not cached yet -> 1022 MiB free expected at the load peak (headroom 576 MiB)",
+   "INFO 10-03 20:26:16 [gpu_worker.py:866] KV steady audit: OK, 446 MiB above the headroom. Setting SX_OPT_KV_STEADY_RESERVE_MIB=2348 would size the KV cache exactly to the measurement.",
+   "INFO 10-03 20:26:16 [gpu_worker.py:866] KV steady audit: after the KV cache the device had 4402 MiB free (KV 1981 MiB, initialize_kv_cache non-KV 0 MiB); the warm-up then took 2970 MiB (CUDA graphs 1338 MiB, allocator cache that holds the activation peak 1006 MiB); 1432 MiB free at the end",
+   "INFO 10-03 20:26:16 [gpu_worker.py:866] KV steady audit: measured post-sizing growth 1964 MiB (plan assumed 2227 MiB); +384 MiB load margin and 0 MiB of the activation peak not cached yet -> 1048 MiB free expected at the load peak (headroom 576 MiB)",
+   "INFO 10-03 20:26:16 [gpu_worker.py:866] KV steady audit: OK, 472 MiB above the headroom. Setting SX_OPT_KV_STEADY_RESERVE_MIB=2348 would size the KV cache exactly to the measurement."
+  ],
+  "auto_enabled": true,
+  "error_lines": []
+ },
+ "stress": {
+  "requests": [
+   {
+    "phase": "A",
+    "target": 8000,
+    "tokens": 7941,
+    "status": 200,
+    "seconds": 8.19,
+    "prompt_tokens": 7941,
+    "completion_tokens": 64
+   },
+   {
+    "phase": "A",
+    "target": 8000,
+    "tokens": 8028,
+    "status": 200,
+    "seconds": 10.52,
+    "prompt_tokens": 8028,
+    "completion_tokens": 64
+   },
+   {
+    "phase": "A",
+    "target": 8000,
+    "tokens": 7997,
+    "status": 200,
+    "seconds": 9.39,
+    "prompt_tokens": 7997,
+    "completion_tokens": 64
+   },
+   {
+    "phase": "A",
+    "target": 8000,
+    "tokens": 7975,
+    "status": 200,
+    "seconds": 10.91,
+    "prompt_tokens": 7975,
+    "completion_tokens": 64
+   },
+   {
+    "phase": "A",
+    "target": 16000,
+    "tokens": 15934,
+    "status": 200,
+    "seconds": 10.99,
+    "prompt_tokens": 15934,
+    "completion_tokens": 64
+   },
+   {
+    "phase": "A",
+    "target": 16000,
+    "tokens": 16010,
+    "status": 200,
+    "seconds": 11.31,
+    "prompt_tokens": 16010,
+    "completion_tokens": 64
+   },
+   {
+    "phase": "B",
+    "target": 32000,
+    "tokens": 32137,
+    "status": 200,
+    "seconds": 5.97,
+    "prompt_tokens": 32137,
+    "completion_tokens": 64
+   }
+  ],
+  "failed": 0,
+  "total": 7
+ },
+ "pass": true,
+ "fail_reasons": [],
+ "peak_limit_mib": 32200
+}

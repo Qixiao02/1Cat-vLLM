@@ -1,4 +1,4 @@
-# 1cat-vllm-heavily-modified-v1-1003
+# 1cat-vllm-heavily-modified-v1-1004
 
 Heavily modified fork of [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) for serving
 **Swift 1.5 Qwen3.8-Flash-Next (NVFP4)** on **4× V100-SXM2-32GB (TP4, SM70)**. It focuses on
@@ -11,10 +11,10 @@ All switches default to on, and setting one to `0` restores the upstream code pa
 
 | 项 | 值 |
 |---|---|
-| 版本名 | 1cat-vllm-heavily-modified-v1-1003 |
-| git tag | `1cat-vllm-heavily-modified-v1-1003`（最新，2026-10-03，改动第 1–12 项）；`1cat-vllm-heavily-modified-v1-1001`（改动第 1–7 项）；`1cat-vllm-heavily-modified-v1-0930`（改动第 1–5 项） |
+| 版本名 | 1cat-vllm-heavily-modified-v1-1004 |
+| git tag | `1cat-vllm-heavily-modified-v1-1004`（最新，2026-10-04，改动第 1–12 项；比 1003 的区别只有改动第 11 项 KV 稳态预算改成两条 Qwen3.8 TP4 通道默认开，另有文档和数据）；`1cat-vllm-heavily-modified-v1-1003`（2026-10-03，改动第 1–12 项）；`1cat-vllm-heavily-modified-v1-1001`（改动第 1–7 项）；`1cat-vllm-heavily-modified-v1-0930`（改动第 1–5 项） |
 | 默认分支 | `1cat-vllm-heavily-modified-v1` |
-| Python 包版本（PEP 440） | 1003 的 wheel：`1.5.1+heavily.modified.v1.1003.torch2.10.cu128`，运行中的引擎在 `/version` 返回 `1.5.1+heavily.modified.v1.1003.torch2.10`。1001 同理。0930：`1.5.1+heavily.modified.v1`。从源码构建时用 `SETUPTOOLS_SCM_PRETEND_VERSION` 设置，见 `sx_bench/as_run/build_fork.sh` |
+| Python 包版本（PEP 440） | 1004 的 wheel：`1.5.1+heavily.modified.v1.1004.torch2.10.cu128`，`/version` 返回 `1.5.1+heavily.modified.v1.1004.torch2.10`。1003 的 wheel：`1.5.1+heavily.modified.v1.1003.torch2.10.cu128`，运行中的引擎在 `/version` 返回 `1.5.1+heavily.modified.v1.1003.torch2.10`。1001 同理。0930：`1.5.1+heavily.modified.v1`。从源码构建时用 `SETUPTOOLS_SCM_PRETEND_VERSION` 设置，见 `sx_bench/as_run/build_fork.sh` |
 | 官方基线 | `main@02c87ab89`（2026-09-14），即官方 v1.5.0 之后第 670 个提交 |
 
 ## 改动（按提交顺序）
@@ -50,7 +50,7 @@ All switches default to on, and setting one to `0` restores the upstream code pa
 8. **移植官方 11 项 MTP 路径（2026-10-02，版本 1003 新增）**：MTP 通道的精确 gated RMSNorm、混合 QKV 的 GDN 验证、PLE 回滚加短卷积、融合的 GDN 元数据、分组 W5 专家、FP16 精确草稿 MoE、router 打包键，以及 HC、router、共享专家、GDN 输入的 4 个批路由。4 个批路由默认关（`SX_OPT_MTP_HC_BATCH`、`SX_OPT_MTP_ROUTER_BATCH`、`SX_OPT_MTP_SHARED_BATCH`、`SX_OPT_MTP_GDN_INPUT_BATCH`）：每张卡多占约 525 MiB，KV 少约三分之一，只换约 3–4% 的单请求速度。开 MTP 单请求写代码从 167.8 提到 200.2 token/s
 9. **启动提速（2026-10-02，版本 1003 新增）**：PLE 表按精确大小锁定内存（`SX_OPT_PLE_EXACT_PIN`，4 个进程共省约 17 GiB 主机内存）、MoE 加载按专家名建索引（`SX_OPT_MOE_LOAD_INDEX`）、更省的加载检查（`SX_OPT_LOAD_CAN_SKIP`、`SX_OPT_LOAD_QSA_REMAP`）。冷启动 592 → 513 秒，权重加载 272.7 → 222.8 秒，输出不变
 10. **可选：torch.compile 缓存复用（版本 1003 新增，默认关）**：见下面“实验开关”
-11. **可选：KV 稳态预算（版本 1003 新增，默认关）**：见下面“实验开关”
+11. **KV 稳态预算（版本 1003 加入，1004 起对两条 Qwen3.8 TP4 通道默认开）**：见下面“KV 稳态预算”
 12. **采样参数校验（版本 1003 新增）**：官方提交 `36259988e`，越界的停止词 ID、允许 ID 的范围、空白 bad words
 
 ## 实测
@@ -82,21 +82,27 @@ All switches default to on, and setting one to `0` restores the upstream code pa
 - 采样 decode 每步快 18–37%
 - 业务 JSON 24 并发：1.84 → 2.89 请求/秒
 
+## KV 稳态预算（改动第 11 项，1004 起默认开）
+
+`SX_OPT_KV_STEADY_BUDGET`：用一次满 chunk 的预热把懒分配的工作区在启动时就量出来，graph 捕获后释放捕获 stream 缓存的空闲块，并在定 KV 容量时加一道物理上限（稳态峰值时剩余显存不低于 576 MiB）。**1004 起对两条已有实测参考值的通道默认打开**：Qwen3.8 TP4 不开 MTP，和原生 MTP（k=1–7）；其他模型保持原来的定容量方式。设 `SX_OPT_KV_STEADY_BUDGET=0` 关闭，`=1` 显式打开，`SX_OPT_KV_STEADY_RESERVE_MIB` 手填“稳态还要分配的量”（启动日志的 audit 行给建议值）。
+
+实测（README.md 第 8 组）：同样的启动参数下 KV 容量不变（不开 MTP util 0.90：410,988 token；开 MTP util 0.87：89,367 token），压测期间显存不再增长，不开 MTP 最坏情况的剩余显存从 335 MiB 变成 771 MiB；开 MTP 把 util 提到 0.93，KV 多 23%（109,723 token，手填 `SX_OPT_KV_STEADY_RESERVE_MIB=2012` 约 120,000）；不开 MTP 的容量已经到卡的上限，util 调到 0.94 只多 1.4%。1003 手动打开时的测量是第 6 组。实现和推导见 `vllm/v1/worker/kv_steady_budget.py` 的文件头注释，V100 验证脚本是 `sx_tests/kv-steady-budget/run_on_v100.sh`（`--switch auto` 验证默认行为）。
+
 ## 实验开关（默认关）
 
-上面各项开关默认开，下面这些默认关（改动第 8、10、11 项）。
+上面各项开关默认开，下面这些默认关（改动第 8、10 项）。
 
 - **`SX_OPT_COMPILE_CACHE`**（默认 `0`，行为和之前逐字节相同）：重启时复用 torch.compile 的缓存，冷启动里约 185 秒的编译预计能省下 100–170 秒（预期值，还没有在 V100 上测过）。`1` 复用编译好的子图，`aot` 复用整个 AOT 产物。打开后缓存键会带上构建指纹（torch/CUDA 版本、源码内容、原生库、检查点文件），换了镜像或改了任何 `VLLM_*`/`SX_OPT_*` 开关都不会命中旧缓存。官方 1.5.1 默认打开缓存，但它自己的 27B 测试里 AOT 重载的输出和冷编译不一致，所以这里在 `sx_tests/compile-cache/cache_parity.sh` 通过之前不要在生产打开。**这个脚本还没有在 V100 上跑过，没有任何实测数据。**分析、移植了官方哪些提交、风险见 [docs/design/sx_compile_cache.md](docs/design/sx_compile_cache.md)。
-- **`SX_OPT_KV_STEADY_BUDGET`**（默认 `0`）：开 MTP 时按稳态峰值给 KV 缓存定容量，配合 `SX_OPT_KV_STEADY_RESERVE_MIB`（开 MTP 实测用 1990）和更高的 `--gpu-memory-utilization`（实测 0.93）。开 MTP 时 KV 缓存 89,367 → 120,645 token（多 35%），4 并发的 decode 低 2–4%（单遍，不确定是不是噪声），单请求持平。**只在开 MTP 的这一种形状上测过**，不开 MTP 的预留量没有测。数据见 README.md 实测第 6 组；实现和推导见 `vllm/v1/worker/kv_steady_budget.py` 的文件头注释，V100 验证脚本是 `sx_tests/kv-steady-budget/run_on_v100.sh`。
 - **MTP 的 4 个批路由**（默认 `0`）：`SX_OPT_MTP_HC_BATCH`、`SX_OPT_MTP_ROUTER_BATCH`、`SX_OPT_MTP_SHARED_BATCH`、`SX_OPT_MTP_GDN_INPUT_BATCH`（别名 `VLLM_SM70_MTP_HC_BATCH` 等，和官方同名）。每张卡多占约 525 MiB，开 MTP 的 KV 缓存从 88,870 降到 59,081 token，4 条 8K 并发放不下，只换约 3–4% 的单请求速度。
 
 ## 已知限制
 
-- **MTP 通道**：请在生产上保持关闭。1003 的 MTP 速度已经高于官方 v1.5.1（README.md 第 5 组），但 KV 缓存只有 89,367 token（默认，显存利用率 0.87）或 120,645 token（打开 KV 稳态预算，0.93），都放不下 4 条 32K 并发；每张卡显存峰值 31.5–31.9 GiB，整卡 32 GiB，余量不到 1 GiB；E4M3 KV 下 4 并发的 decode 速度减半（README.md 第 3 组，那是 1001 的数据）。MTP 只测了 1 并发和 4 并发。
+- **MTP 通道**：请在生产上保持关闭。1003 的 MTP 速度已经高于官方 v1.5.1（README.md 第 5 组），但 KV 缓存只有 89,367 token（util 0.87）、109,723 token（util 0.93，1004 默认）或约 120,000（util 0.93 加 `SX_OPT_KV_STEADY_RESERVE_MIB=2012`），都放不下 4 条 32K 并发；每张卡显存峰值 31.1–31.9 GiB，整卡 32 GiB，余量不到 1 GiB；E4M3 KV 下 4 并发的 decode 速度减半（README.md 第 3 组，那是 1001 的数据）。MTP 只测了 1 并发和 4 并发。
+- **视觉**：所有测试都不开视觉（`--language-model-only`）。开视觉时快速通道不进，decode 慢约 23%，prefill 慢约 36%；`--kv-cache-dtype fp8_e4m3`（没有标定的 scale）同样让 decode 慢约 24%，两项一起也不会更慢。数据见 README.md 第 9 组；最佳启动参数见 README.md 快速开始。
 - **和官方的对比有边界**：官方一侧是 v1.5.1 发布版，装在我们自己做的 Ubuntu 24.04 镜像里，不是官方原样镜像；官方 `main@e53d02171` 在我们的环境里起不来，没有拿它比；两边参数不完全相同；每格只有 1–2 遍。官方在前缀缓存开时只有显存利用率 0.90 能稳定运行（0.92、0.94 会显存溢出）。
 - **1 token prompt**：全新请求的 prompt 只有 1 个 token 时，状态槽没有清零。官方也有同样问题。聊天接口的 prompt 带模板，不会触发。
 - **开前缀缓存时长 prompt 的 KV 占用偏高（版本 0930 的问题，1001 起已修）**：版本 0930 在 4 条 64K 并发时 KV 占用峰值是 86%，关前缀缓存是 64%；1001 起是 64.4%。原因是 prefill 一步跨多个状态块时，换下来的状态块要到请求结束才释放，1001 起处理完对应的 token 就释放（改动第 7 项）。
 - **别的请求 prefill 时 decode 会停顿**：一条请求在 prefill 时，已经在生成的请求会停顿。4 并发冷 prompt 的测量里，相邻两个 token 的最长间隔是 1.2–1.5 秒，官方 `main@d30469863` 是 0.5–0.8 秒，见 README.md 的历史记录。
 - **首次启动慢**：部分内核第一次启动时现编，之后更快；我们机器放模型的盘 PCIe 链路只有 x1，读取上限约 0.85 GB/s，是启动时间的硬件下限。
 - **测试环境**：`sx_tests/` 下的测试需要 V100 和对应镜像，每个文件里写了运行方法。
-- **压测脚本和原始结果**：在 `sx_bench/`，说明见 `sx_bench/README.md`。收录 2026-09-30、2026-10-01 和 2026-10-03 的测量（和官方并排对比、前缀缓存开和关、开 MTP 时 FP16 KV 和 E4M3 KV、对官方 v1.5.1 的完整对比、KV 稳态预算）。
+- **压测脚本和原始结果**：在 `sx_bench/`，说明见 `sx_bench/README.md`。收录 2026-09-30、2026-10-01、2026-10-03 和 2026-10-04 的测量（和官方并排对比、前缀缓存开和关、开 MTP 时 FP16 KV 和 E4M3 KV、对官方 v1.5.1 的完整对比、KV 稳态预算及其默认开的显存验证、开视觉和 FP8 KV 的代价、单步 decode 的时间分布）。

@@ -24,6 +24,10 @@
 | `as_run/official-main-dockerfile-local.patch` | 构建官方 `main@e53d02171` 时对它的 `docker/Dockerfile` 做的 4 处本地补丁（补 COPY 两个文件、cpython 走镜像源、CMake 第三方库走本地镜像），没有改任何源码 |
 | `as_run/build_1003.sh`、`validate_wheel_1003.sh` | 1003 wheel 的构建（仓库自己的 Dockerfile，参数和 1002 相同）和验证：取出 wheel，做验证镜像（1002 镜像换上新 wheel），按生产参数启动，答题加 8K 贪心 C1/C4 加 4 并发 8K–64K，对照第 5 组的覆盖镜像 |
 | `as_run/make_report.py` | 从 `results/2026-10-03-fork-vs-official-v1.5.1/` 的原始日志算出第 5 组的所有对比表，不手算 |
+| `as_run/prof_1003.sh`、`add_prof_arms.py`、`analyze_eager2.py`、`make_profile_tables.py` | 2026-10-04 单步 decode 剖析：`add_prof_arms.py` 加两个配置（eager 加 record_shapes；CUDA graph），`prof_1003.sh` 依次启动，每个窗口等所有请求出了第一个 token 后抓 3 秒 decode（`prof_window.py` 在服务器上，没有收进仓库）；`analyze_eager2.py` 是修了 TensorList 输入形状解析的版本（原版在带 TensorList 参数的算子上崩溃）；`make_profile_tables.py` 把分析输出变成 `PROFILE_TABLES.md` |
+| `as_run/make_vision_tables.py` | 从 `results/2026-10-04-vision-fp8-probe/` 的原始日志生成 `RESULTS.md`（开视觉和 FP8 KV 各自的代价）。启动脚本 `vision_probe.sh` 和 `image_check.py` 在同一个结果目录里 |
+| `as_run/build_1004.sh`、`validate_wheel_1004.sh`、`add_arms_1004.py` | 1004 wheel 的构建（仓库自己的 Dockerfile，参数和 1003 相同，BuildKit 缓存已清掉，冷构建 50 分钟）和验证：取出 wheel，做验证镜像（1003 镜像换上新 wheel），不开 MTP 和开 MTP 各一组“默认”和一组“开关设 0”的同镜像对照，另有 util 0.94 和 MTP util 0.93 |
+| `as_run/make_wheel1004_report.py` | 从 `results/2026-10-04-wheel-1004/` 的原始日志算出 `RESULTS.md`（1004 wheel 验证的所有表，不手算） |
 
 `as_run/` 下的脚本带着我们服务器上的路径、容器名和 compose 文件名，换机器要改。`pfx_bench.py` 和 `summarize.py` 不依赖这些，只用 Python 标准库。
 
@@ -68,6 +72,10 @@ python3 pfx_bench.py --port 8001 --model <served-model-name> --out result.json \
 | `results/2026-10-01-wheel-1001/` | 发行的 wheel（1001）：`detail_wheel_1001_c4.json` 是和第 1 组同样的压测，`answers_*.json` 是 1001 和 0930 的答题对照 |
 | `results/2026-09-30-mtp-fp16-vs-e4m3/` | 开 MTP（k=4）时 FP16 KV 和 E4M3 KV。`c1s`、`c1g` 是单请求 8K（采样、贪心），`c4s2k`、`c4g2k` 是 4 并发 2K（采样、贪心），`c4` 是 4 并发 8K/16K/32K；`answers_*.json` 是输出对照，`kv_scale_report.json` 是标定得到的各层 K、V 最大值和 scale |
 | `results/2026-10-03-fork-vs-official-v1.5.1/` | 本分支 1003 对官方 v1.5.1（README 实测第 5、6 组）。文件名前缀是测试时的内部简称，对照见下表。`*_sweep_c*` 是 8K 并发扫描，`*_long` 是 4 并发 8K–64K，`*_l128k` 是 128K，`*_mtp*` 是 MTP 测试，`*_answers.json` 是答题，`engine_*.log` 是引擎日志，`compose.*.yaml` 是各配置的 compose。`O1_HEAD_hang_pyspy.txt` 和 `engine_O1_HEAD_hang.log` 是官方 main 起不来的证据。`REPORT_TABLES.md` 是脚本生成的全部对比表 |
+| `results/2026-10-04-decode-profile/` | 单步 decode 的时间分布（README 实测第 10 组）：`PROFILE_TABLES.md` 是汇总，`LEVERS.md` 是“还能优化什么”的排序（预计收益是估计，不是实测），`raw/` 是每个窗口的分析输出（`G_*` 是 CUDA graph，`E_*` 是 eager 加形状）。完整 trace 文件没有收进仓库 |
+| `results/2026-10-04-vision-fp8-probe/` | 开视觉和 FP8 KV 各自的代价（README 实测第 9 组）：`RESULTS.md` 是汇总；`F1`、`T_VISION`、`T_FP8` 分别是生产参数、只开视觉、只用 FP8 KV（`*_vp_*` 是这一轮的数据）；`theirs_command/` 是别人那条命令的更早一次测试 |
+| `results/2026-10-04-kv-default-on/` | KV 稳态预算默认开的显存验证（README 实测第 8 组）：`first-run-graph-reserve-charged/` 是第一版（不开 MTP 通道 KV −21%，从没发布）的数据，`final-overlay-run/` 是修正后的数据，目录里的 `README.md` 有汇总 |
+| `results/2026-10-04-wheel-1004/` | 发行的 wheel（1004）的验证（README 实测第 8 组）。文件名前缀：`F1A` 不开 MTP 默认（util 0.90），`F1Z` 同样但 `SX_OPT_KV_STEADY_BUDGET=0`，`F1B` 不开 MTP util 0.94，`FMA` 开 MTP 默认（util 0.87），`FMZ` 同样但开关设 0，`FMB` 开 MTP util 0.93（不设预留量）。其余文件名同上表 |
 
 `results/2026-10-03-fork-vs-official-v1.5.1/` 的文件名前缀：
 

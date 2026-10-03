@@ -1,0 +1,63 @@
+== PROF_E 200 x C1 : 30729 kernels, 14 decode steps (QSA calls 168 / 12), kernel time 2555.0 ms = 182.50 ms per step
+parent op                          input dims                         kernel                                       calls/st  us/call   ms/step      GB/s
+_C_custom_ar::all_reduce           [[1, 2560], [1, 2560]]             cross_device_reduce_1stage<__half, 4>            97.0   1737.4   168.530          
+aten::mm                           [[1, 10240], [10240, 336]]         gemv2T_kernel_val<int, int, __half, float, f     96.0     13.8     1.325       498
+aten::mm                           [[1, 2560], [2560, 4096]]          gemv2T_kernel_val<int, int, __half, __half,      36.0     31.5     1.134       666
+aten::mm                           [[1, 320], [320, 10240]]           gemv2T_kernel_val<int, int, __half, __half,      97.0     11.6     1.124       566
+record_param_comms                 [[1, 2]]                           ncclDevKernel_AllGather_RING_LL                   1.0    948.4     0.948          
+_C_custom_ar::all_reduce           [[1, 16, 160], [1, 16, 160]]       cross_device_reduce_1stage<__half, 4>             1.0    873.4     0.873          
+aten::mm                           [[1, 1536], [1536, 2560]]          gemv2T_kernel_val<int, int, __half, __half,      48.0     15.3     0.733       515
+_C::nvfp4_qwen38_w13_fused_swiglu_ [[10, 160], [1, 2560], [512, 2560,                                                  48.0     11.8     0.568          
+aten::mm                           [[1, 2560], [2560, 62080]]         cutlass_70_wmma_tensorop_f16_s161616gemm_f16      1.0    452.7     0.453       702
+_C::nvfp4_qwen38_w2_direct_reduce_ [[1, 2560], [10, 160], [512, 160,                                                   48.0      8.2     0.393          
+aten::mm                           [[1, 2560], [2560, 3584]]          gemv2T_kernel_val<int, int, __half, __half,      12.0     27.7     0.332       663
+aten::mm                           [[1, 2560], [2560, 512]]           gemv2T_kernel_val<int, int, __half, float, f     48.0      6.4     0.308       409
+vllm::moe_forward_shared           [[1, 2560], [1, 2560], [1, 2560]]  _sm70_qwen38_router_topk_runtime_m_kernel        48.0      6.4     0.307          
+vllm::qwen4_exp_hc_combine_norm    [[1, 10240], [1, 2560], [1, 4]]    _hc_combine_norm_kernel                          95.0      3.1     0.298          
+vllm::qwen4_exp_qsa_with_output    [[1, 2560], [1], [1, 6, 256]]      _qsa_sparse_paged_gqa_splitk_kernel              12.0     23.1     0.277          
+aten::mm                           [[1, 10240], [10240, 336]]         cublasLt::splitKreduce_kernel<32, 16, int, f     96.0      2.8     0.272      2425
+aten::gather                       [[1, 4096], [1, 1536], [1, 1536]]  at::native::_scatter_gather_elementwise_kern     36.0      7.4     0.268         1
+vllm::qwen4_exp_hc_gate_mix        [[1, 10240], [1, 10240]]           _hc_gate_mix_kernel                              97.0      2.7     0.266          
+aten::mm                           [[1, 2560], [2560, 320]]           gemv2T_kernel_val<int, int, __half, float, f     48.0      5.1     0.244       323
+vllm::qwen4_exp_qsa_with_output    [[1, 2560], [1], [1, 6, 256]]      _qsa_mqa_paged_kernel                            12.0     19.7     0.236          
+vllm::qwen_gdn_attention_core_stan [[1, 2560], [1, 12], [1, 12]]                                                       36.0      6.5     0.233          
+aten::mm                           [[1, 160], [160, 2560]]            gemv2T_kernel_val<int, int, __half, __half,      48.0      4.2     0.202       195
+vllm::qwen4_exp_hc_silu            [[1, 320]]                         _hc_silu_kernel                                  97.0      1.7     0.168          
+_C::qwen38_shared_gate_exact_out   [[1, 2560], [1, 2560], [1, 2560]]                                                   48.0      3.3     0.157          
+aten::index_select                 [[1, 24], [12]]                    at::native::                                     36.0      4.3     0.155         0
+_C::silu_and_mul                   [[1, 160], [1, 320]]               act_and_mul_kernel<c10::Half, __half2, &         48.0      3.1     0.151          
+aten::mm                           [[1, 2560], [2560, 24]]            dot_kernel<float, 128, 0, cublasDotParams<cu     36.0      3.3     0.118        37
+aten::copy_                        [[256], [256]]                     at::native::unrolled_elementwise_kernel<at::     24.0      4.4     0.105         0
+aten::copy_                        [[1, 6, 256], [1, 6, 256]]         at::native::elementwise_kernel<128, 4, at::n     12.0      8.6     0.103         0
+aten::mm                           [[1, 2560], [2560, 320]]           cublasLt::splitKreduce_kernel<32, 16, int, f     48.0      2.1     0.101       780
+aten::add                          [[1, 2560], [1, 2560]]             at::native::vectorized_elementwise_kernel<4,     48.0      2.1     0.101         2
+aten::mm                           [[1, 2560], [2560, 24]]            reduce_1Block_kernel<float, 128, 7, cublasGe     36.0      2.7     0.098        45
+vllm::qwen_gdn_attention_core_stan [[1, 2560], [1, 12], [1, 12]]      _causal_conv1d_update_kernel                     36.0      2.7     0.097          
+aten::mm                           [[1, 2560], [2560, 512]]           cublasLt::splitKreduce_kernel<32, 16, int, f     48.0      2.0     0.097      1296
+aten::arange                       [[0]]                                                                               76.9      1.2     0.095          
+vllm::qwen4_exp_qsa_with_output    [[1, 2560], [1], [1, 6, 256]]      _qsa_merge_splitk_kernel                         12.0      7.5     0.089          
+aten::mm                           [[1, 2560], [2560, 640]]           gemv2T_kernel_val<int, int, __half, float, f     12.0      7.4     0.088       445
+(no cpu op)                                                           layer_norm_fwd_kernel                            36.0      2.3     0.082          
+aten::mm                           [[1, 2560], [2560, 10240]]         cutlass_70_wmma_tensorop_f16_s161616gemm_f16      1.0     80.4     0.080       652
+aten::fill_                        [[1, 12, 128]]                     at::native::vectorized_elementwise_kernel<4,     36.0      1.7     0.062         2
+_C_cache_ops::reshape_and_cache_fl [[1, 1, 256], [1, 1, 256], [22589, reshape_and_cache_flash_kernel<unsigned shor     12.0      4.9     0.059          
+vllm::qwen4_exp_qsa_with_output    [[1, 2560], [1], [1, 6, 256]]      _qsa_pre_indexer_kernel                          12.0      4.9     0.059          
+aten::mean                         [[1, 6, 256]]                      at::native::reduce_kernel<512, 1, at::native     12.0      4.7     0.056         1
+_C::rotary_embedding               [[1], [1, 1536], [1, 256]]         rotary_embedding_kernel<c10::Half, c10::Half     12.0      4.3     0.051          
+aten::add                          [[256]]                            at::native::vectorized_elementwise_kernel<4,     24.0      2.0     0.049         0
+
+-- per kernel family (top 14, ms per step, share of kernel time)
+cross_device_reduce_1stage<__half, 4>                                      169.403   92.8%
+gemv2T_kernel_val<int, int, __half, __half, __half, float, 128, 16, 4,       3.344    1.8%
+gemv2T_kernel_val<int, int, __half, float, float, float, 128, 16, 4, 4       1.978    1.1%
+                                                                             1.445    0.8%
+ncclDevKernel_AllGather_RING_LL                                              0.948    0.5%
+cutlass_70_wmma_tensorop_f16_s161616gemm_f16_16x16_64x2_tn_align8>           0.533    0.3%
+cublasLt::splitKreduce_kernel<32, 16, int, float, __half, float, __hal       0.508    0.3%
+_sm70_qwen38_router_topk_runtime_m_kernel                                    0.307    0.2%
+_hc_combine_norm_kernel                                                      0.298    0.2%
+at::native::_scatter_gather_elementwise_kernel<128, 8, at::native::_cu       0.279    0.2%
+_qsa_sparse_paged_gqa_splitk_kernel                                          0.277    0.2%
+_hc_gate_mix_kernel                                                          0.266    0.1%
+_qsa_mqa_paged_kernel                                                        0.236    0.1%
+gemv2T_kernel_val<int, int, __half, __half, __half, float, 128, 16, 2,       0.202    0.1%

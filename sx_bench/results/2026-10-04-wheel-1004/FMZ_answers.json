@@ -1,0 +1,43 @@
+{
+ "port": 8141,
+ "needle": [
+  {
+   "words": 8000,
+   "prompt_tokens": 8732,
+   "correct": 8,
+   "of": 8,
+   "seconds": 2.2,
+   "answer": "{\n  \"Halden\": \"860791\",\n  \"Moravia\": \"946734\",\n  \"Tressel\": \"834060\",\n  \"Quillon\": \"612593\",\n  \"Berwick\": \"431552\",\n  \"Isolde\": \"957757\",\n  \"Ferrand\": \"697577\",\n  \"Oskarn\": \"198701\"\n}"
+  },
+  {
+   "words": 24000,
+   "prompt_tokens": 25792,
+   "correct": 8,
+   "of": 8,
+   "seconds": 5.2,
+   "answer": "{\n  \"Halden\": \"522567\",\n  \"Moravia\": \"543965\",\n  \"Tressel\": \"610573\",\n  \"Quillon\": \"770357\",\n  \"Berwick\": \"313450\",\n  \"Isolde\": \"631414\",\n  \"Ferrand\": \"552773\",\n  \"Oskarn\": \"293381\"\n}"
+  }
+ ],
+ "short": [
+  {
+   "question": "计算 37×43+125 等于多少？只输出数字。",
+   "answer": "1721",
+   "ok": false
+  },
+  {
+   "question": "把这些数字从小到大排序：42, 7, 19, 88, 3, 56。只输出排序结果，用英文逗号分隔。",
+   "answer": "3, 7, 19, 42, 56, 88",
+   "ok": true
+  },
+  {
+   "question": "What is the capital of Australia? Answer with one word.",
+   "answer": "Canberra",
+   "ok": true
+  },
+  {
+   "question": "把这句话翻译成英文：今天的会议推迟到明天下午三点。",
+   "answer": "Today's meeting has been postponed to 3:00 PM tomorrow.",
+   "ok": true
+  }
+ ]
+}

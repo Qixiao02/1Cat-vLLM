@@ -2,12 +2,12 @@
 
 本分支基于 1Cat 官方代码修改，面向 4 张 V100 上的 Swift 1.5 Qwen3.8-Flash-Next，重点优化 prefill、KV 缓存容量和并发吞吐。官方原版请看 [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)。
 
-This is a heavily modified fork of 1Cat-vLLM (branch `1cat-vllm-heavily-modified-v1`, latest tag `1cat-vllm-heavily-modified-v1-1003`, previous `-1001` and `-0930`, based on upstream `main@02c87ab89`) tuned for prefill, KV capacity and concurrency of Swift 1.5 Qwen3.8-Flash-Next on 4x V100. See [HEAVILY_MODIFIED.md](HEAVILY_MODIFIED.md) for the changes and switches.
+This is a heavily modified fork of 1Cat-vLLM (branch `1cat-vllm-heavily-modified-v1`, latest tag `1cat-vllm-heavily-modified-v1-1004`, previous `-1003`, `-1001` and `-0930`, based on upstream `main@02c87ab89`) tuned for prefill, KV capacity and concurrency of Swift 1.5 Qwen3.8-Flash-Next on 4x V100. See [HEAVILY_MODIFIED.md](HEAVILY_MODIFIED.md) for the changes and switches.
 
 | 项 | 值 |
 |---|---|
-| 最新版本 | tag `1cat-vllm-heavily-modified-v1-1003`（2026-10-03），[下载 wheel](https://github.com/Qixiao02/1Cat-vLLM/releases/tag/1cat-vllm-heavily-modified-v1-1003)（Linux x86_64，Python 3.12，CUDA 12.8，torch 2.10，只支持 V100 / sm_70） |
-| 上一个版本 | tag `1cat-vllm-heavily-modified-v1-1001`，更早 `1cat-vllm-heavily-modified-v1-0930` |
+| 最新版本 | tag `1cat-vllm-heavily-modified-v1-1004`（2026-10-04），[下载 wheel](https://github.com/Qixiao02/1Cat-vLLM/releases/tag/1cat-vllm-heavily-modified-v1-1004)（Linux x86_64，Python 3.12，CUDA 12.8，torch 2.10，只支持 V100 / sm_70） |
+| 上一个版本 | tag `1cat-vllm-heavily-modified-v1-1003`（2026-10-03），更早 `1cat-vllm-heavily-modified-v1-1001`、`1cat-vllm-heavily-modified-v1-0930` |
 | 默认分支 | `1cat-vllm-heavily-modified-v1` |
 | 基于 | 官方 `main@02c87ab89`（v1.5.0 之后第 670 个提交），另移植了官方之后的几项修复 |
 | 验证过的组合 | 4 张 V100-SXM2-32GB，TP4，Swift 1.5 Qwen3.8-Flash-Next NVFP4 |
@@ -37,6 +37,8 @@ This is a heavily modified fork of 1Cat-vLLM (branch `1cat-vllm-heavily-modified
 **简单说**：除了贪心 decode 的 4–8 并发（官方快 7–10%），本分支在 prefill、长上下文、采样 decode、KV 缓存容量、高并发和开 MTP 上都更好。和上一版 1001 相比，开 MTP 的单请求写代码从 169 提到 202 token/s，已经超过官方（第 5 组）。
 
 > [!NOTE]
+> - **1004 相对 1003 只有一处行为变化**：KV 稳态预算对两条 Qwen3.8 TP4 通道默认打开（改动第 11 项）。同样的启动参数下 KV 容量、速度和输出都不变（[第 8 组](#8-kv-稳态预算默认开显存验证2026-10-04)），下面表里 1003 的实测数字对 1004 同样适用。
+> - **本 README 里所有测试都不开视觉**（`--language-model-only`）。开视觉时快速通道不进，decode 慢约 23%，prefill 慢约 36%（[第 9 组](#9-开视觉和-fp8-kv-各自的代价2026-10-04)）；最佳启动参数见[快速开始](#快速开始)。
 > - **官方 `main@e53d02171`（2026-10-03，v1.5.1 之后 145 个提交）在本测试环境里起不来**：权重加载和 CUDA graph 捕获都正常，最后一步预热时 4 张卡同时停在一次 GPU 同步上，GPU 利用率 0%，复现 3 次，没有定位到具体提交。所以对比用的是官方最新发布版 v1.5.1。证据和排查过程见第 5 组。
 > - 官方 v1.5.1 的 wheel 要求 GLIBC ≥ 2.38，而官方自己的镜像是 Ubuntu 22.04，装不上。官方一侧因此装在 Ubuntu 24.04 镜像里：依赖和 CUDA 工具链取自官方镜像（版本和 wheel 声明的一致），只有 vllm 换成官方发布的 wheel。它不是官方原样镜像。
 > - 官方用它自己能稳定运行的参数：前缀缓存关时显存利用率 0.94；**前缀缓存开时 0.94 和 0.92 都会在 4 并发或 8 并发的 8K 预填充时显存溢出（引擎死亡），只有 0.90 能稳定运行**，所以前缀缓存开的对比用 0.90。开 MTP 时官方用 0.92 加每步 prefill 4096（官方文档受支持的值），0.95 加 8192 会在第一个 8K 请求时显存溢出。
@@ -44,13 +46,13 @@ This is a heavily modified fork of 1Cat-vLLM (branch `1cat-vllm-heavily-modified
 
 ## 快速开始
 
-**1. 下载**：从 [Release 页面](https://github.com/Qixiao02/1Cat-vLLM/releases/tag/1cat-vllm-heavily-modified-v1-1003) 下载 `1cat_vllm-1.5.1+heavily.modified.v1.1003.torch2.10.cu128-cp312-cp312-linux_x86_64.whl`，并用 Release 里的 `SHA256SUMS` 核对。
+**1. 下载**：从 [Release 页面](https://github.com/Qixiao02/1Cat-vLLM/releases/tag/1cat-vllm-heavily-modified-v1-1004) 下载 `1cat_vllm-1.5.1+heavily.modified.v1.1004.torch2.10.cu128-cp312-cp312-linux_x86_64.whl`，并用 Release 里的 `SHA256SUMS` 核对。
 
 **2. 安装**：
 
 ```bash
 python3.12 -m venv venv && . venv/bin/activate
-pip install ./1cat_vllm-1.5.1+heavily.modified.v1.1003.torch2.10.cu128-cp312-cp312-linux_x86_64.whl
+pip install ./1cat_vllm-1.5.1+heavily.modified.v1.1004.torch2.10.cu128-cp312-cp312-linux_x86_64.whl
 ```
 
 pip 会从 download.pytorch.org 装 torch 2.10.0+cu128（地址写在 wheel 的元数据里），从 PyPI 装 flashinfer 0.6.11.post2 等依赖。运行时还需要：
@@ -59,7 +61,12 @@ pip 会从 download.pytorch.org 装 torch 2.10.0+cu128（地址写在 wheel 的�
 - 约 48 GiB 可锁定的主机内存，放 PLE 表。
 - 原生内核只为 sm_70 编译，只能在 V100 上跑。
 
-**3. 启动**（作者线上服务用的参数）：
+**3. 启动**：下面是本分支测过的最佳启动参数（4 张 V100-SXM2-32GB，TP4）。两套都**不开视觉**，都带 `--language-model-only`。
+
+> [!IMPORTANT]
+> **本 README 里所有测试，以及作者线上服务，都不开视觉。** 模型文件本身带视觉部分（`Qwen4ExpForConditionalGeneration`，含 333 个视觉权重），但本分支的快速通道（双编译、PLE 默认值、KV 稳态预算等自动设置）在代码里只对带 `--language-model-only` 的启动放行；不带这个参数时这些自动设置都不会生效。**实测**（同一镜像，一次只改一项，见[第 9 组](#9-开视觉和-fp8-kv-各自的代价2026-10-04)）：只去掉 `--language-model-only`，1 并发 decode 98.4 → 75.6 token/s（−23%），prefill 6,323 → 4,030 token/s（−36%）。视觉功能本身能用（发两张纯色图问颜色，回答正确）。
+
+**A. 不开 MTP**（多并发，作者线上服务在用；上面效果一览里“不开 MTP”的各行用的就是它）：
 
 ```bash
 vllm serve <模型目录> \
@@ -70,6 +77,31 @@ vllm serve <模型目录> \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
   --language-model-only
 ```
+
+**B. 开 MTP**（k=4，单请求最快；效果一览里“开 MTP”的各行用的是它）。和 A 比有三处不同：上下文 32768、并发上限 16、加 `--speculative-config`：
+
+```bash
+vllm serve <模型目录> \
+  --tensor-parallel-size 4 --dtype half --attention-backend FLASH_ATTN_V100 \
+  --max-model-len 32768 --max-num-seqs 16 --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.87 --kv-cache-dtype auto --trust-remote-code \
+  --enable-prefix-caching --enable-chunked-prefill \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
+  --language-model-only \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":4}'
+```
+
+**开 MTP 的显存利用率**：B 里写的 0.87 是速度最好的值。想要更大的 KV 缓存可以改成 0.93：KV 89,367 → 109,723 token（+23%），单请求、写代码和聊天的速度不变，4 并发 8K 贪心每路 decode 低约 4%（1003 手填预留量时也是低 4%，两次一致）。再设 `SX_OPT_KV_STEADY_RESERVE_MIB=2012`（启动日志的自检给出的建议值，默认是 2227）还能多一些，约 120,000 token（1003 手填 1990 时实测 120,645），代价是压测峰值时剩余显存降到约 640 MiB。A 保持 0.90。数据见[第 8 组](#8-kv-稳态预算默认开显存验证2026-10-04)。
+
+**这两项不要加**（实测，以上面的 A 为基准，数据见[第 9 组](#9-开视觉和-fp8-kv-各自的代价2026-10-04)）：
+
+| 偏离 A 的参数 | 1 并发 decode | 1 并发 prefill | KV 容量 |
+|---|---|---|---|
+| 去掉 `--language-model-only`（开视觉） | −23% | −36% | −5% |
+| 加 `--kv-cache-dtype fp8_e4m3`（没有标定的 scale） | −24% | −7% | +81% |
+| 两项都有（别人用的那条命令，另有几处不同） | −25% | −21% | +78% |
+
+原因：本分支的快速通道只在“不开视觉、FP16 KV”时放行，任何一项不满足，整条通道（双编译、融合内核等的自动设置）都不进，所以两项一起也不会比单项更慢。
 
 环境变量（`SX_OPT_*` 开关全部保持默认，即开）：
 
@@ -83,11 +115,12 @@ vllm serve <模型目录> \
 | `VLLM_SM70_NVFP4_MOE_GROUPED_DECODE` | `1` | 打开 NVFP4 MoE 的分组 decode 内核，改动第 3 项的分组 decode 依赖它 |
 | `VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS` | `240` | 预热时 MoE 内核调优覆盖的上限，240 对应 24 行（每个 token 选 10 个专家） |
 
-**默认关闭的可选开关**（1003 新增，都不在上面的启动命令里，需要时再开）：
+**KV 稳态预算（1004 起默认开）**：上面两套参数所在的 Qwen3.8 TP4 通道会自动打开 `SX_OPT_KV_STEADY_BUDGET`（日志里有 `Auto-enabling the KV steady-state budget`），不用设环境变量。它让显存用量在启动预热时就定下来（压测期间不再增长），并给 KV 缓存容量加一道“稳态峰值时剩余显存不低于 576 MiB”的上限。**同样的启动参数下 KV 容量和以前一样**（A：410,988 token，B：89,367 token）。想要更大的 KV：开 MTP 的 B 把 `--gpu-memory-utilization` 提到 0.93，KV 多 23%（109,723 token）；不开 MTP 的 A 没有空间（卡已经到顶，util 调到 0.94 也只多 1.4%）。数据见[第 8 组](#8-kv-稳态预算默认开显存验证2026-10-04)。设 `SX_OPT_KV_STEADY_BUDGET=0` 关闭，回到 1003 的行为。
+
+**默认关闭的可选开关**（都不在上面的启动命令里，需要时再开）：
 
 | 环境变量 | 作用 | 备注 |
 |---|---|---|
-| `SX_OPT_KV_STEADY_BUDGET=1`，配 `SX_OPT_KV_STEADY_RESERVE_MIB=1990` 和更高的 `--gpu-memory-utilization` | 按稳态峰值给 KV 缓存定容量，容量更大 | 只在**开 MTP**时测过：KV 89,367 → 120,645 token（util 0.87 → 0.93），见[第 6 组](#6-开-mtp-的-kv-稳态预算默认关2026-10-03)。不开 MTP 的预留量没有测过 |
 | `SX_OPT_COMPILE_CACHE=1` 或 `aot` | 重启时复用 torch.compile 缓存 | 输出一致性没有验证，**生产不要开**，见[已知限制](#已知限制) |
 | `SX_OPT_MTP_HC_BATCH`、`SX_OPT_MTP_ROUTER_BATCH`、`SX_OPT_MTP_SHARED_BATCH`、`SX_OPT_MTP_GDN_INPUT_BATCH` | 开 MTP 时的批路由 | 每张卡多占约 525 MiB，KV 容量少约三分之一，只换约 3–4% 的单请求速度，所以默认关 |
 
@@ -109,7 +142,7 @@ vllm serve <模型目录> \
 | 8 | 移植官方 11 项 MTP 路径：MTP 通道的精确 gated RMSNorm、混合 QKV 的 GDN 验证、PLE 回滚加短卷积、融合的 GDN 元数据、分组 W5 专家、FP16 精确草稿 MoE、router 打包键；以及 HC、router、共享专家、GDN 输入的 4 个批路由 | 开 MTP 时单请求比官方慢 | 官方 `main@d30469863` 上的提交，逐项移植 + **本分支**（显存取舍：4 个批路由默认关） | 开 MTP 时开；4 个批路由**关**，见[可选开关](#快速开始) | 1003 |
 | 9 | 启动提速：PLE 表按精确大小锁定内存；MoE 加载按专家名建索引；更省的加载检查 | 冷启动慢、主机内存峰值高 | **本分支** | 开 | 1003 |
 | 10 | 可选：torch.compile 缓存复用（`SX_OPT_COMPILE_CACHE`） | 重启时的编译时间 | **本分支**（含官方 #675 的修复） | **关** | 1003 |
-| 11 | 可选：KV 稳态预算（`SX_OPT_KV_STEADY_BUDGET`） | 开 MTP 时显存利用率只能设得很保守，KV 容量小 | **本分支** | **关** | 1003 |
+| 11 | KV 稳态预算（`SX_OPT_KV_STEADY_BUDGET`） | 显存峰值要到压测时才涨上去，显存利用率只能设得很保守；开 MTP 时 KV 容量小 | **本分支** | 开（两条 Qwen3.8 TP4 通道；其他模型不开） | 1003 加入，1004 起默认开 |
 | 12 | 采样参数校验：越界的停止词 ID、空白的 bad words | 越界请求可能造成 GPU 越界写 | 官方提交 `36259988e`（cherry-pick） | 开 | 1003 |
 
 关于从官方移植的几项：
@@ -265,11 +298,13 @@ V100 实测（4 条冷 prompt 同时发出，KV 占用峰值，见实测第 2 �
 </details>
 
 <details>
-<summary>11. 可选：KV 稳态预算（版本 1003 新增，默认关）</summary>
+<summary>11. KV 稳态预算（版本 1003 加入，1004 起默认开）</summary>
 
-引擎按 profile 那一步量出的显存算 KV 缓存容量，而这一步没有 KV、没有注意力，之后才分配的东西（CUDA graph 池、各 stream 的工作区、第一次长请求的注意力和 GDN 工作区）都不在预算里。开 MTP 时显存峰值比 util 设定的预算高约 3.3–3.5 GiB，所以 util 不敢设高。`SX_OPT_KV_STEADY_BUDGET=1` 在定容量前先预留这部分（`SX_OPT_KV_STEADY_RESERVE_MIB`，开 MTP 实测用 1990 MiB），并用一次满 chunk 的预热量出懒分配的工作区，让 util 可以设到 0.93。
+引擎按 profile 那一步量出的显存算 KV 缓存容量，而这一步没有 KV、没有注意力，之后才分配的东西（CUDA graph 池、各 stream 的工作区、第一次长请求的注意力和 GDN 工作区）都不在预算里。结果是显存峰值要到压测时才涨上去（不开 MTP：启动后 30.2 GB，压测时涨到 32.2 GB，整卡可用 32.5 GB），显存利用率不敢设高。`SX_OPT_KV_STEADY_BUDGET` 做三件事：用一次满 chunk 的预热把这些懒分配的工作区在启动时就量出来；graph 捕获后释放捕获 stream 缓存的空闲块；定 KV 容量时再加一道物理上限：`KV ≤ 预热后的剩余显存 − 激活峰值 − 稳态还要分配的量 − 576 MiB`。
 
-实测见[第 6 组](#6-开-mtp-的-kv-稳态预算默认关2026-10-03)：开 MTP 时 KV 缓存 89,367 → 120,645 token（多 35%）。**只在开 MTP 的这一种形状上测过**；不开 MTP 时合适的预留量没有测。
+**1004 起默认开**，只对两条已经实测过“稳态还要分配的量”的通道：Qwen3.8 TP4 不开 MTP，和原生 MTP（k=1–7，均匀验证行）。其他模型保持原来的定容量方式。设 `SX_OPT_KV_STEADY_BUDGET=0` 关闭，`=1` 是显式打开。`SX_OPT_KV_STEADY_RESERVE_MIB` 可以手填“稳态还要分配的量”：启动日志的 audit 行会给出建议值（开 MTP、util 0.93 是 2012），填上能把 KV 容量提到刚好满足 576 MiB 余量。
+
+实测见[第 8 组](#8-kv-稳态预算默认开显存验证2026-10-04)：同样的启动参数下 KV 容量不变，压测期间显存不再增长；开 MTP 把 util 提到 0.93，KV 多 23%。1003 手动打开时的测量见[第 6 组](#6-开-mtp-的-kv-稳态预算默认关2026-10-03)。
 
 </details>
 
@@ -299,15 +334,18 @@ V100 实测（4 条冷 prompt 同时发出，KV 占用峰值，见实测第 2 �
 > - KV 缓存容量多 65%，但开 MTP 时每条在跑的请求固定占约 13% 的缓存池，4 条 32K 并发仍然放不下。
 > - 每张卡显存峰值 32,267 MiB，整卡 32,768 MiB，余量约 500 MiB。
 > - scale 只覆盖标定时见过的数值范围，超出的会被截断。我们的标定只用了 18 条请求，prompt 最长 36K token。
-> - 不开 MTP 时用 E4M3，本分支的各项优化会回到官方路径，这个组合没有测过。
+> - 不开 MTP 时用 E4M3，本分支的各项优化会回到官方路径：实测 1 并发 decode 慢 24%，KV 容量多 81%（[第 9 组](#9-开视觉和-fp8-kv-各自的代价2026-10-04)）。
 
 ## 实测测试对比
 
 | 组 | 比什么 | 结论 |
 |---|---|---|
 | [5](#5-本分支-1003-对官方最新发布版-v1512026-10-03) | **本分支 1003 对官方最新发布版 v1.5.1**（不开 MTP 前缀缓存开、关，开 MTP；各用能稳定运行的参数） | prefill 快 9–85%，KV 容量多 37%（缓存关）和 2.03 倍（缓存开），采样 decode 快约 19%；贪心 decode 4–8 并发官方快 7–10%；开 MTP 4 并发快约 50%、单请求快 9–17%；官方 main 起不来 |
-| [6](#6-开-mtp-的-kv-稳态预算默认关2026-10-03) | 开 MTP：KV 稳态预算开 / 关 | KV 缓存多 35%（89,367 → 120,645 token）；4 并发 decode 低 2–4%（单遍，不确定是否噪声） |
+| [6](#6-开-mtp-的-kv-稳态预算默认关2026-10-03) | 开 MTP：KV 稳态预算开 / 关（1003 手动打开，预留量手填 1990 MiB） | KV 缓存多 35%（89,367 → 120,645 token）；4 并发 decode 低 2–4%（单遍，不确定是否噪声）；1004 起默认开，见第 8 组 |
 | [7](#7-发行的-wheel1003的验证2026-10-03) | 发行的 wheel（1003）对第 5 组用的覆盖镜像 | 答案逐字相同 7/7，KV 容量相同；decode 差异在 ±0.6% 以内，prefill 除一格（−5.5%，第一遍）外在 1% 以内 |
+| [8](#8-kv-稳态预算默认开显存验证2026-10-04) | KV 稳态预算默认开：显存验证（不开 MTP 和开 MTP，开关设 0 / 默认） | 同样的启动参数下 KV 容量不变，压测期间显存不再增长（不开 MTP 最坏情况多 436 MiB 余量）；开 MTP 的 util 0.93 下 KV 多 23% |
+| [9](#9-开视觉和-fp8-kv-各自的代价2026-10-04) | 开视觉、FP8 KV 各自的代价（一次只改一项，不开 MTP） | 各自让 1 并发 decode 慢 23% / 24%，一起也是 25%：快速通道只在不开视觉且 FP16 KV 时放行；视觉功能能用 |
+| [10](#10-单步-decode-的时间花在哪2026-10-04) | 单步 decode 的时间花在哪（CUDA graph，1–24 并发，8K–32K 上下文） | 一步从 11 ms（1 并发）到 29 ms（24 并发）；稠密 GEMM 加 HC 占 GPU 忙的 43–53%，kernel 间隙占 7–13% |
 | [1](#1-对官方-maind30469863双方各用最佳参数2026-10-01) | 本分支 1001 对官方 `main@d30469863`（2026-10-01 时的最新），双方各用最佳参数（不开 MTP 和开 MTP） | prefill 快 1.1–1.6 倍，KV 多 33%，采样 decode 快约 20%；贪心 decode 4–8 并发官方快 8–11%；开 MTP 时 4 并发快 36–45%，单请求官方快 4–13% |
 | [2](#2-发行的-wheel1001对-0930-的镜像2026-10-01) | 发行的 wheel（1001）对 0930 的镜像 | 输出逐字相同，速度相同，64K 的 KV 占用峰值从 86.1% 降到 64.4% |
 | [3](#3-开-mtpfp16-kv-对-e4m3-kv2026-09-30) | 本分支开 MTP 时 FP16 KV 对 E4M3 KV | E4M3 的 KV 容量多 65%，4 并发 decode 减半 |
@@ -482,6 +520,8 @@ needle（长文里找 8 个验证码）加 4 道短题，贪心、关思考。**
 
 ### 6. 开 MTP 的 KV 稳态预算（默认关，2026-10-03）
 
+> 这一组是 1003 时手动打开开关的测量（预留量要手填 1990 MiB）。**1004 起这个开关对两条 Qwen3.8 TP4 通道默认打开，预留量由通道参考值给出**，见[第 8 组](#8-kv-稳态预算默认开显存验证2026-10-04)；下面的数据和标题保持 1003 时的样子。
+
 开 MTP 时，引擎按启动时量出的显存算 KV 缓存容量，之后才分配的东西（CUDA graph 池、各 stream 的工作区）不在预算里，所以显存利用率只能设得很保守。“KV 稳态预算”（`SX_OPT_KV_STEADY_BUDGET=1`）先把这部分预留出来，让显存利用率可以设高。下面比较打开前后，只差三项：
 
 | | 默认（不开稳态预算，显存利用率 0.87） | 打开稳态预算（`SX_OPT_KV_STEADY_RESERVE_MIB=1990`，显存利用率 0.93） |
@@ -527,6 +567,88 @@ wheel 用仓库自己的 `docker/Dockerfile` 从源码构建（CUDA 12.8.1，只
 - decode 的差异都在 ±0.6% 以内，prefill 除一格外都在 1% 以内，属于测量波动。唯一的例外是 8K 贪心 4 并发的 prefill 低 5.5%：两遍分别是 5,976 和 6,529，第一遍偏低；这次用的是全新缓存，第一遍可能还含一部分内核编译，**这是推测，没有单独验证**。
 - 官方的发布产物检查脚本（按官方 `main@d30469863` 写的，要求 wheel 里带官方的 27B 启动脚本）对这个 wheel 报 `missing packaged V100 release launcher`。本分支不打包官方的启动脚本，所以这项检查不适用，1001 的 wheel 也是同样的结果。
 - 原始数据在 [`sx_bench/results/2026-10-03-fork-vs-official-v1.5.1/`](sx_bench/results/2026-10-03-fork-vs-official-v1.5.1/)，文件名前缀是 `F1W`（含义见第 5 组末尾“文件名对照”）；脚本是 `sx_bench/as_run/build_1003.sh` 和 `validate_wheel_1003.sh`。tag 在 `e673bd168` 之后只多了文档和数据的改动。
+
+### 8. KV 稳态预算默认开：显存验证（2026-10-04）
+
+1004 把 KV 稳态预算改成默认开（只对两条 Qwen3.8 TP4 通道，见改动第 11 项）。这一组验证显存：用 1003 的镜像，把改过的三个 Python 文件（`vllm/config/vllm.py`、`vllm/v1/worker/gpu_worker.py`、`vllm/v1/worker/kv_steady_budget.py`）覆盖上去，每个配置启动后先空闲，再发 4 条 8K 加 2 条 16K 同时到达、然后一条 32K，每 2 秒记一次每张卡的 `memory.used`。每条通道先用 `SX_OPT_KV_STEADY_BUDGET=0` 跑一遍作为基线，再不设这个变量（默认）跑。可用显存按 CUDA 报告的 32,494 MiB 算。
+
+| 通道 | 开关 | util | KV 容量（token） | 压测期间每卡显存峰值（MiB） | 峰值时剩余（MiB） | 引擎自检 |
+|---|---|---|---|---|---|---|
+| 不开 MTP | 0 | 0.90 | 410,988 | 32,159 | 335 | — |
+| 不开 MTP | 默认 | 0.90 | 410,988 | 31,723（启动预热时就到了，压测中没再涨） | 771 | 通过，高出余量线 50 MiB |
+| 不开 MTP | 默认 | 0.94 | 416,912（+1.4%） | 31,557 | 937 | 差 22 MiB，只记警告 |
+| 开 MTP | 0 | 0.87 | 89,367 | 31,323 | 1,171 | — |
+| 开 MTP | 默认 | 0.87 | 89,367 | 31,091 | 1,403 | 通过，高出余量线 444–472 MiB |
+| 开 MTP | 默认 | 0.93 | 109,723（+23%） | 31,643 | 851 | 通过，高出余量线 340–366 MiB |
+
+所有请求都成功（每个配置 7/7），引擎日志没有显存溢出和异常；唯一的 ERROR 行是不开 MTP 的 util 0.94 那一格的自检提示（差 22 MiB），现在已降为警告（见下）。
+
+- **同样的启动参数下 KV 容量不变**（不开 MTP 0.90：410,988；开 MTP 0.87：89,367）。压测期间的显存峰值反而更低：不开 MTP 从 32,159 降到 31,723 MiB，最坏情况的剩余显存从 335 MiB 变成 771 MiB。原因是满 chunk 的预热把原来要等第一条长请求才分配的工作区提前到启动时，峰值在启动时就到了；如果卡放不下，启动就失败，而不是压测时才显存溢出。
+- **不开 MTP 通道想要更大的 KV 没有空间**：util 从 0.90 提到 0.94 只多 1.4%（410,988 → 416,912），因为 0.90 的原定容量本来就已经把卡用到了接近物理上限（0.9024 以上由物理上限决定）。所以对线上这套参数，默认开的价值是显存峰值更稳、更低，不是更大的容量。
+- **开 MTP 通道把 util 提到 0.93，KV 多 23%**（89,367 → 109,723）。引擎日志里的自检建议把 `SX_OPT_KV_STEADY_RESERVE_MIB` 设成 2012，设了之后 KV 约 120,000（1003 手填 1990 时是 120,645，见第 6 组），代价是峰值时剩余显存降到约 640 MiB。默认值（由通道参考值算出的 2227 MiB）比实测需要的 2012 多留了 215 MiB。
+- **开发过程中发现并修正的一个问题**：第一版“默认开”在不开 MTP 通道 util 0.90 下 KV 容量从 410,988 降到 325,088（−21%），因为上游风格的 graph 预留（激活峰值 1.10 GiB）又被算进了显存利用率上限，而通道参考值已经包含 graph 池。这一版从没发布；现在两条通道都不再重复扣这一项（显式设置的 `VLLM_V2_CUDAGRAPH_MEM_MIB` 仍然生效），其他模型保持原来的算法。第一版的原始数据保留在 `sx_bench/results/2026-10-04-kv-default-on/first-run-graph-reserve-charged/`。
+- 自检把差 64 MiB 以内的不足只记警告，不记错误（负载余量 384 MiB 是估计值：不开 MTP 压测实际比空闲多 0–238 MiB，开 MTP 多 448 MiB；不开 MTP 的 util 0.94 差 22 MiB 时实测峰值时仍剩 937 MiB）。设 `SX_OPT_KV_STEADY_STRICT=1` 仍然对任何不足直接拒绝启动。
+- 通道参考值：开 MTP 的参考值按 1003 的实测从 31,811 刷新为 31,467 MiB（util 0.87 下的峰值，MTP 移植后降低了）；不开 MTP 的参考值是 31,839 MiB（util 0.90；1003 代码的同一配置实测 31,831 MiB）。
+- 原始数据和脚本：[`sx_bench/results/2026-10-04-kv-default-on/`](sx_bench/results/2026-10-04-kv-default-on/)；脚本 `sx_tests/kv-steady-budget/run_on_v100.sh --switch auto`。
+
+#### 发行的 wheel（1004）的验证
+
+wheel 用仓库自己的 `docker/Dockerfile` 从提交 `4e888907c` 冷构建（BuildKit 缓存已清掉，50 分钟，CUDA 12.8.1，只编译 sm_70），202,699,723 字节，sha256 `ba934bbbeb3036aeea552141dfa803b2c5aad73828d0a74ec9d7d0b9cd92312b`。和 1003 的 wheel 比，Python 源码只有上面三个文件不同；CUDA 扩展库是重新编译的，字节上不同。验证镜像是 1003 的验证镜像换上这个 wheel（`--no-deps`），按生产参数启动，全新缓存目录；同一个镜像里每条通道各跑“默认”和“开关设 0”两组，prompt 和测法与第 5 组相同。
+
+| 项目 | 不开 MTP：开关设 0 | 不开 MTP：默认 | 开 MTP：开关设 0 | 开 MTP：默认 |
+|---|---|---|---|---|
+| util | 0.90 | 0.90 | 0.87 | 0.87 |
+| KV 缓存容量（token） | 410,988 | 410,988 | 89,367 | 89,367 |
+| 测试后每卡显存（MiB） | 32,317 | **31,485** | 31,619 | **31,091** |
+| 答案（needle 加 4 道短题，贪心） | 与 1003 的 wheel 逐字相同 | 逐字相同 | 与 1003 逐字相同 | 逐字相同 |
+| 8K 贪心 decode 每路，1 / 4 / 24 并发（token/s） | 98.5 / 63.1 / 35.4 | 98.3 / 62.9 / 35.5 | — | — |
+| 4 并发 8K–64K decode 每路（token/s） | 62.0 / 60.5 / 59.5 / 57.4 | 62.1 / 60.7 / 59.4 / 57.1 | — | — |
+| 写代码 / 聊天，单请求每路（token/s） | — | — | 202.0 / 124.4 | 201.5 / 124.2 |
+| 写代码 / 聊天，4 并发每路 | — | — | 129.3 / 87.6 | 124.9 / 85.1 |
+| 8K 贪心，1 / 4 并发每路 | — | — | 117.8 / 75.3 | 118.0 / 75.1 |
+| 引擎日志错误 | 0 | 0 | 0 | 0 |
+
+- **默认开对速度没有可测的影响**：不开 MTP 的 decode 差异在 ±0.7% 以内，prefill 除 4 并发 8K 一格（−5.6%：两遍是 5,957 和 6,461，第一遍偏低，对照的两遍都在 6,580 附近）外在 ±2% 以内。开 MTP 单请求持平；4 并发的写代码 −3.4%、聊天 −2.8%，但每轮产出的 token 数也同样低（4.21 对 4.25，2.51 对 2.70），差异来自接受率的波动，不是每步变慢；8K 贪心 4 并发 −0.2%。
+- **util 提高的两组**：不开 MTP util 0.94：KV 416,912（+1.4%），decode −0.7% 到 +0.2%，prefill 在 ±2% 以内，自检差 22 MiB（只记警告）。开 MTP util 0.93：KV 109,723（+23%），单请求、写代码、聊天持平，**8K 贪心 4 并发每路 72.1，比对照低 4.2%**（对照自己两遍相差 6%，所以可信度不高，但 1003 的同一格也是低 4%，符号一致）。
+- 对照里“开关设 0”的数字和 1003 的发行 wheel（第 7 组：98.3 / 63.1，4 并发 8K–64K 62.1 / 60.3 / 59.4 / 56.8）一致，说明重新编译的扩展库没有改变速度和输出。
+- 首个启动（不开 MTP 默认）647 秒，是因为用了全新缓存目录，要现编内核；之后的配置 406–542 秒。
+- 原始数据和汇总：[`sx_bench/results/2026-10-04-wheel-1004/`](sx_bench/results/2026-10-04-wheel-1004/)（`RESULTS.md` 里有每一格的两遍数据，由脚本 `sx_bench/as_run/make_wheel1004_report.py` 从日志算出）；构建和验证脚本是 `build_1004.sh`、`validate_wheel_1004.sh`。官方的发布产物检查脚本对这个 wheel 同样报 `missing packaged V100 release launcher`（本分支不打包官方的启动脚本，和 1001、1003 一样）。tag 在 `4e888907c` 之后只多了文档和数据的改动。
+
+### 9. 开视觉和 FP8 KV 各自的代价（2026-10-04）
+
+有人用本分支的启动命令，说复现不出我们的 prefill 和 decode 速度。他们的命令和线上参数有两处大的不同：没有 `--language-model-only`（开视觉），以及 `--kv-cache-dtype fp8_e4m3`。下面一次只改一项，其余照生产参数（不开 MTP，前缀缓存开，24 路，显存利用率 0.90）；同一台机器、同一个镜像（1003）、同一套压测（8K 输入、256 个贪心 token，每格 2 遍平均）。
+
+| 配置 | 1 并发 prefill（token/s） | 1 并发 decode 每路 | 2 并发 decode 每路 | KV 容量（token） |
+|---|---|---|---|---|
+| 生产参数（不开视觉，FP16 KV） | 6,323 | 98.4 | 75.9 | 410,988 |
+| 只开视觉（去掉 `--language-model-only`） | 4,030（−36%） | 75.6（−23%） | 60.1（−21%） | 388,772（−5%） |
+| 只用 FP8 KV | 5,864（−7%） | 74.7（−24%） | 59.6（−21%） | 744,150（+81%） |
+| 他们的完整命令（两项都有，另有 `--max-num-seqs 2` 等） | 5,005（−21%） | 73.7（−25%） | 58.4（−23%） | 731,633 |
+
+- **两项各自都让 decode 慢约四分之一，两项一起也不会更慢**。启动日志里能看到原因：生产参数启动时有 6 条“quality-qualified … no-MTP path”自动设置和一条“Auto-enabling the SM70 Qwen3.8 dual-compile lane”；只开视觉或只用 FP8 KV 时这 7 条都没有出现，快速通道整体没进。所以只去掉其中一项还不够，两项都要去掉。
+- 开视觉还多损失 prefill（1 并发 −36%）。推测是双编译通道没进，大块 prefill 走了另一条路径，没有单独验证。KV 容量少 5%，推测是视觉塔和编码器缓存占了显存，也没有单独验证。
+- **输出**：三组的 needle 答案（8 个验证码）逐字相同，4 道短题的答案也逐字相同（第 1 题 37×43+125 三组都答 1721，是模型自己的错）。FP8 KV 的启动日志有 `QSA E4M3 scale overlay is incomplete: 0/24 local K/V scales loaded`（没有标定的 scale，按 1 运行）：这次测的几个问题没出现差异，不等于没有数值风险。
+- **视觉功能本身能用**：开视觉的实例上发了两张 224×224 的纯色图（红、蓝）问主色，回答 `Red` 和 `Blue`。
+- 第 1 遍明显偏低的两格（FP8 的 2 并发 prefill 4,056 对 5,974，他们命令的 2 并发 prefill 2,957 对 5,727）没有单独验证原因，prefill 的“相对生产”对这两格不可靠；decode 两遍之间相差 1% 以内（开视觉 1 并发相差 4%）。“他们的完整命令”那一行来自更早的一次副线测试，镜像和压测相同。
+- 原始数据和脚本：[`sx_bench/results/2026-10-04-vision-fp8-probe/`](sx_bench/results/2026-10-04-vision-fp8-probe/)（`RESULTS.md` 是汇总，`theirs_command/` 是他们命令那次的数据，脚本 `vision_probe.sh`）。
+
+### 10. 单步 decode 的时间花在哪（2026-10-04）
+
+不开 MTP、生产参数、FP16 KV，CUDA graph 开着。每个窗口等所有请求都出了第一个 token 之后，抓 3 秒 decode（100–180 个 graph 步），不是整条请求。下表每个数都是窗口总量除以 graph 步数。
+
+| 上下文 × 并发 | 一步（ms） | GPU 忙（ms） | kernel 间隙（ms） | 每步 kernel 数 | 稠密 GEMM + HC（ms） | MoE（ms） | QSA 注意力（ms） | all-reduce（ms） |
+|---|---|---|---|---|---|---|---|---|
+| 8K × 1 | 11.06 | 9.66 | 1.40 | 1,465 | 5.13 | 1.15 | 0.94 | 0.62 |
+| 8K × 4 | 16.90 | 15.30 | 1.61 | 1,724 | 7.76 | 2.47 | 1.39 | 1.02 |
+| 8K × 8 | 21.22 | 19.39 | 1.83 | 1,868 | 8.84 | 3.40 | 2.14 | 1.11 |
+| 4K × 16 | 25.09 | 22.93 | 2.16 | 2,036 | 10.65 | 4.55 | 3.02 | 1.53 |
+| 2K × 24 | 28.89 | 26.93 | 1.96 | 1,987 | 11.57 | 5.48 | 3.88 | 2.18 |
+| 32K × 1 | 11.62 | 10.07 | 1.55 | 1,465 | 5.08 | 1.15 | 0.98 | 0.74 |
+
+- 一步的时间随并发近似线性涨：8 并发 → 24 并发多 7.7 ms，平均每多一路约 0.5 ms，所以合计吞吐还在涨（24 并发折合 831 token/s）。两个窗口的上下文不同（8K 和 2K），只是大致趋势。
+- 稠密 GEMM 加 HC 是最大的一块（GPU 忙的 43–53%）。1 并发时 HC 走自写的 FP16 融合内核，4 并发起落到通用 cutlass GEMM；自写的小批量 GEMV 内核用到 8 并发，16 并发起也落到通用 GEMM。8 并发、200 token 的 eager 剖析里，这些 GEMM 多数形状读权重的速度只有 180–550 GB/s（V100 的 HBM2 峰值约 900 GB/s；lm_head 那个最大的矩阵 690 GB/s）。
+- kernel 间隙占一步的 7–13%（每步 1,500–2,000 个 kernel）。
+- 家族分类按 kernel 名字划分，GDN 输入投影在 8 并发以内是自写内核（算 GDN），16 并发起落到通用 GEMM（算稠密 GEMM），所以家族列不能逐行直接比，上表只放了不受这点影响的几列。完整分类、前几名 kernel 和各 GEMM 形状的带宽见 [`sx_bench/results/2026-10-04-decode-profile/`](sx_bench/results/2026-10-04-decode-profile/)。
 
 ### 1. 对官方 main@d30469863：双方各用最佳参数（2026-10-01）
 
@@ -806,7 +928,8 @@ KV 占用峰值和抢占次数（4 并发）：
 
 - **适用范围**：只在 4 张 V100-SXM2-32GB（NVLink）、TP4、Swift 1.5 Qwen3.8-Flash-Next NVFP4（PLE 表以 FP8 存储）这一种组合上验证过，不开 MTP 和开 MTP（k=4）两种用法都测过。各项优化按这套硬件和模型的形状判断是否启用；其他组合会回到官方路径，能运行，但没有加速。PCIe 版 V100 没有测过，TP4 的 decode 靠 NVLink 做 all-reduce，预计会明显更慢。没有针对 Qwen3.8-27B 加 DFlash2 做调优或验证。
 - **版本标记**：默认分支是 `1cat-vllm-heavily-modified-v1`，版本用 git tag 标记。
-  - `1cat-vllm-heavily-modified-v1-1003`（最新，2026-10-03）：改动第 1–12 项。比 1001 多出第 8–12 项（MTP 路径、启动提速、两个默认关的开关、采样校验），都只改 Python 和已有的内核调用，`csrc` 与 1002 的构建相同。第 5、6 组测的是它。
+  - `1cat-vllm-heavily-modified-v1-1004`（最新，2026-10-04）：改动第 1–12 项，比 1003 的区别是改动第 11 项 KV 稳态预算对两条 Qwen3.8 TP4 通道默认开（只改 Python 文件，`csrc` 与 1003 相同；wheel 是重新冷构建的）。第 8、9、10 组测的是它或它的代码。
+  - `1cat-vllm-heavily-modified-v1-1003`（2026-10-03）：改动第 1–12 项。比 1001 多出第 8–12 项（MTP 路径、启动提速、两个默认关的开关、采样校验），都只改 Python 和已有的内核调用，`csrc` 与 1002 的构建相同。第 5、6 组测的是它。
   - `1cat-vllm-heavily-modified-v1-1001`：改动第 1–7 项。比 0930 多出的第 6、7 项只改 Python 文件，不开 MTP 时输出与 0930 逐字相同（第 2 组）。第 1、2 组测的是它；第 3 组测的是它的代码，当时还没有第 7 项。
   - `1cat-vllm-heavily-modified-v1-0930`：改动第 1–5 项，引擎代码同 2026-09-28。第 4 组和历史记录里的测量用的是它。
   - 运行中的引擎在 `/version` 返回的是编译进去的包版本。1003 的 wheel 包版本是 `1.5.1+heavily.modified.v1.1003.torch2.10.cu128`，`/version` 返回 `1.5.1+heavily.modified.v1.1003.torch2.10`（构建时自动加的 `.cu128` 只在 wheel 元数据里）；1001 同理；0930 的构建是 `1.5.1+heavily.modified.v1`。
@@ -826,7 +949,7 @@ Flash-Next 的注意力（QSA）只支持下面两种 KV 缓存格式，没有�
 | 本分支的快速通道 | 开不开 MTP 都有 | 只有开 MTP 并设置 `VLLM_QWEN4EXP_QSA_E4M3_MTP=1` 时有 |
 
 - E4M3 只压缩主 K/V，QSA 的索引缓存仍是 FP16，所以容量是多 65%，不是翻倍。
-- 不开 MTP 时也可以用 `--kv-cache-dtype fp8_e4m3` 启动（需要 24 个目标层 scale），但本分支的通道检查在这个组合下只认 FP16，各项优化会回到官方路径。这个组合没有测过。
+- 不开 MTP 时也可以用 `--kv-cache-dtype fp8_e4m3` 启动（需要 24 个目标层 scale），但本分支的通道检查在这个组合下只认 FP16，各项优化会回到官方路径。实测（[第 9 组](#9-开视觉和-fp8-kv-各自的代价2026-10-04)）：1 并发 decode 慢 24%，KV 容量多 81%，没有标定的 scale 按 1 运行。
 - 官方只为它自己发布的模型提供 scale。后训练过或重新转换过的模型（例如 Swift 1.5）要自己标定。
 
 启用 E4M3 KV 的步骤（我们跑的全流程脚本是 [`sx_bench/as_run/e4m3_chain.sh`](sx_bench/as_run/e4m3_chain.sh)，工具在 `tools/qwen4_exp/`）：
@@ -839,10 +962,11 @@ Flash-Next 的注意力（QSA）只支持下面两种 KV 缓存格式，没有�
 
 ### 已知限制
 
-- **MTP 通道**：生产环境请保持关闭。1003 的 MTP 速度已经高于官方 v1.5.1（第 5 组），但 KV 缓存只有 89,367 token（默认，显存利用率 0.87）或 120,645 token（打开 KV 稳态预算，0.93），两种都放不下 4 条 32K 并发；每张卡显存峰值 31.5–31.9 GiB，整卡 32 GiB，余量不到 1 GiB；E4M3 KV 下 4 并发的 decode 速度减半（第 3 组，那是 1001 的数据）。4 个批路由默认关（改动第 8 项）。MTP 只测了 1 并发和 4 并发，没有测 8 并发以上，也没有测 MTP 下的长上下文和 128K。
+- **MTP 通道**：生产环境请保持关闭。1003 的 MTP 速度已经高于官方 v1.5.1（第 5 组），但 KV 缓存只有 89,367 token（util 0.87）、109,723 token（util 0.93，1004 默认）或约 120,000（util 0.93 加 `SX_OPT_KV_STEADY_RESERVE_MIB=2012`），都放不下 4 条 32K 并发；每张卡显存峰值 31.1–31.9 GiB，整卡 32 GiB，余量不到 1 GiB；E4M3 KV 下 4 并发的 decode 速度减半（第 3 组，那是 1001 的数据）。4 个批路由默认关（改动第 8 项）。MTP 只测了 1 并发和 4 并发，没有测 8 并发以上，也没有测 MTP 下的长上下文和 128K。
+- **视觉**：本 README 的所有测试都不开视觉（`--language-model-only`）。开视觉时快速通道不进，decode 慢约 23%，prefill 慢约 36%（第 9 组）；视觉功能本身能用，但没有测过图片请求的速度，也没有开视觉时的长上下文和并发数据。
 - **和官方的对比有边界**（第 5 组）：官方一侧是 v1.5.1 发布版，装在我们自己做的 Ubuntu 24.04 镜像里，不是官方原样镜像；官方 `main@e53d02171` 在我们的环境里起不来，没有拿它比；两边的参数不完全相同（并发数、显存利用率，开 MTP 时每步 prefill 8192 对 4096）；每格只有 1–2 遍。官方在前缀缓存开时只有显存利用率 0.90 能稳定运行，这个限制和我们用的是同一台机器、同一个模型，换硬件结论可能不同。
 - **torch.compile 缓存复用（改动第 10 项）没有验证输出一致性**：一致性测试脚本写好了但没有在 V100 上跑过，没有实测数据，所以默认关，生产不要开。
-- **KV 稳态预算（改动第 11 项）只在开 MTP 时测过**：不开 MTP 时合适的预留量没有测；开 MTP 时 4 并发的 decode 比默认低 2–4%（单遍，不确定是不是噪声）。
+- **KV 稳态预算（改动第 11 项，1004 起默认开）**：只对两条已有实测参考值的 Qwen3.8 TP4 通道生效，参考值来自 4×V100-SXM2-32GB；换别的卡或别的形状（并发数、MTP 的 k）要看启动日志里的 audit 行，必要时手填 `SX_OPT_KV_STEADY_RESERVE_MIB`。不开 MTP 通道的容量已经到卡的上限，提高 util 没有收益。默认开对速度没有可测的影响（第 8 组）；开 MTP 把 util 提到 0.93 时 4 并发 8K 贪心每路 decode 低约 4%。
 - **首次启动慢**：部分内核第一次启动时现编，官方 v1.5.1 在我们机器上首次启动 774 秒，之后 563–664 秒；本分支 436–526 秒。我们机器放模型的盘 PCIe 链路只有 x1，读取上限约 0.85 GB/s，这是启动时间的硬件下限。
 - **只有 1 个 token 的 prompt**：全新请求的整个 prompt 只有 1 个 token 时，会读到没有清零的状态槽。官方也有同样的问题。聊天接口的 prompt 带模板，不会触发。
 - **开着前缀缓存时长 prompt 的 KV 占用偏高（版本 0930 的问题，版本 1001 已修，见改动第 7 项）**：版本 0930 在 4 条 64K 并发时 KV 占用峰值是 86%，关掉前缀缓存是 64%；版本 1001 实测 64.4%。以下是原因。原因是一步 prefill 跨多个状态块时，换下来的状态块要到请求结束才释放，每个状态组多占“步数 − 2”个块（Flash-Next 有 4 个状态组）。一条冷的 110K 请求因此多占约 9% 的缓存池，这是用本分支的调度器和 KV 管理器模拟得到的估算值，不是实测。这只影响容量，不影响输出；长 prompt 并发多时，缓存池会更早用满，出现排队或抢占。版本 1001 已包含修复。
