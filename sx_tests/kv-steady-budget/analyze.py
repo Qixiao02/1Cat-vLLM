@@ -46,11 +46,15 @@ AUDIT_MEASURED = re.compile(
 AUDIT_SHORT = re.compile(r"KV steady audit: SHORT by (-?[\d.]+) MiB")
 AUDIT_OK = re.compile(r"KV steady audit: OK")
 AUDIT_SUGGEST = re.compile(r"SX_OPT_KV_STEADY_RESERVE_MIB=(\d+)")
+# Out-of-memory and crash signatures (any case), and vLLM's own error level: the
+# log line starts with ERROR once the rank prefix is stripped.
 OOM = re.compile(
     r"out of memory|OutOfMemoryError|CUDA error|Traceback \(most recent|"
-    r"\bERROR\b|RuntimeError|Engine core initialization failed",
+    r"Engine core initialization failed",
     re.IGNORECASE,
 )
+ERROR_LEVEL = re.compile(r"^ERROR\b")
+PHASE_END = re.compile(r"KV steady phase end_of_warmup: (\d+) MiB free")
 
 
 def _clean(line: str) -> str:
@@ -140,6 +144,7 @@ def parse_log(path: str) -> dict:
     audit_short: list[float] = []
     audit_ok = 0
     audit_suggest: list[int] = []
+    end_free: list[int] = []
     steady_lines: list[str] = []
     errors: list[str] = []
     with open(path, encoding="utf-8", errors="replace") as handle:
@@ -169,7 +174,11 @@ def parse_log(path: str) -> dict:
                 audit_suggest.append(int(m.group(1)))
             if "KV steady" in line and line not in steady_lines:
                 steady_lines.append(line)
-            if OOM.search(line) and "KV steady audit" not in line:
+            if m := PHASE_END.search(line):
+                end_free.append(int(m.group(1)))
+            if (OOM.search(line) or ERROR_LEVEL.search(line)) and (
+                "KV steady audit" not in line
+            ):
                 errors.append(line[:240])
     return {
         "kv_tokens": min(kv_tokens) if kv_tokens else None,
@@ -182,6 +191,7 @@ def parse_log(path: str) -> dict:
         "audit_short_mib": audit_short,
         "audit_ok_ranks": audit_ok,
         "audit_suggested_reserve_mib": audit_suggest,
+        "end_of_warmup_free_mib": end_free,
         "steady_lines": steady_lines,
         "error_lines": errors,
     }
@@ -210,6 +220,14 @@ def verdict(
                 f"only {free} MiB of CUDA-usable memory free at the peak "
                 f"(< {headroom_mib} MiB headroom)"
             )
+    end_free = log["end_of_warmup_free_mib"]
+    idle = mem.get("idle_mib")
+    if usable is not None and end_free and idle is not None:
+        # nvidia-smi's memory.used against what CUDA reports used (total - free) at
+        # the end of the warm-up: if they differ, the peak limit (nvidia-smi) and the
+        # headroom (CUDA) are not in the same unit.
+        cuda_used = int(usable) // MiB - min(end_free)
+        mem["smi_minus_cuda_idle_mib"] = idle - cuda_used
     stress = result.get("stress") or {}
     if stress.get("failed"):
         reasons.append(f"{stress['failed']} of {stress['total']} stress requests failed")
@@ -250,6 +268,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=1)
     mem = result["memory"]
+    delta = mem.get("smi_minus_cuda_idle_mib")
+    if delta is not None and abs(delta) > 128:
+        print(
+            "note: nvidia-smi memory.used is %+d MiB from CUDA's own used memory at "
+            "the end of the warm-up; the peak limit and the headroom check use "
+            "different units on this machine" % delta
+        )
     print(
         "%s util %s switch %s: KV %s tokens, idle %s MiB, peak %s MiB -> %s%s"
         % (

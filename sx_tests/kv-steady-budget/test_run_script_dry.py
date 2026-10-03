@@ -243,6 +243,14 @@ def test_patch_repo_overlays_the_files_that_differ(rig):
     assert "same.py" not in compose
 
 
+def test_utils_with_stray_spaces_and_a_fractional_interval(rig):
+    proc, out = run_script(
+        rig, "--switch", "1", "--no-stress", "--sample-interval", "0.5", utils="  0.93   "
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (out / "result.mtp-s1-u093.json").exists()
+
+
 def test_patch_repo_and_patch_dir_are_exclusive(rig):
     proc, _ = run_script(rig, "--patch-repo", "/x", "--patch-dir", "/y")
     assert proc.returncode == 2

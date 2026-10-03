@@ -127,13 +127,16 @@ def test_rendered_file_is_valid_yaml_with_the_same_flags():
     assert service["ulimits"]["memlock"] == -1
 
 
-@pytest.mark.parametrize(
-    "over",
-    [{"switch": "2"}, {"gpus": "4,5"}, {"lane": "weird"}],
-)
+@pytest.mark.parametrize("over", [{"switch": "2"}, {"gpus": "4,5"}])
 def test_bad_arguments_raise(over):
     with pytest.raises(ValueError):
-        render(**{**over, "lane": compose_gen.normalise_lane(over["lane"]) if "lane" in over else "MTP"})
+        render(**over)
+
+
+def test_an_unknown_lane_is_refused():
+    with pytest.raises(ValueError, match="lane must be"):
+        compose_gen.normalise_lane("weird")
+    assert compose_gen.main(["--lane-info", "weird"]) == 2
 
 
 @pytest.mark.parametrize("raw,expected", [("mtp", "MTP"), ("MTP", "MTP"), ("no-MTP", "no-MTP"),
@@ -213,6 +216,8 @@ GOOD_LOG = [
     "(Worker_TP0 pid=11) INFO KV steady budget: util 0.9300 of 31.75 GiB",
     "(Worker_TP0 pid=11) INFO KV steady budget [kv=2295000000 total=34089730048 requested=1 "
     "free_after_profile=2 activation=3 graph_reserve=4 post_sizing=5 headroom=6 limiting=physical]",
+    "(Worker_TP0 pid=11) INFO KV steady phase end_of_warmup: 1000 MiB free (-5 MiB since the previous phase)",
+    "(Worker_TP1 pid=12) INFO KV steady phase end_of_warmup: 1030 MiB free (-5 MiB since the previous phase)",
     "(Worker_TP0 pid=11) INFO KV steady audit: measured post-sizing growth 2500 MiB (plan assumed 2600 MiB); x",
     "(Worker_TP0 pid=11) INFO KV steady audit: OK, 100 MiB above the headroom. Setting "
     "SX_OPT_KV_STEADY_RESERVE_MIB=2900 would size the KV cache exactly to the measurement.",
@@ -250,6 +255,24 @@ def test_phases_and_log_are_parsed(tmp_path):
     assert log["audit_suggested_reserve_mib"] == [2900] and log["audit_ok_ranks"] == 1
     assert log["error_lines"] == []
     assert rc == 0 and result["pass"] is True
+
+
+def test_nvidia_smi_is_compared_with_cuda_used_memory(tmp_path):
+    rc, result = run_analysis(tmp_path)
+    # CUDA total 32510 MiB, least free rank 1000 MiB -> 31510 used; nvidia-smi idle 31499
+    assert result["memory"]["smi_minus_cuda_idle_mib"] == 31499 - 31510
+    assert result["log"]["end_of_warmup_free_mib"] == [1000, 1030]
+
+
+def test_only_error_level_lines_and_crash_signatures_are_errors(tmp_path):
+    log = GOOD_LOG + [
+        "(Worker_TP0 pid=11) INFO a RuntimeError is mentioned in this info line",
+        "(Worker_TP0 pid=11) WARNING no error here, just the word error",
+        "(Worker_TP0 pid=11) ERROR 10-02 12:00:00 [x.py:1] something failed",
+    ]
+    rc, result = run_analysis(tmp_path, log=log)
+    assert len(result["log"]["error_lines"]) == 1
+    assert "something failed" in result["log"]["error_lines"][0]
 
 
 def test_cuda_usable_total_comes_from_the_engine_log(tmp_path):

@@ -130,6 +130,8 @@ LANE_INFO=$(python3 "$HERE/compose_gen.py" --lane-info "$LANE" 2>/dev/null) \
   || die "--lane must be MTP or no-MTP"
 LANE_NORM=${LANE_INFO%%|*}
 [ -n "$UTILS" ] || UTILS=${LANE_INFO#*|}
+read -r -a UTIL_LIST <<< "$UTILS"
+[ "${#UTIL_LIST[@]}" -gt 0 ] || die "--utils is empty"
 for tool in docker nvidia-smi python3 curl; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
@@ -143,7 +145,7 @@ if [ -n "$PATCH_REPO" ]; then
   command -v git >/dev/null 2>&1 || die "--patch-repo needs git"
   PATCH_DIR="$OUT/patch"
   rm -rf "$PATCH_DIR"; mkdir -p "$PATCH_DIR"
-  changed=$(git -C "$PATCH_REPO" diff --name-only --diff-filter=AM "$PATCH_BASE"...HEAD -- vllm) \
+  changed=$(git -C "$PATCH_REPO" diff --name-only --diff-filter=ACMR "$PATCH_BASE"...HEAD -- vllm) \
     || die "git diff $PATCH_BASE...HEAD failed in $PATCH_REPO"
   [ -n "$changed" ] || die "no vllm/ files differ between $PATCH_BASE and HEAD in $PATCH_REPO"
   while IFS= read -r f; do
@@ -154,6 +156,11 @@ if [ -n "$PATCH_REPO" ]; then
 fi
 [ -z "$PATCH_DIR" ] || [ -d "$PATCH_DIR/vllm" ] || die "$PATCH_DIR has no vllm/ directory"
 LANE_TAG=$(echo "$LANE_NORM" | tr 'A-Z' 'a-z' | tr -d '-')
+IDLE_WAIT=$(awk -v i="$SAMPLE_INTERVAL" 'BEGIN{printf "%d", i * 5 + 0.5}')
+POST_WAIT=$(awk -v i="$SAMPLE_INTERVAL" 'BEGIN{printf "%d", i * 3 + 0.5}')
+# One long prompt after the concurrent ones; it must fit the window with its output.
+SINGLE_TOKENS=32000
+if [ -n "$MAXLEN" ] && [ "$MAXLEN" -lt 32300 ]; then SINGLE_TOKENS=$(( MAXLEN - 300 )); fi
 SAMPLER_PID=""
 CURRENT_COMPOSE=""
 
@@ -231,7 +238,7 @@ run_trial() {  # run_trial <switch> <util>
   local t0 ready=0 state
   t0=$(date +%s)
   while :; do
-    if curl -sf -m 5 "http://127.0.0.1:$PORT/health" -o /dev/null; then ready=1; break; fi
+    if curl -sf --noproxy '*' -m 5 "http://127.0.0.1:$PORT/health" -o /dev/null; then ready=1; break; fi
     state=$(docker inspect -f '{{.State.Status}}' "$cname" 2>/dev/null || echo gone)
     if [ "$state" != running ]; then echo "container is $state before it became healthy"; break; fi
     if [ $(( $(date +%s) - t0 )) -gt "$START_TIMEOUT" ]; then echo "no /health after ${START_TIMEOUT}s"; break; fi
@@ -240,11 +247,11 @@ run_trial() {  # run_trial <switch> <util>
   if [ "$ready" = 1 ]; then
     event ready "$dir/events.log"
     echo "healthy after $(( $(date +%s) - t0 )) s"
-    sleep $(( SAMPLE_INTERVAL * 5 ))      # idle samples
+    sleep "$IDLE_WAIT"                    # idle samples
     if [ "$STRESS" = 1 ]; then
-      python3 "$HERE/stress.py" --port "$PORT" --model "$SERVED_MODEL" \
+      python3 "$HERE/stress.py" --port "$PORT" --model "$SERVED_MODEL" --single "$SINGLE_TOKENS" \
         --out "$dir/stress.json" --events "$dir/events.log" || echo "stress: some requests failed"
-      sleep $(( SAMPLE_INTERVAL * 3 ))
+      sleep "$POST_WAIT"
     fi
   fi
   docker logs "$cname" > "$dir/engine.log" 2>&1 || true
@@ -256,22 +263,22 @@ run_trial() {  # run_trial <switch> <util>
   grep -E "GPU KV cache size|Available KV cache memory|Maximum concurrency|Graph capturing finished|KV steady" "$dir/engine.log" \
     | sed -E 's/^\([A-Za-z_0-9]+ pid=[0-9]+\) //' | awk '!s[$0]++' | cut -c1-260 | head -40
   python3 "$HERE/analyze.py" run --samples "$dir/samples.csv" --events "$dir/events.log" \
-    --log "$dir/engine.log" "${stress_arg[@]}" --tag "$tag" --util "$util" --switch "$sw" \
+    --log "$dir/engine.log" ${stress_arg[@]+"${stress_arg[@]}"} --tag "$tag" --util "$util" --switch "$sw" \
     --lane "$LANE_NORM" --peak-limit-mib "$PEAK_LIMIT_MIB" --headroom-mib "$HEADROOM_MIB" \
     --out "$OUT/result.$tag.json"
 }
 
-first_util=${UTILS%% *}
+first_util=${UTIL_LIST[0]}
 any_fail=0
 if [ "$SWITCH" = both ] || [ "$SWITCH" = 0 ]; then
   if [ "$SWITCH" = 0 ]; then
-    for u in $UTILS; do run_trial 0 "$u" || any_fail=1; done
+    for u in "${UTIL_LIST[@]}"; do run_trial 0 "$u" || any_fail=1; done
   else
     run_trial 0 "$first_util" || any_fail=1       # "today": the baseline row
   fi
 fi
 if [ "$SWITCH" = both ] || [ "$SWITCH" = 1 ]; then
-  for u in $UTILS; do run_trial 1 "$u" || any_fail=1; done
+  for u in "${UTIL_LIST[@]}"; do run_trial 1 "$u" || any_fail=1; done
 fi
 
 echo

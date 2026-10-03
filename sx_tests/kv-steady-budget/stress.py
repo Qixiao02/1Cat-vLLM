@@ -36,13 +36,17 @@ WORDS = (
 ).split()
 
 
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def _post(url: str, payload: dict, timeout: float) -> tuple[int, dict | str]:
     data = json.dumps(payload).encode()
     request = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        # The engine is local: a proxy from the environment must not get in the way.
+        with _OPENER.open(request, timeout=timeout) as response:
             return response.status, json.loads(response.read())
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode(errors="replace")[:500]
