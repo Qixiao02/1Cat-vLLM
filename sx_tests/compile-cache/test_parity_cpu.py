@@ -697,3 +697,41 @@ def test_invalidation_arm_must_recompile():
     table = cp.arm_table("subgraph")
     assert dict(table["inval"].extra_env) == {"VLLM_SX_CACHE_PROBE": "1"}
     assert "VLLM_SX_CACHE_PROBE" not in cp.arm_env(cp.LANES["nomtp"], table["warm"], {})
+
+
+def test_wipe_dir_falls_back_when_the_container_owned_the_files(tmp_path, monkeypatch):
+    real_rmtree = cp.shutil.rmtree
+    path = tmp_path / "cache-on"
+    messages = []
+    removed = []
+
+    def denied(p, ignore_errors=False, **kw):
+        # the operator cannot delete files created by the container user
+        if ignore_errors:
+            return None
+        raise PermissionError("owned by uid 997")
+
+    monkeypatch.setattr(cp.shutil, "rmtree", denied)
+    monkeypatch.setattr(cp.shutil, "which", lambda name: None)  # no sudo, no docker
+    path.mkdir()
+    with pytest.raises(cp.EngineError, match="remove it by hand"):
+        cp.wipe_dir(str(path), None, messages.append)
+    assert any("rmtree" in m for m in messages)
+
+    # with docker, a root container does the removal
+    def root_container(cmd, **kw):
+        removed.append(cmd)
+        real_rmtree(str(path))
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(cp.shutil, "which", lambda name: "/usr/bin/" + name if name == "docker" else None)
+    monkeypatch.setattr(cp, "run", root_container)
+    cp.wipe_dir(str(path), "img", messages.append)
+    assert not path.exists()
+    assert removed and "--user" in removed[0] and "img" in removed[0]
+    # the plain case needs no helper at all
+    monkeypatch.undo()
+    path.mkdir()
+    (path / "f").write_text("x")
+    cp.wipe_dir(str(path), None, messages.append)
+    assert not path.exists()

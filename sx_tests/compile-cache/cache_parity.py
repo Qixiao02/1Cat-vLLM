@@ -1116,10 +1116,39 @@ def arm_env(lane: dict[str, Any], arm: ArmSpec, user_env: dict[str, str]) -> dic
     return env
 
 
-def prepare_cache_dir(root: str, arm: ArmSpec, seed: str | None, log: Callable[[str], None]) -> str:
+def wipe_dir(path: str, image: str | None, log: Callable[[str], None]) -> None:
+    """Remove a cache dir whose files the engine container created (other uid)."""
+    try:
+        shutil.rmtree(path)
+        return
+    except OSError as exc:
+        log("rmtree %s failed (%s); trying sudo, then a root container" % (path, exc))
+    if shutil.which("sudo") and run(["sudo", "-n", "rm", "-rf", path]).returncode == 0:
+        if not os.path.exists(path):
+            return
+    if image and shutil.which("docker"):
+        run(
+            [
+                "docker", "run", "--rm", "--user", "0", "--entrypoint", "sh",
+                "-v", "%s:/w" % path, image, "-c",
+                "rm -rf /w/* /w/.[!.]* /w/..?* 2>/dev/null; true",
+            ]
+        )
+        shutil.rmtree(path, ignore_errors=True)
+    if os.path.exists(path):
+        raise EngineError("cannot remove %s: remove it by hand (sudo rm -rf)" % path)
+
+
+def prepare_cache_dir(
+    root: str,
+    arm: ArmSpec,
+    seed: str | None,
+    log: Callable[[str], None],
+    image: str | None = None,
+) -> str:
     path = os.path.join(root, "cache-" + arm.cache)
     if arm.fresh and os.path.isdir(path):
-        shutil.rmtree(path)
+        wipe_dir(path, image, log)
     if not os.path.isdir(path):
         os.makedirs(path)
         if seed:
@@ -1145,10 +1174,13 @@ def run_arm(
     log: Callable[[str], None],
 ) -> tuple[dict[str, Any], list[PromptSpec] | None]:
     env = arm_env(lane, arm, dict(kv.split("=", 1) for kv in args.env))
-    cache_dir = prepare_cache_dir(args.cache_root, arm, args.cache_seed, log)
-    result: dict[str, Any] = {"arm": arm.name, "switch": arm.switch, "cache_dir": cache_dir}
+    result: dict[str, Any] = {"arm": arm.name, "switch": arm.switch}
     t0 = time.time()
     try:
+        cache_dir = prepare_cache_dir(
+            args.cache_root, arm, args.cache_seed, log, getattr(args, "image", None)
+        )
+        result["cache_dir"] = cache_dir
         log("[%s] start (SX_OPT_COMPILE_CACHE=%s, cache %s)" % (arm.name, arm.switch, cache_dir))
         engine.start(arm, env, cache_dir)
         if args.dry_run:
