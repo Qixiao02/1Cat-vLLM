@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from torch import nn
 
 import vllm.envs as envs
+from vllm.compilation import sx_compile_cache
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -677,6 +678,20 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         if not isinstance(meta_weight, torch.Tensor):
             raise RuntimeError("Qwen4Exp PLE meta weight was not initialized")
         self._meta_weight_shape = tuple(meta_weight.shape)
+        # SX_OPT_COMPILE_CACHE: with the compile cache reuse on, the gather op
+        # resolves the table addresses by layer name when it runs (see
+        # embedding_lookup), so no raw pointer enters a compiled graph that a
+        # later process may load. Off: the module is not registered and the
+        # gather keeps taking pointers, exactly as before.
+        self._sx_gather_by_name = sx_compile_cache.compile_cache_enabled()
+        if self._sx_gather_by_name:
+            self.layer_name = prefix
+            static_forward_context = (
+                get_current_vllm_config().compilation_config.static_forward_context
+            )
+            if prefix in static_forward_context:
+                raise ValueError(f"Duplicate layer name: {prefix}")
+            static_forward_context[prefix] = self
         self._meta_weight_dtype = meta_weight.dtype
         # Placeholder parameter: keeps the loader contract (a CPU-resident
         # ``weight`` that must not be moved to the device) without holding
@@ -811,6 +826,14 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.ple_host_storage = host_storage
         self._device_rows = placement.vram_rows
         self._host_rows = placement.host_rows
+        if self._sx_gather_by_name:
+            # The row split is a literal in the traced gather (the host/device
+            # boundary) and, with an automatic host budget, depends on the free
+            # memory of this run: it belongs in the compile cache key.
+            sx_compile_cache.register_baked_constant(
+                f"ple_rows:{self.layer_name}",
+                (placement.vram_rows, placement.host_rows),
+            )
         # Cached as a plain int: torch.compile cannot trace data_ptr() inside
         # the forward, the same reason the host pointer is cached below.
         self._device_table_ptr = self.ple_device_table.data_ptr()
@@ -907,6 +930,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             device=input_.device,
         )
         out_flat = output.reshape(-1, self.embedding_dim)
+        if self._sx_gather_by_name:
+            return self._embedding_lookup_by_name(
+                flat_ids, output, out_flat, self._host_rows, self._device_rows
+            )
         if self._host_rows == 0 or self._device_rows == 0:
             table_ptr = self._device_table_ptr if self._host_rows == 0 else host_ptr
             torch.ops.vllm.qwen4_exp_ple_pinned_gather(
@@ -935,6 +962,54 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             host_out,
             self.weight_scale,
             host_ptr,
+            self.embedding_dim,
+        )
+        out_flat.copy_(torch.where(on_host.unsqueeze(-1), host_out, out_flat))
+        return output
+
+    def _embedding_lookup_by_name(
+        self,
+        flat_ids: torch.Tensor,
+        output: torch.Tensor,
+        out_flat: torch.Tensor,
+        host_rows: int,
+        device_rows: int,
+    ) -> torch.Tensor:
+        """embedding_lookup with the table addresses resolved inside the op.
+
+        Same row split and arithmetic as the pointer variant above; only the
+        string layer name and a host/device flag reach the graph.
+        """
+        if host_rows == 0 or device_rows == 0:
+            torch.ops.vllm.qwen4_exp_ple_pinned_gather_by_name(
+                flat_ids,
+                out_flat,
+                self.weight_scale,
+                self.layer_name,
+                host_rows != 0,
+                self.embedding_dim,
+            )
+            return output
+        boundary = device_rows
+        on_host = flat_ids >= boundary
+        zero = flat_ids.new_zeros(())
+        device_ids = torch.where(on_host, zero, flat_ids)
+        host_ids = torch.where(on_host, flat_ids - boundary, zero)
+        host_out = torch.empty_like(out_flat)
+        torch.ops.vllm.qwen4_exp_ple_pinned_gather_by_name(
+            device_ids,
+            out_flat,
+            self.weight_scale,
+            self.layer_name,
+            False,
+            self.embedding_dim,
+        )
+        torch.ops.vllm.qwen4_exp_ple_pinned_gather_by_name(
+            host_ids,
+            host_out,
+            self.weight_scale,
+            self.layer_name,
+            True,
             self.embedding_dim,
         )
         out_flat.copy_(torch.where(on_host.unsqueeze(-1), host_out, out_flat))
@@ -2495,6 +2570,58 @@ def qwen4_exp_ple_pinned_gather_fake(
     return
 
 
+def qwen4_exp_ple_pinned_gather_by_name(
+    input_ids: torch.Tensor,
+    output: torch.Tensor,
+    weight_scale: torch.Tensor,
+    layer_name: str,
+    use_host_table: bool,
+    embedding_dim: int,
+) -> None:
+    """qwen4_exp_ple_pinned_gather with the table address resolved at run time.
+
+    Upstream 1Cat 5f668ebb9 (#622). The pointer variant takes the address as a
+    Python int, which Inductor writes into the compiled graph and the AOT /
+    compiled-subgraph cache: a later process then gathers from the address of a
+    buffer that no longer exists (illegal memory access in profile_run). Only
+    the layer name and the host/device selector reach the graph here; the
+    module registers itself under its prefix when SX_OPT_COMPILE_CACHE is on.
+    """
+    if input_ids.numel() == 0:
+        return
+    table = get_forward_context().no_compile_layers[layer_name]
+    if use_host_table:
+        device_index = (
+            torch.accelerator.current_device_index()
+            if input_ids.device.index is None
+            else input_ids.device.index
+        )
+        weight_ptr = table._accelerator_weight_ptrs[device_index]
+    else:
+        weight_ptr = table._device_table_ptr
+    block_d = triton.next_power_of_2(embedding_dim)
+    _gather_ple_fp8_from_pinned_kernel[(input_ids.numel(),)](
+        weight_ptr,
+        input_ids,
+        weight_scale,
+        output,
+        embedding_dim=embedding_dim,
+        BLOCK_D=block_d,
+        num_warps=4,
+    )
+
+
+def qwen4_exp_ple_pinned_gather_by_name_fake(
+    input_ids: torch.Tensor,
+    output: torch.Tensor,
+    weight_scale: torch.Tensor,
+    layer_name: str,
+    use_host_table: bool,
+    embedding_dim: int,
+) -> None:
+    return
+
+
 def qwen4_exp_ple_fp8_bytes_dequant(
     input_bytes: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -2538,6 +2665,14 @@ direct_register_custom_op(
     op_func=qwen4_exp_ple_pinned_gather,
     mutates_args=["output"],
     fake_impl=qwen4_exp_ple_pinned_gather_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_pinned_gather_by_name",
+    op_func=qwen4_exp_ple_pinned_gather_by_name,
+    mutates_args=["output"],
+    fake_impl=qwen4_exp_ple_pinned_gather_by_name_fake,
 )
 
 
