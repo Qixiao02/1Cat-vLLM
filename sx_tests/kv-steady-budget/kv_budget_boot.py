@@ -50,6 +50,7 @@ WORKER_METHODS = {
     "determine_available_memory",
     "_sx_plan_steady_budget",
     "_sx_mark",
+    "_sx_cached_free_bytes",
     "_sx_release_idle_cache",
     "_sx_after_kv_cache_init",
     "_sx_steady_audit",
@@ -187,15 +188,51 @@ class ProfileResult:
 
 
 class FakeCuda:
-    """``torch.cuda`` as the audit reads it; ``free`` moves with the test."""
+    """``torch.cuda`` as the audit reads it; ``free`` moves with the test.
+
+    ``cached_default`` / ``cached_graph_pool`` are the idle bytes of the default
+    pool and of a CUDA-graph private pool, as ``memory_snapshot`` reports them.
+    """
 
     def __init__(self, free: int = 0, reserved: int = 0, allocated: int = 0) -> None:
         self.free = free
         self.reserved = reserved
         self.allocated = allocated
+        self.cached_default = 0
+        self.cached_graph_pool = 0
+        self.snapshot_error: Exception | None = None
+
+    def current_device(self):
+        return 0
 
     def mem_get_info(self, device=None):
         return (self.free, 0)
+
+    def memory_snapshot(self):
+        if self.snapshot_error is not None:
+            raise self.snapshot_error
+        mib = 1 << 20
+        return [
+            {  # default pool: two idle blocks and one in use
+                "device": 0,
+                "segment_pool_id": (0, 0),
+                "blocks": [
+                    {"size": self.cached_default // 2, "state": "inactive"},
+                    {"size": self.cached_default - self.cached_default // 2, "state": "inactive"},
+                    {"size": 64 * mib, "state": "active_allocated"},
+                ],
+            },
+            {  # a CUDA-graph private pool: idle blocks are kept for replay
+                "device": 0,
+                "segment_pool_id": (0, 7),
+                "blocks": [{"size": self.cached_graph_pool, "state": "inactive"}],
+            },
+            {  # another GPU
+                "device": 1,
+                "segment_pool_id": (0, 0),
+                "blocks": [{"size": 10**12, "state": "inactive"}],
+            },
+        ]
 
     def memory_reserved(self, device=None):
         return self.reserved
@@ -268,7 +305,8 @@ def worker_class(
     )
     platform = types.SimpleNamespace(
         is_cuda=lambda: is_cuda,
-        is_device_capability=lambda cap, device_id=None: is_sm70,
+        # strict: only the SM70 spellings are accepted, so a wrong literal fails
+        is_device_capability=lambda cap, device_id=None: is_sm70 and cap in (70, (7, 0)),
     )
     namespace = {
         "torch": fake_torch,

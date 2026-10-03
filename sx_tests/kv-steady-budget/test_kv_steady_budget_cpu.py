@@ -157,7 +157,7 @@ def test_predicted_free_memory_is_larger_when_the_utilisation_limits():
 
 
 @pytest.mark.parametrize("activation", [400, 1200, 1800])
-@pytest.mark.parametrize("context", [300, 900, 1500])
+@pytest.mark.parametrize("context", [300, 900, 1280])
 def test_gain_over_todays_sizing_is_the_unused_headroom(activation, context):
     """At the reference point the physical bound reproduces today's peak, so the
     KV cache grows by (total - reference peak - headroom) and by nothing else."""
@@ -175,9 +175,9 @@ def test_gain_over_todays_sizing_is_the_unused_headroom(activation, context):
 
 
 def test_context_moves_out_of_the_post_sizing_allocation_one_for_one():
-    a = kb.plan_kv_budget(inputs(0.95, context=600 * MiB))
-    b = kb.plan_kv_budget(inputs(0.95, context=1400 * MiB))
-    assert a.post_sizing - b.post_sizing == 800 * MiB
+    a = kb.plan_kv_budget(inputs(0.95, context=500 * MiB))
+    b = kb.plan_kv_budget(inputs(0.95, context=1200 * MiB))
+    assert a.post_sizing - b.post_sizing == 700 * MiB
     # The context is inside the measured free memory, so the KV size is the same.
     assert a.kv_physical == b.kv_physical
 
@@ -228,9 +228,9 @@ def test_lane_without_a_reference_uses_the_graph_reserve_plus_extra():
 
 
 def test_post_sizing_never_below_the_graph_reserve():
-    # A device whose context is larger than the reference overshoot.
-    plan = kb.plan_kv_budget(inputs(0.99, context=9000 * MiB))
-    assert plan.post_sizing == ACTIVATION
+    # A graph reserve larger than the reference overshoot minus the context.
+    plan = kb.plan_kv_budget(inputs(0.99, graph_reserve=3000 * MiB))
+    assert plan.post_sizing == 3000 * MiB
 
 
 def test_explicit_zero_graph_reserve_is_respected():
@@ -270,18 +270,26 @@ def test_estimate_table_for_the_four_utilisations():
 # ------------------------------------------------------------------ the audit
 
 
-def audit_inputs(**over):
+F_PROF, ACT, H, LOAD = 6500, 1200, kb.DEFAULT_HEADROOM_MIB, 384
+
+
+def audit_inputs(p_plan=2600, *, warm=2666, cached=900, init_extra=10, **over):
+    """A startup consistent with a plan: the KV cache was sized as the physical
+    bound says (kv = F_prof - activation - P - headroom), then initialize_kv_cache
+    took ``init_extra`` more and the warm-up ``warm`` (all MiB)."""
+    kv = F_PROF - ACT - p_plan - H
+    free_after_kv = F_PROF - kv - init_extra
     base = dict(
-        free_after_profile=6500 * MiB,
-        kv_bytes_allocated=2200 * MiB,
-        free_after_kv=4290 * MiB,  # 10 MiB of non-KV in initialize_kv_cache
-        free_at_end=1700 * MiB,
-        cached_free=900 * MiB,
-        activation_peak=1200 * MiB,
+        free_after_profile=F_PROF * MiB,
+        kv_bytes_allocated=kv * MiB,
+        free_after_kv=free_after_kv * MiB,
+        free_at_end=(free_after_kv - warm) * MiB,
+        cached_free=cached * MiB,
+        activation_peak=ACT * MiB,
         graph_capture_bytes=1400 * MiB,
-        post_sizing_planned=2600 * MiB,
-        headroom_planned=kb.DEFAULT_HEADROOM_MIB * MiB,
-        load_margin=384 * MiB,
+        post_sizing_planned=p_plan * MiB,
+        headroom_planned=H * MiB,
+        load_margin=LOAD * MiB,
     )
     base.update(over)
     return kb.AuditInputs(**base)
@@ -290,42 +298,83 @@ def audit_inputs(**over):
 def test_audit_measures_the_growth_without_the_activation_cache():
     res = kb.audit(audit_inputs())
     assert res.kv_init_extra == 10 * MiB
-    assert res.warmup_growth == 2590 * MiB
+    assert res.warmup_growth == 2666 * MiB
     # 900 MiB of the growth is the allocator holding memory for activations.
-    assert res.post_sizing_measured == 10 * MiB + 2590 * MiB - 900 * MiB
+    assert res.post_sizing_measured == (10 + 2666 - 900) * MiB
     assert res.activation_deficit == 300 * MiB
 
 
-def test_audit_ok_when_the_plan_assumed_more():
-    res = kb.audit(audit_inputs(free_at_end=2400 * MiB))
-    assert res.ok and res.surplus > 0
+def test_audit_is_exact_when_the_growth_is_what_the_plan_assumed():
+    """measured growth + load margin == P  <=>  the load peak leaves the headroom."""
+    # warm-up growth that makes measured + load margin equal the planned 2600 MiB
+    res = kb.audit(audit_inputs(2600, warm=2600 - LOAD - 10 + 900))
+    assert res.post_sizing_measured + LOAD * MiB == 2600 * MiB
+    assert res.surplus == 0 and res.ok
     assert "OK" in res.lines[-1]
 
 
+def test_audit_ok_when_the_plan_assumed_more():
+    res = kb.audit(audit_inputs())
+    assert res.ok and res.surplus == 440 * MiB  # P_true 2160 vs P_plan 2600
+    assert f"{kb.ENV_RESERVE_MIB}=2160" in res.lines[-1]
+
+
 def test_audit_short_names_the_remedy():
-    res = kb.audit(audit_inputs(free_at_end=1000 * MiB))
-    assert not res.ok and res.surplus < 0
-    assert "SHORT by" in res.lines[-1]
+    res = kb.audit(audit_inputs(warm=3366))
+    assert not res.ok and res.surplus == -260 * MiB  # P_true 2860 vs P_plan 2600
+    assert "SHORT by 260 MiB" in res.lines[-1]
     assert f"{kb.ENV_RESERVE_MIB}={res.suggested_reserve_mib}" in res.lines[-1]
+    assert res.suggested_reserve_mib == 2860
 
 
-def test_audit_suggestion_makes_the_plan_exact():
-    """Feeding the suggested reserve back gives predicted free == headroom."""
-    res = kb.audit(audit_inputs(free_at_end=1000 * MiB))
-    inp = inputs(0.99, lane="other")
-    plan = kb.plan_kv_budget(inp, {kb.ENV_RESERVE_MIB: str(res.suggested_reserve_mib)})
-    assert plan.predicted_free_at_peak == plan.headroom
+def test_the_suggested_reserve_would_have_left_exactly_the_headroom():
+    """Size the same startup by the suggested P: the KV cache shrinks by the
+    shortfall, the warm-up takes what it took before, and the audit of that run
+    projects exactly the headroom."""
+    first = kb.audit(audit_inputs(2600, warm=3366))
+    assert first.surplus < 0
+    replay = kb.audit(audit_inputs(first.suggested_reserve_mib, warm=3366))
+    assert replay.surplus == 0 and replay.ok
 
 
 def test_audit_activation_fully_cached_costs_nothing_more():
-    res = kb.audit(audit_inputs(cached_free=1500 * MiB))
+    res = kb.audit(audit_inputs(cached=1500))
     assert res.activation_deficit == 0
-    assert res.post_sizing_measured == 10 * MiB + 2590 * MiB - 1200 * MiB
+    assert res.post_sizing_measured == (10 + 2666 - 1200) * MiB
 
 
 def test_audit_never_reports_negative_growth():
-    res = kb.audit(audit_inputs(free_at_end=5000 * MiB))
+    res = kb.audit(audit_inputs(warm=-2000))
     assert res.warmup_growth == 0
+
+
+def test_context_beyond_the_cap_is_not_subtracted():
+    """Memory held by other processes shows up in init_cuda_memory; beyond the
+    cap it must shrink the physical bound instead of cancelling out."""
+    cap = kb.DEFAULT_CONTEXT_CAP_MIB * MiB
+    within = kb.plan_kv_budget(inputs(0.99, context=cap))
+    foreign = kb.plan_kv_budget(inputs(0.99, context=cap + 3000 * MiB))
+    assert foreign.post_sizing == within.post_sizing
+    assert within.kv_physical - foreign.kv_physical == 3000 * MiB
+    assert "not this engine's" in foreign.post_sizing_source
+    assert "not this engine's" not in within.post_sizing_source
+
+
+def test_context_cap_is_a_parameter():
+    plan = kb.plan_kv_budget(inputs(0.99, context=900 * MiB), {kb.ENV_CONTEXT_CAP_MIB: "500"})
+    default = kb.plan_kv_budget(inputs(0.99, context=900 * MiB))
+    assert plan.post_sizing - default.post_sizing == 400 * MiB
+
+
+def test_shape_note_only_when_the_shape_differs():
+    base = inputs(0.99)
+    same = kb.BudgetInputs(**{**base.__dict__, "spec_tokens": 4, "max_num_seqs": 16})
+    other = kb.BudgetInputs(**{**base.__dict__, "spec_tokens": 3, "max_num_seqs": 16})
+    assert kb.reference_shape_note(same) is None
+    assert kb.reference_shape_note(base) is None  # shape unknown (0, 0): no claim
+    assert "k=3" in kb.reference_shape_note(other)
+    unreferenced = kb.BudgetInputs(**{**other.__dict__, "lane": "other"})
+    assert kb.reference_shape_note(unreferenced) is None
 
 
 # ------------------------------------------------------------- large warm-up
@@ -333,7 +382,9 @@ def test_audit_never_reports_negative_growth():
 
 def test_steady_warmup_tokens_default_is_a_full_chunk():
     assert kb.steady_warmup_tokens(8192, 32768, {}) == 8192
-    assert kb.steady_warmup_tokens(8192, 4096, {}) == 4096
+    # inside the window by the margin the decode step after the prefill needs
+    assert kb.steady_warmup_tokens(8192, 4096, {}) == 4096 - kb.WARMUP_WINDOW_MARGIN
+    assert kb.steady_warmup_tokens(8192, 8192, {}) == 8192 - kb.WARMUP_WINDOW_MARGIN
 
 
 def test_steady_warmup_tokens_override_and_disable():

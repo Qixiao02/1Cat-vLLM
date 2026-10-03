@@ -111,7 +111,7 @@ def test_switch_on_adds_one_full_chunk(monkeypatch):
 
 def test_the_chunk_is_bounded_by_the_window(monkeypatch):
     monkeypatch.setenv(kb.ENV_SWITCH, "1")
-    assert counts(runner(batched=8192, max_len=4096)) == (6, 33, 48, 4096)
+    assert counts(runner(batched=8192, max_len=4096)) == (6, 33, 48, 4096 - 16)
 
 
 def test_a_tiny_budget_adds_nothing(monkeypatch):

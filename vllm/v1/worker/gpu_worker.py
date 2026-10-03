@@ -749,6 +749,12 @@ class Worker(WorkerBase):
             activation_peak=int(profile_result.torch_peak_increase),
             graph_reserve=int(graph_reserve),
             lane=lane,
+            spec_tokens=(
+                0
+                if speculative_config is None
+                else int(speculative_config.num_speculative_tokens or 0)
+            ),
+            max_num_seqs=int(self.vllm_config.scheduler_config.max_num_seqs),
         )
         plan = kv_budget.plan_kv_budget(inputs)
         for line in plan.lines:
@@ -772,6 +778,39 @@ class Worker(WorkerBase):
             free / (1 << 20),
             (free - previous) / (1 << 20),
         )
+
+    def _sx_cached_free_bytes(self) -> int:
+        """Idle allocator bytes that an eager activation could reuse.
+
+        ``memory_reserved - memory_allocated`` also counts the idle blocks of the
+        CUDA-graph private pools, which are kept for replay and cannot serve an
+        eager allocation, so only the inactive blocks of the default pool count.
+        """
+        try:
+            index = getattr(self.device, "index", None)
+            if index is None:
+                index = torch.cuda.current_device()
+            total = 0
+            for segment in torch.cuda.memory_snapshot():
+                if segment.get("device", index) != index:
+                    continue
+                if tuple(segment.get("segment_pool_id", (0, 0))) != (0, 0):
+                    continue
+                for block in segment.get("blocks", ()):
+                    if block.get("state") == "inactive":
+                        total += int(block.get("size", 0))
+            return total
+        except Exception as exc:  # noqa: BLE001 - the audit is advisory
+            logger.warning_once(
+                "KV steady audit: torch.cuda.memory_snapshot() failed (%s); "
+                "counting every idle allocator byte, graph pools included.",
+                exc,
+            )
+            return max(
+                0,
+                int(torch.cuda.memory_reserved(self.device))
+                - int(torch.cuda.memory_allocated(self.device)),
+            )
 
     def _sx_release_idle_cache(self) -> None:
         """Hand the capture streams' idle allocator blocks back to the driver.
@@ -806,8 +845,6 @@ class Worker(WorkerBase):
             return
         self._sx_mark("end_of_warmup")
         marks = dict(self._sx_steady_marks)
-        reserved = int(torch.cuda.memory_reserved(self.device))
-        allocated = int(torch.cuda.memory_allocated(self.device))
         load_margin_mib = kv_budget.read_mib(
             kv_budget.ENV_LOAD_MIB, kv_budget.DEFAULT_LOAD_MIB
         )
@@ -817,7 +854,7 @@ class Worker(WorkerBase):
                 kv_bytes_allocated=getattr(self, "_sx_kv_bytes_allocated", 0),
                 free_after_kv=marks.get("after_kv_cache", marks["after_profile"]),
                 free_at_end=marks["end_of_warmup"],
-                cached_free=max(0, reserved - allocated),
+                cached_free=self._sx_cached_free_bytes(),
                 activation_peak=int(self.peak_activation_memory),
                 graph_capture_bytes=int(graph_capture_bytes),
                 post_sizing_planned=plan.post_sizing,

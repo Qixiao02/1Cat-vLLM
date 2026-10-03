@@ -103,6 +103,7 @@ ENV_STRICT = "SX_OPT_KV_STEADY_STRICT"
 ENV_WARMUP_TOKENS = "SX_OPT_KV_STEADY_WARMUP_TOKENS"
 ENV_EMPTY_CACHE = "SX_OPT_KV_STEADY_EMPTY_CACHE"
 ENV_EXTRA_MIB = "SX_OPT_KV_STEADY_EXTRA_MIB"  # only for lanes without a reference
+ENV_CONTEXT_CAP_MIB = "SX_OPT_KV_STEADY_CONTEXT_CAP_MIB"
 
 # Free device memory (CUDA's view: total minus used) the steady state must
 # still have at its peak. The task this was built for asked for ~500 MiB and a
@@ -118,6 +119,17 @@ DEFAULT_LOAD_MIB = 384
 # Reserve for lanes without a measured reference (DFlash2, other methods):
 # upstream's activation-peak graph reserve plus this.
 DEFAULT_UNREFERENCED_EXTRA_MIB = 1024
+# Upper bound on the part of ``init_snapshot.cuda_memory`` that is taken to be
+# this engine's own CUDA context + NCCL + custom all-reduce (0.6-0.9 GiB by the
+# code, not measured). The lane reference subtracts that footprint from its
+# overshoot, and the physical bound cancels it again, so it only matters that the
+# subtracted value is right where it is NOT part of the reference: memory that
+# other processes hold shows up in ``cuda_memory`` too, and beyond this cap it is
+# kept out of the subtraction, so the physical bound shrinks with it.
+DEFAULT_CONTEXT_CAP_MIB = 1280
+# Headroom for the warm-up prompt below the window: the decode step after the
+# prefill schedules 1 + k more tokens (k <= 7) and the block table row must hold them.
+WARMUP_WINDOW_MARGIN = 16
 
 
 @dataclass(frozen=True)
@@ -128,6 +140,8 @@ class LaneReference:
     peak_mib: int
     util: float
     source: str
+    spec_tokens: int = 0  # num_speculative_tokens of the measured run
+    max_num_seqs: int = 0  # --max-num-seqs of the measured run (decides the graph set)
 
 
 # Both rows come from the 2026-10-01 fork-vs-official runs on 4x V100-SXM2-32GB,
@@ -145,6 +159,8 @@ LANE_REFERENCES: dict[str, LaneReference] = {
         0.87,
         "FM_mtp_c4_8k.json: fork + native MTP k=4, max-num-seqs 16, util 0.87, "
         "idle 31499 MiB, peak 31811 MiB under 4x8K",
+        spec_tokens=4,
+        max_num_seqs=16,
     ),
     "nomtp": LaneReference(
         "nomtp",
@@ -152,6 +168,8 @@ LANE_REFERENCES: dict[str, LaneReference] = {
         0.90,
         "F1_sweep_c8/c16/c24.json: fork production no-MTP, max-num-seqs 24, "
         "util 0.90, idle 31681 MiB, peak 31839 MiB",
+        spec_tokens=0,
+        max_num_seqs=24,
     ),
 }
 
@@ -215,6 +233,8 @@ class BudgetInputs:
     activation_peak: int  # torch peak increase of the measured profile
     graph_reserve: int  # upstream-style graph pool reserve (util bound)
     lane: str  # "mtp" / "nomtp" (admitted Qwen3.8 TP4 lanes) / "other"
+    spec_tokens: int = 0  # num_speculative_tokens of this run
+    max_num_seqs: int = 0  # --max-num-seqs of this run
 
 
 @dataclass(frozen=True)
@@ -247,11 +267,12 @@ def estimate_post_sizing(
     separately) and excludes the CUDA context/NCCL footprint (it is part of
     ``free_after_profile``). For a lane with a reference::
 
-        P = reference_peak - reference_util * total - init_cuda_memory
+        P = reference_peak - reference_util * total - min(init_cuda_memory, cap)
 
     which is the reference run's own overshoot over its utilisation budget with
-    this device's context taken out. Without a reference it is the graph reserve
-    plus ``DEFAULT_UNREFERENCED_EXTRA_MIB``.
+    this device's own context taken out (``DEFAULT_CONTEXT_CAP_MIB`` keeps memory
+    held by other processes out of it). Without a reference it is the graph
+    reserve plus ``DEFAULT_UNREFERENCED_EXTRA_MIB``.
     """
     explicit = read_mib(ENV_RESERVE_MIB, None, environ)
     if explicit is not None:
@@ -265,11 +286,45 @@ def estimate_post_sizing(
             f"unreferenced lane {inputs.lane!r}: graph reserve + {extra} MiB",
         )
     overshoot = ref.peak_mib * MiB - int(ref.util * inputs.total_memory)
-    value = max(overshoot - inputs.init_cuda_memory, inputs.graph_reserve)
+    cap_mib = read_mib(ENV_CONTEXT_CAP_MIB, DEFAULT_CONTEXT_CAP_MIB, environ)
+    assert cap_mib is not None
+    context = min(inputs.init_cuda_memory, cap_mib * MiB)
+    value = max(overshoot - context, inputs.graph_reserve)
+    clipped = ""
+    if context < inputs.init_cuda_memory:
+        clipped = (
+            f", of {inputs.init_cuda_memory / MiB:.0f} MiB in use at init "
+            f"(the rest is not this engine's)"
+        )
     return value, (
         f"lane reference {ref.name}: peak {ref.peak_mib} MiB at util {ref.util} "
-        f"minus its budget minus this device's {inputs.init_cuda_memory / MiB:.0f} "
-        f"MiB context/NCCL ({ref.source})"
+        f"minus its budget minus this device's {context / MiB:.0f} MiB "
+        f"context/NCCL{clipped} ({ref.source})"
+    )
+
+
+def reference_shape_note(inputs: BudgetInputs) -> str | None:
+    """A warning when this run's shape differs from the one the lane reference
+    was measured at (the graph set, hence P, depends on both)."""
+    ref = LANE_REFERENCES.get(inputs.lane)
+    if ref is None or (not inputs.spec_tokens and not inputs.max_num_seqs):
+        return None
+    if inputs.spec_tokens == ref.spec_tokens and (
+        not inputs.max_num_seqs or inputs.max_num_seqs == ref.max_num_seqs
+    ):
+        return None
+    return (
+        "KV steady budget: NOTE the %s reference was measured at k=%d, "
+        "max-num-seqs %d; this run has k=%d, max-num-seqs %d, so the graph set "
+        "and P differ. Check the audit after the warm-up and set %s from it."
+        % (
+            ref.name,
+            ref.spec_tokens,
+            ref.max_num_seqs,
+            inputs.spec_tokens,
+            inputs.max_num_seqs,
+            ENV_RESERVE_MIB,
+        )
     )
 
 
@@ -305,6 +360,7 @@ def plan_kv_budget(
         + inputs.graph_reserve
     ) / max(inputs.total_memory, 1)
 
+    note = reference_shape_note(inputs)
     lines = (
         "KV steady budget: util %.4f of %.2f GiB = %.2f GiB requested; non-KV "
         "%.2f GiB (activation peak %.2f GiB), graph reserve %.2f GiB -> "
@@ -338,7 +394,7 @@ def plan_kv_budget(
         # One machine-readable line (bytes) for sx_tests/kv-steady-budget/analyze.py.
         "KV steady budget [kv=%d total=%d requested=%d free_after_profile=%d "
         "activation=%d graph_reserve=%d post_sizing=%d headroom=%d limiting=%s "
-        "kv_utilisation=%d kv_physical=%d]"
+        "kv_utilisation=%d kv_physical=%d init_cuda=%d]"
         % (
             kv,
             inputs.total_memory,
@@ -351,8 +407,9 @@ def plan_kv_budget(
             limiting,
             kv_util,
             kv_phys,
+            inputs.init_cuda_memory,
         ),
-    )
+    ) + ((note,) if note else ())
     return BudgetPlan(
         kv_unreserved=kv_unreserved,
         kv_utilisation=kv_util,
@@ -489,10 +546,11 @@ def steady_warmup_tokens(
     workspace, GDN chunk temporaries, PLE short-conv rows) are first allocated
     by the first long real request, after the KV cache is sized and outside any
     audit. With the switch on, one full-chunk prefill runs at startup so those
-    buffers exist (and are measured) before serving. Unset: a full chunk,
-    ``0`` disables it.
+    buffers exist (and are measured) before serving. Unset: a full chunk (kept
+    ``WARMUP_WINDOW_MARGIN`` tokens inside the window so the decode step after it
+    fits), ``0`` disables it.
     """
-    cap = min(int(max_num_batched_tokens), int(max_model_len))
+    cap = min(int(max_num_batched_tokens), int(max_model_len) - WARMUP_WINDOW_MARGIN)
     value = read_mib(ENV_WARMUP_TOKENS, None, environ)
     if value is None:
         return max(cap, 0)

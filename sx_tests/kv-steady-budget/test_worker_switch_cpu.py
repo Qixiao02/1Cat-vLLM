@@ -76,7 +76,8 @@ def make_profile() -> boot.ProfileResult:
     )
 
 
-def make_worker(*, util=UTIL, spec_method=None, v2=True, **kwargs):
+def make_worker(*, util=UTIL, spec_method=None, v2=True, spec_tokens=4,
+                max_num_seqs=16, **kwargs):
     cuda = boot.FakeCuda()
     if "lane_contract" not in kwargs:
         # The admitted Qwen3.8 lanes: native MTP, or no speculative config.
@@ -88,7 +89,7 @@ def make_worker(*, util=UTIL, spec_method=None, v2=True, **kwargs):
         **kwargs,
     )
     worker = cls()
-    worker.device = "cuda:0"
+    worker.device = SimpleNamespace(index=0)  # a torch.device has .index
     worker.use_v2_model_runner = v2
     worker.init_snapshot = SimpleNamespace(
         free_memory=TOTAL - CONTEXT,
@@ -103,11 +104,14 @@ def make_worker(*, util=UTIL, spec_method=None, v2=True, **kwargs):
     worker.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(),
         parallel_config=SimpleNamespace(),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
         compilation_config=SimpleNamespace(
             cudagraph_mode=boot._Mode.FULL_AND_PIECEWISE
         ),
         speculative_config=(
-            None if spec_method is None else SimpleNamespace(method=spec_method)
+            None
+            if spec_method is None
+            else SimpleNamespace(method=spec_method, num_speculative_tokens=spec_tokens)
         ),
     )
     worker.model_runner = FakeRunner()
@@ -325,7 +329,7 @@ def run_startup(worker, cuda, *, kv, init_extra, warmup_growth, cached):
         SimpleNamespace(kv_cache_tensors=[SimpleNamespace(size=kv)])
     )
     cuda.free -= warmup_growth
-    cuda.reserved, cuda.allocated = cached, 0
+    cuda.cached_default = cached
     worker._sx_steady_audit(1000 * MiB)
     return plan
 
@@ -333,10 +337,11 @@ def run_startup(worker, cuda, *, kv, init_extra, warmup_growth, cached):
 def test_audit_reports_ok_when_the_growth_matches_the_plan(monkeypatch):
     worker, logger, cuda = planned_worker(monkeypatch)
     plan = worker._sx_steady_plan
-    # What the plan assumed: after the KV cache, activations (cached) + P.
+    # What the plan assumed: measured growth + the load margin == P, with the
+    # activation peak sitting in the allocator cache.
     run_startup(
         worker, cuda, kv=plan.kv_bytes, init_extra=20 * MiB,
-        warmup_growth=ACTIVATION + plan.post_sizing - plan.graph_reserve - 400 * MiB,
+        warmup_growth=plan.post_sizing - 384 * MiB - 20 * MiB + ACTIVATION,
         cached=ACTIVATION,
     )
     text = logger.text()
@@ -344,6 +349,48 @@ def test_audit_reports_ok_when_the_growth_matches_the_plan(monkeypatch):
     assert "KV steady phase end_of_warmup" in text
     assert "KV steady audit: OK" in text
     assert logger.text("error") == ""
+
+
+def test_idle_blocks_of_a_graph_pool_do_not_count_as_cache(monkeypatch):
+    """Only the default pool's inactive blocks can serve an eager activation."""
+    worker, logger, cuda = planned_worker(monkeypatch)
+    cuda.cached_default = 300 * MiB
+    cuda.cached_graph_pool = 900 * MiB
+    assert worker._sx_cached_free_bytes() == 300 * MiB
+
+
+def test_cached_bytes_fall_back_to_reserved_minus_allocated(monkeypatch):
+    worker, logger, cuda = planned_worker(monkeypatch)
+    cuda.snapshot_error = RuntimeError("no snapshot")
+    cuda.reserved, cuda.allocated = 1000 * MiB, 400 * MiB
+    assert worker._sx_cached_free_bytes() == 600 * MiB
+    assert "memory_snapshot() failed" in logger.text("warning")
+
+
+def test_audit_uses_the_default_pool_only(monkeypatch):
+    worker, logger, cuda = planned_worker(monkeypatch)
+    plan = worker._sx_steady_plan
+    cuda.cached_graph_pool = 5000 * MiB  # must not make the audit optimistic
+    run_startup(
+        worker, cuda, kv=plan.kv_bytes, init_extra=0,
+        warmup_growth=ACTIVATION + plan.post_sizing - plan.graph_reserve - 400 * MiB,
+        cached=0,
+    )
+    # nothing of the activation peak is cached, so all of it is still to come
+    assert "KV steady audit" in logger.text()
+    assert f"{ACTIVATION / MiB:.0f} MiB of the activation peak not cached yet" in logger.text()
+
+
+def test_the_shape_note_appears_when_the_run_differs_from_the_reference(monkeypatch):
+    monkeypatch.setenv(kb.ENV_SWITCH, "1")
+    worker, logger, _ = make_worker(util=0.99, spec_method="mtp", spec_tokens=3, max_num_seqs=24)
+    worker.determine_available_memory()
+    text = logger.text("info")
+    assert "NOTE the mtp reference was measured at k=4, max-num-seqs 16" in text
+    assert "this run has k=3, max-num-seqs 24" in text
+    worker, logger, _ = make_worker(util=0.99, spec_method="mtp")
+    worker.determine_available_memory()
+    assert "NOTE" not in logger.text()
 
 
 def test_audit_reports_short_as_an_error(monkeypatch):
@@ -391,3 +438,45 @@ def test_load_margin_env_changes_the_audit(monkeypatch):
         cached=ACTIVATION,
     )
     assert "+0 MiB load margin" in logger.text()
+
+
+# ------------------------------------------------------- the hooks are in order
+
+import ast  # noqa: E402
+
+
+def _calls_in_order(method: str) -> list[str]:
+    source = open(boot.WORKER, encoding="utf-8").read()
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.ClassDef) and node.name == "Worker":
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == method:
+                    calls = [
+                        (n.lineno, n.col_offset, ast.unparse(n.func))
+                        for n in ast.walk(item)
+                        if isinstance(n, ast.Call)
+                    ]
+                    return [name for *_, name in sorted(calls)]
+    raise AssertionError(method)
+
+
+def test_compile_or_warm_up_model_calls_the_hooks_in_order():
+    calls = _calls_in_order("compile_or_warm_up_model")
+
+    def at(name):
+        return calls.index(name)
+
+    assert at("self._sx_mark") < at("kernel_warmup")
+    assert at("self.model_runner.capture_model") < at("self._sx_release_idle_cache")
+    assert at("self._sx_release_idle_cache") < at("warmup_kernels")
+    assert at("warmup_kernels") < at("self._sx_steady_audit")
+    assert at("self._sx_steady_audit") < at("set_random_seed")
+    # the marks that bracket every phase
+    assert calls.count("self._sx_mark") == 3
+
+
+def test_initialize_from_config_marks_after_the_kv_cache_exists():
+    calls = _calls_in_order("initialize_from_config")
+    assert calls.index("self.model_runner.initialize_kv_cache") < calls.index(
+        "self._sx_after_kv_cache_init"
+    )
