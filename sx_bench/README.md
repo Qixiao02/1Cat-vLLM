@@ -17,6 +17,13 @@
 | `as_run/build_fork.sh`、`dockerfile-local-gitmirror.patch` | 2026-10-01 从源码构建 1001 的 wheel 和镜像。补丁只在那次构建时用：GitHub 链路太慢，CMake 要拉的第三方仓库改从本地镜像取（提交哈希都核对过），不在仓库里 |
 | `as_run/arm_compose.py`、`run_all.sh`、`mtp_bench.py`、`cmp_summary.py` | 2026-10-01 本分支对官方最新（双方最佳参数）：`arm_compose.py` 写出 6 种配置的 compose（本分支和官方，各自开、关前缀缓存，以及两边开 MTP），`run_all.sh` 依次启动并测，`mtp_bench.py` 用自然 prompt 测 MTP，`cmp_summary.py` 汇总 |
 | `as_run/wheel_check.sh`、`mk_forkwheel_compose.py` | 用 1001 的镜像按生产配置启动，和 0930 的镜像对照答题，再跑第 1 组的压测 |
+| `as_run/arm_compose_1003.py` | 2026-10-03 本分支 1003 对官方 v1.5.1：写出各配置的 compose（F1、F2、FM、FM2 是本分支，V1、V2、V2b、V2c、VM、VMa 是官方 v1.5.1，O1、O2、OM 是官方 main 的几组），每组的完整启动参数和环境变量都在里面 |
+| `as_run/run_all_1003.sh`、`run_main_final2.sh`、`run_v2b.sh`、`run_final2.sh`、`fm_answers_rerun.sh`、`arm_functions.sh` | 2026-10-03 那轮的外层脚本，按实际运行的顺序保留：一次只起一个实例，带内存和生产健康检查看门狗。`run_main_final2.sh` 等脚本里写死了我们服务器的路径和镜像名 |
+| `as_run/build_v151.sh`、`gen_dockerfile_v151.py` | 官方 v1.5.1 的 wheel 要求 GLIBC ≥ 2.38，官方镜像是 Ubuntu 22.04，所以做了一个 Ubuntu 24.04 镜像：依赖和 CUDA 工具链取自官方镜像，只把 vllm 换成官方发布的 wheel（`--no-deps`） |
+| `as_run/probe_official.sh` | 官方 `main@e53d02171` 起不来的探测脚本：起实例，图捕获结束后 4 分钟还不就绪就判定为挂起，自动保存 py-spy 栈 |
+| `as_run/official-main-dockerfile-local.patch` | 构建官方 `main@e53d02171` 时对它的 `docker/Dockerfile` 做的 4 处本地补丁（补 COPY 两个文件、cpython 走镜像源、CMake 第三方库走本地镜像），没有改任何源码 |
+| `as_run/build_1003.sh`、`validate_wheel_1003.sh` | 1003 wheel 的构建（仓库自己的 Dockerfile，参数和 1002 相同）和验证：取出 wheel，做验证镜像（1002 镜像换上新 wheel），按生产参数启动，答题加 8K 贪心 C1/C4 加 4 并发 8K–64K，对照第 5 组的覆盖镜像 |
+| `as_run/make_report.py` | 从 `results/2026-10-03-fork-vs-official-v1.5.1/` 的原始日志算出第 5 组的所有对比表，不手算 |
 
 `as_run/` 下的脚本带着我们服务器上的路径、容器名和 compose 文件名，换机器要改。`pfx_bench.py` 和 `summarize.py` 不依赖这些，只用 Python 标准库。
 
@@ -60,5 +67,6 @@ python3 pfx_bench.py --port 8001 --model <served-model-name> --out result.json \
 | `results/2026-10-01-fork-vs-official-best/` | 本分支对官方最新，双方最佳参数（README 实测第 1 组）。文件名前缀：`F1` 本分支开前缀缓存（线上配置），`F2` 本分支关前缀缓存，`O1` 官方最佳参数（关前缀缓存），`O2` 官方开前缀缓存，`OM` 官方开 MTP，`FM` 本分支开 MTP。`*_sweep_c<N>.json` 是 8K 输入、贪心、N 并发；`*_long.json` 是 4 并发 8K–64K、默认采样；`*_l128k.json` 是单条 128K；`*_mtp.json` 是自然 prompt 的 MTP 测试；`*_answers.json` 是答题对照；`summary_nomtp.txt` 是不开 MTP 的汇总 |
 | `results/2026-10-01-wheel-1001/` | 发行的 wheel（1001）：`detail_wheel_1001_c4.json` 是和第 1 组同样的压测，`answers_*.json` 是 1001 和 0930 的答题对照 |
 | `results/2026-09-30-mtp-fp16-vs-e4m3/` | 开 MTP（k=4）时 FP16 KV 和 E4M3 KV。`c1s`、`c1g` 是单请求 8K（采样、贪心），`c4s2k`、`c4g2k` 是 4 并发 2K（采样、贪心），`c4` 是 4 并发 8K/16K/32K；`answers_*.json` 是输出对照，`kv_scale_report.json` 是标定得到的各层 K、V 最大值和 scale |
+| `results/2026-10-03-fork-vs-official-v1.5.1/` | 本分支 1003 对官方 v1.5.1（README 实测第 5、6 组）。文件名前缀：`F1`、`F2`、`FM`、`FM2` 是本分支，`V1`、`V2`、`V2b`、`V2c`、`VM`、`VMa` 是官方 v1.5.1（`V2`、`V2c`、`VM` 显存溢出，数据作废或只有一部分有效）。`*_sweep_c*` 是 8K 并发扫描，`*_long` 是 4 并发 8K–64K，`*_l128k` 是 128K，`*_mtp*` 是 MTP 测试，`*_answers.json` 是答题，`engine_*.log` 是引擎日志，`compose.*.yaml` 是各配置的 compose。`O1_HEAD_hang_pyspy.txt` 和 `engine_O1_HEAD_hang.log` 是官方 main 起不来的证据。`REPORT_TABLES.md` 是脚本生成的全部对比表 |
 
 开/关前缀缓存那一轮用的是脚本的第一版，测法和指标算法相同，只是没有上面“详细记录”里的那些字段。

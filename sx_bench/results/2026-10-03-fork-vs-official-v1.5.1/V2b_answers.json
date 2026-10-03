@@ -1,0 +1,51 @@
+{
+ "port": 8141,
+ "needle": [
+  {
+   "words": 8000,
+   "prompt_tokens": 8732,
+   "correct": 8,
+   "of": 8,
+   "seconds": 3.6,
+   "answer": "{\n  \"Halden\": \"860791\",\n  \"Moravia\": \"946734\",\n  \"Tressel\": \"834060\",\n  \"Quillon\": \"612593\",\n  \"Berwick\": \"431552\",\n  \"Isolde\": \"957757\",\n  \"Ferrand\": \"697577\",\n  \"Oskarn\": \"198701\"\n}"
+  },
+  {
+   "words": 32000,
+   "prompt_tokens": 34192,
+   "correct": 8,
+   "of": 8,
+   "seconds": 7.9,
+   "answer": "{\n  \"Halden\": \"247786\",\n  \"Moravia\": \"241071\",\n  \"Tressel\": \"007455\",\n  \"Quillon\": \"365074\",\n  \"Berwick\": \"996950\",\n  \"Isolde\": \"849714\",\n  \"Ferrand\": \"621375\",\n  \"Oskarn\": \"290016\"\n}"
+  },
+  {
+   "words": 64000,
+   "prompt_tokens": 68268,
+   "correct": 8,
+   "of": 8,
+   "seconds": 14.1,
+   "answer": "{\n  \"Halden\": \"417603\",\n  \"Moravia\": \"470594\",\n  \"Tressel\": \"346037\",\n  \"Quillon\": \"458663\",\n  \"Berwick\": \"410079\",\n  \"Isolde\": \"459723\",\n  \"Ferrand\": \"699438\",\n  \"Oskarn\": \"451788\"\n}"
+  }
+ ],
+ "short": [
+  {
+   "question": "计算 37×43+125 等于多少？只输出数字。",
+   "answer": "1721",
+   "ok": false
+  },
+  {
+   "question": "把这些数字从小到大排序：42, 7, 19, 88, 3, 56。只输出排序结果，用英文逗号分隔。",
+   "answer": "3, 7, 19, 42, 56, 88",
+   "ok": true
+  },
+  {
+   "question": "What is the capital of Australia? Answer with one word.",
+   "answer": "Canberra",
+   "ok": true
+  },
+  {
+   "question": "把这句话翻译成英文：今天的会议推迟到明天下午三点。",
+   "answer": "Today's meeting has been postponed to 3:00 PM tomorrow.",
+   "ok": true
+  }
+ ]
+}

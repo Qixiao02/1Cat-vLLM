@@ -1,0 +1,33 @@
+diff --git a/docker/Dockerfile b/docker/Dockerfile
+index 077825244..808a6e8a1 100644
+--- a/docker/Dockerfile
++++ b/docker/Dockerfile
+@@ -349,6 +349,8 @@ COPY flash_qla flash_qla/
+ COPY flashinfer-sm70 flashinfer-sm70/
+ COPY flash-attention-v100 flash-attention-v100/
+ COPY vllm/envs.py vllm/envs.py
++# Local build only: upstream main@e53d02171 setup.py loads vllm/envs_metadata.py but this stage never copied it.
++COPY vllm/envs_metadata.py vllm/envs_metadata.py
+ COPY vllm/__init__.py vllm/__init__.py
+ 
+ # max jobs used by Ninja to build extensions
+@@ -384,9 +386,19 @@ RUN --mount=type=cache,target=/opt/uv/cache \
+ # cmake/external_projects/deepgemm.cmake for the full picture.
+ COPY tools/setup_deepgemm_pythons.sh tools/build_deepgemm_C.py tools/
+ ENV DEEPGEMM_VENV_PREFIX=/opt/dgenv
++# Local build only: the standalone Python builds uv fetches for DeepGEMM come through a domestic GitHub mirror.
++ENV UV_PYTHON_INSTALL_MIRROR=https://ghfast.top/https://github.com/astral-sh/python-build-standalone/releases/download
+ RUN --mount=type=cache,target=/root/.cache/uv \
+     tools/setup_deepgemm_pythons.sh > /tmp/dg_pythons.txt
+ 
++# Local build only (not part of the repository): the third-party repositories CMake clones from GitHub are
++# taken from verified local mirrors, because the GitHub link of the build host was at 14 KB/s.
++COPY --from=gitmirror / /gitmirror
++RUN git config --global url."file:///gitmirror/".insteadOf "https://github.com/" \n    && git config --global protocol.file.allow always
++
++# Local build only: setup.py (data_files) also packages scripts/serve_flash_next_nvfp4_v100.sh, but this stage only copied the 27B launcher.
++COPY scripts/serve_flash_next_nvfp4_v100.sh scripts/
++
+ # Build the vLLM wheel
+ # if USE_SCCACHE is set, use sccache to speed up compilation
+ # AWS credentials mounted at ~/.aws/credentials for sccache S3 auth (optional)

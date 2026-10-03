@@ -1,0 +1,67 @@
+===== worker pid 740474
+Process 740474: VLLM::Worker_TP0
+Python v3.12.14 (/usr/bin/python3.12)
+
+Thread 149 (active): "MainThread"
+    _apply_top_k_top_p_compact (vllm/v1/sample/ops/topk_topp_triton.py:1109)
+    apply_top_k_top_p_triton (vllm/v1/sample/ops/topk_topp_triton.py:1217)
+    apply_top_k_top_p (vllm/v1/sample/ops/topk_topp_sampler.py:341)
+    apply_top_k_top_p (vllm/v1/worker/gpu/sample/states.py:104)
+    apply_sampling_params (vllm/v1/worker/gpu/sample/sampler.py:185)
+    sample (vllm/v1/worker/gpu/sample/sampler.py:198)
+    __call__ (vllm/v1/worker/gpu/sample/sampler.py:98)
+    sample (vllm/v1/worker/gpu/model_runner.py:1378)
+    sample_tokens (vllm/v1/worker/gpu/model_runner.py:1807)
+    wrapper (vllm/v1/worker/gpu/eplb_utils.py:37)
+    decorate_context (torch/utils/_contextlib.py:124)
+    sample_tokens (vllm/v1/worker/gpu_worker.py:991)
+    decorate_context (torch/utils/_contextlib.py:124)
+    warmup_kernels (vllm/v1/worker/gpu/warmup.py:239)
+    decorate_context (torch/utils/_contextlib.py:124)
+    compile_or_warm_up_model (vllm/v1/worker/gpu_worker.py:884)
+    sync_wrapper (vllm/tracing/otel.py:178)
+    worker_busy_loop (vllm/v1/executor/multiproc_executor.py:975)
+    worker_main (vllm/v1/executor/multiproc_executor.py:879)
+    run (multiprocessing/process.py:108)
+    _bootstrap (multiprocessing/process.py:314)
+    _main (multiprocessing/spawn.py:135)
+    spawn_main (multiprocessing/spawn.py:122)
+    <module> (<string>:1)
+Thread 412 (active): "Thread-1 (_report_usage_worker)"
+    read (ssl.py:1103)
+    recv_into (ssl.py:1251)
+    readinto (socket.py:720)
+    _read_status (http/client.py:304)
+    begin (http/client.py:343)
+    getresponse (http/client.py:1478)
+    getresponse (urllib3/connection.py:638)
+    _make_request (urllib3/connectionpool.py:540)
+    urlopen (urllib3/connectionpool.py:793)
+    send (requests/adapters.py:696)
+    send (requests/sessions.py:784)
+    request (requests/sessions.py:651)
+    post (requests/sessions.py:712)
+    _send_to_server (vllm/usage/usage_lib.py:269)
+    _report_continuous_usage (vllm/usage/usage_lib.py:264)
+    _report_usage_worker (vllm/usage/usage_lib.py:174)
+===== worker pid 740475
+Process 740475: VLLM::Worker_TP1
+Python v3.12.14 (/usr/bin/python3.12)
+
+Error: Failed to get stack traces
+
+Caused by:
+    0: Failed to suspend process
+    1: unexpected waitpid result Signaled(Pid(740475), SIGKILL, false) to 740475
+===== worker pid 740476
+Error: Failed to get process executable name. Check that the process is running.
+
+Caused by:
+    0: No such file or directory (os error 2)
+    1: No such file or directory (os error 2)
+===== worker pid 740477
+Error: Failed to get process executable name. Check that the process is running.
+
+Caused by:
+    0: No such file or directory (os error 2)
+    1: No such file or directory (os error 2)

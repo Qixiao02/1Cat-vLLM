@@ -1,0 +1,733 @@
+{
+ "schema": 2,
+ "args": {
+  "port": 8141,
+  "model": "Swift-1.5-Qwen3.8-Flash-Next",
+  "out": "/mnt/2t/build/cmp1003/VMa_mtp_c1_8k.json",
+  "lengths": "8000",
+  "conc": 1,
+  "gen": 256,
+  "passes": 1,
+  "seed": 2026100101,
+  "gpus": "4,5,6,7",
+  "temperature": 0.0
+ },
+ "started": "2026-10-03 21:50:27",
+ "engine": {
+  "version": "1.5.1",
+  "models": [
+   {
+    "id": "Swift-1.5-Qwen3.8-Flash-Next",
+    "max_model_len": 32768
+   }
+  ],
+  "cache_config": {
+   "_block_size_resolved": "True",
+   "block_size": "16",
+   "cache_dtype": "auto",
+   "cache_dtype_from_checkpoint": "False",
+   "calculate_kv_scales": "False",
+   "enable_prefix_caching": "True",
+   "engine": "0",
+   "gpu_memory_utilization": "0.92",
+   "hash_block_size": "None",
+   "is_attention_free": "False",
+   "kv_cache_dtype_skip_layers": "[]",
+   "kv_cache_memory_bytes": "None",
+   "kv_offloading_backend": "native",
+   "kv_offloading_size": "None",
+   "kv_sharing_fast_prefill": "False",
+   "mamba_block_size": "16",
+   "mamba_cache_dtype": "auto",
+   "mamba_cache_mode": "align",
+   "mamba_page_size_padded": "None",
+   "mamba_ssm_cache_dtype": "float32",
+   "num_cpu_blocks": "None",
+   "num_gpu_blocks": "272",
+   "num_gpu_blocks_override": "None",
+   "prefix_cache_retention_interval": "0",
+   "prefix_caching_hash_algo": "sha256",
+   "sliding_window": "None",
+   "user_specified_block_size": "False",
+   "user_specified_mamba_block_size": "False"
+  }
+ },
+ "cells": [
+  {
+   "wall_start": "2026-10-03 21:50:32",
+   "loadavg": [
+    "11.34",
+    "10.86",
+    "9.02"
+   ],
+   "kv_peak": 0.1181,
+   "waiting_peak": 0,
+   "running_peak": 1,
+   "cache_hit_tokens": 0,
+   "preemptions": 0,
+   "server": {
+    "spec_decode_num_drafts_total": 102.0,
+    "spec_decode_num_draft_tokens_total": 408.0,
+    "spec_decode_num_accepted_tokens_total": 153.0,
+    "spec_decode_num_accepted_tokens_per_pos_total": 153.0,
+    "prefix_cache_queries_total": 7996.0,
+    "prompt_tokens_total": 7996.0,
+    "prompt_tokens_by_source_total": 7996.0,
+    "generation_tokens_total": 256.0,
+    "request_success_total": 1.0,
+    "request_prompt_tokens_count": 1.0,
+    "request_prompt_tokens_sum": 7996.0,
+    "request_generation_tokens_count": 1.0,
+    "request_generation_tokens_sum": 256.0,
+    "iteration_tokens_total_count": 103.0,
+    "iteration_tokens_total_sum": 8252.0,
+    "request_max_num_generation_tokens_count": 1.0,
+    "request_max_num_generation_tokens_sum": 256.0,
+    "request_params_n_count": 1.0,
+    "request_params_n_sum": 1.0,
+    "request_params_max_tokens_count": 1.0,
+    "request_params_max_tokens_sum": 256.0,
+    "time_to_first_token_seconds_count": 1.0,
+    "time_to_first_token_seconds_sum": 1.8544,
+    "inter_token_latency_seconds_count": 102.0,
+    "inter_token_latency_seconds_sum": 2.3569,
+    "request_time_per_output_token_seconds_count": 1.0,
+    "request_time_per_output_token_seconds_sum": 0.0092,
+    "e2e_request_latency_seconds_count": 1.0,
+    "e2e_request_latency_seconds_sum": 4.2114,
+    "request_queue_time_seconds_count": 1.0,
+    "request_queue_time_seconds_sum": 0.0,
+    "request_inference_time_seconds_count": 1.0,
+    "request_inference_time_seconds_sum": 4.1726,
+    "request_prefill_time_seconds_count": 1.0,
+    "request_prefill_time_seconds_sum": 1.8157,
+    "request_decode_time_seconds_count": 1.0,
+    "request_decode_time_seconds_sum": 2.3569,
+    "request_prefill_kv_computed_tokens_count": 1.0,
+    "request_prefill_kv_computed_tokens_sum": 7996.0
+   },
+   "timeline": [
+    {
+     "t": 0.0,
+     "kv": 0.0,
+     "running": 0,
+     "waiting": 0,
+     "gpu": [
+      [
+       21.0,
+       32145.0,
+       72.12
+      ],
+      [
+       28.0,
+       32085.0,
+       78.89
+      ],
+      [
+       1.0,
+       32085.0,
+       77.4
+      ],
+      [
+       44.0,
+       32085.0,
+       73.23
+      ]
+     ]
+    },
+    {
+     "t": 1.0,
+     "kv": 0.0996,
+     "running": 1,
+     "waiting": 0,
+     "gpu": [
+      [
+       61.0,
+       32145.0,
+       230.29
+      ],
+      [
+       59.0,
+       32085.0,
+       228.23
+      ],
+      [
+       38.0,
+       32085.0,
+       259.4
+      ],
+      [
+       80.0,
+       32085.0,
+       231.38
+      ]
+     ]
+    },
+    {
+     "t": 2.0,
+     "kv": 0.1144,
+     "running": 1,
+     "waiting": 0,
+     "gpu": [
+      [
+       98.0,
+       32145.0,
+       144.97
+      ],
+      [
+       98.0,
+       32085.0,
+       151.47
+      ],
+      [
+       97.0,
+       32085.0,
+       162.34
+      ],
+      [
+       98.0,
+       32085.0,
+       140.29
+      ]
+     ]
+    },
+    {
+     "t": 3.0,
+     "kv": 0.1144,
+     "running": 1,
+     "waiting": 0,
+     "gpu": [
+      [
+       98.0,
+       32145.0,
+       144.11
+      ],
+      [
+       98.0,
+       32085.0,
+       150.61
+      ],
+      [
+       97.0,
+       32085.0,
+       152.12
+      ],
+      [
+       98.0,
+       32085.0,
+       139.91
+      ]
+     ]
+    },
+    {
+     "t": 4.0,
+     "kv": 0.1181,
+     "running": 1,
+     "waiting": 0,
+     "gpu": [
+      [
+       98.0,
+       32145.0,
+       147.75
+      ],
+      [
+       98.0,
+       32085.0,
+       150.71
+      ],
+      [
+       98.0,
+       32085.0,
+       151.37
+      ],
+      [
+       97.0,
+       32085.0,
+       138.95
+      ]
+     ]
+    }
+   ],
+   "prompt_tokens": [
+    7996
+   ],
+   "completion_tokens": [
+    256
+   ],
+   "ttft": [
+    1.861
+   ],
+   "ttft_first": 1.861,
+   "ttft_last": 1.861,
+   "prefill_tok_s": 4296.0,
+   "decode_window_s": 2.353,
+   "decode_tok_s": 108.36,
+   "decode_tok_s_min": 108.36,
+   "decode_tok_s_max": 108.36,
+   "decode_agg_tok_s": 108.36,
+   "e2e_s": 4.214,
+   "wave": 1,
+   "wave_ttft_last": 1.861,
+   "wave_prefill_tok_s": 4296.0,
+   "wave_window_s": 2.353,
+   "wave_decode_tok_s": 108.36,
+   "wave_decode_agg_tok_s": 108.36,
+   "requests": [
+    {
+     "i": 0,
+     "prompt_tokens": 7996,
+     "completion_tokens": 256,
+     "send_offset_s": 0.0,
+     "ttft_s": 1.861,
+     "finish_s": 4.214,
+     "own_decode_tok_s": 108.36,
+     "window_decode_tok_s": 108.36,
+     "in_wave": true,
+     "tokens_before_window": 1,
+     "itl_ms": {
+      "p50": 22.9,
+      "p90": 23.6,
+      "p99": 30.5,
+      "max": 43.1
+     },
+     "events": [
+      [
+       1861,
+       1
+      ],
+      [
+       1904,
+       3
+      ],
+      [
+       1927,
+       4
+      ],
+      [
+       1950,
+       8
+      ],
+      [
+       1973,
+       11
+      ],
+      [
+       1997,
+       16
+      ],
+      [
+       2019,
+       18
+      ],
+      [
+       2042,
+       20
+      ],
+      [
+       2065,
+       25
+      ],
+      [
+       2088,
+       30
+      ],
+      [
+       2118,
+       32
+      ],
+      [
+       2134,
+       33
+      ],
+      [
+       2157,
+       36
+      ],
+      [
+       2180,
+       38
+      ],
+      [
+       2202,
+       41
+      ],
+      [
+       2224,
+       44
+      ],
+      [
+       2247,
+       47
+      ],
+      [
+       2270,
+       49
+      ],
+      [
+       2293,
+       51
+      ],
+      [
+       2323,
+       55
+      ],
+      [
+       2338,
+       56
+      ],
+      [
+       2362,
+       58
+      ],
+      [
+       2384,
+       60
+      ],
+      [
+       2407,
+       65
+      ],
+      [
+       2430,
+       67
+      ],
+      [
+       2453,
+       68
+      ],
+      [
+       2476,
+       70
+      ],
+      [
+       2498,
+       72
+      ],
+      [
+       2522,
+       77
+      ],
+      [
+       2544,
+       82
+      ],
+      [
+       2567,
+       86
+      ],
+      [
+       2590,
+       87
+      ],
+      [
+       2612,
+       89
+      ],
+      [
+       2635,
+       93
+      ],
+      [
+       2658,
+       94
+      ],
+      [
+       2681,
+       95
+      ],
+      [
+       2703,
+       96
+      ],
+      [
+       2733,
+       98
+      ],
+      [
+       2749,
+       100
+      ],
+      [
+       2771,
+       102
+      ],
+      [
+       2794,
+       107
+      ],
+      [
+       2817,
+       109
+      ],
+      [
+       2840,
+       113
+      ],
+      [
+       2863,
+       118
+      ],
+      [
+       2886,
+       123
+      ],
+      [
+       2908,
+       126
+      ],
+      [
+       2932,
+       127
+      ],
+      [
+       2954,
+       129
+      ],
+      [
+       2977,
+       132
+      ],
+      [
+       3000,
+       135
+      ],
+      [
+       3023,
+       140
+      ],
+      [
+       3046,
+       143
+      ],
+      [
+       3069,
+       145
+      ],
+      [
+       3092,
+       147
+      ],
+      [
+       3115,
+       149
+      ],
+      [
+       3138,
+       151
+      ],
+      [
+       3160,
+       152
+      ],
+      [
+       3183,
+       154
+      ],
+      [
+       3206,
+       157
+      ],
+      [
+       3228,
+       159
+      ],
+      [
+       3251,
+       164
+      ],
+      [
+       3274,
+       167
+      ],
+      [
+       3297,
+       169
+      ],
+      [
+       3320,
+       170
+      ],
+      [
+       3344,
+       171
+      ],
+      [
+       3367,
+       173
+      ],
+      [
+       3389,
+       174
+      ],
+      [
+       3412,
+       175
+      ],
+      [
+       3435,
+       179
+      ],
+      [
+       3458,
+       184
+      ],
+      [
+       3480,
+       185
+      ],
+      [
+       3504,
+       187
+      ],
+      [
+       3526,
+       190
+      ],
+      [
+       3549,
+       191
+      ],
+      [
+       3572,
+       193
+      ],
+      [
+       3596,
+       195
+      ],
+      [
+       3618,
+       197
+      ],
+      [
+       3641,
+       198
+      ],
+      [
+       3664,
+       200
+      ],
+      [
+       3687,
+       202
+      ],
+      [
+       3710,
+       203
+      ],
+      [
+       3733,
+       205
+      ],
+      [
+       3763,
+       206
+      ],
+      [
+       3779,
+       208
+      ],
+      [
+       3802,
+       209
+      ],
+      [
+       3825,
+       211
+      ],
+      [
+       3848,
+       216
+      ],
+      [
+       3871,
+       218
+      ],
+      [
+       3895,
+       221
+      ],
+      [
+       3917,
+       223
+      ],
+      [
+       3940,
+       225
+      ],
+      [
+       3963,
+       229
+      ],
+      [
+       3985,
+       233
+      ],
+      [
+       4014,
+       236
+      ],
+      [
+       4031,
+       237
+      ],
+      [
+       4054,
+       239
+      ],
+      [
+       4077,
+       242
+      ],
+      [
+       4100,
+       243
+      ],
+      [
+       4122,
+       244
+      ],
+      [
+       4146,
+       246
+      ],
+      [
+       4168,
+       250
+      ],
+      [
+       4199,
+       251
+      ],
+      [
+       4214,
+       256
+      ]
+     ]
+    }
+   ],
+   "conc": 1,
+   "length": 8000,
+   "pass": 0
+  }
+ ],
+ "warmup": [
+  {
+   "prefill_tok_s": 3080.4,
+   "decode_tok_s": 126.37,
+   "ttft": [
+    0.648
+   ],
+   "errors": null
+  },
+  {
+   "prefill_tok_s": 4224.8,
+   "decode_tok_s": 112.25,
+   "ttft": [
+    3.788
+   ],
+   "errors": null
+  }
+ ],
+ "finished": "2026-10-03 21:50:37"
+}
