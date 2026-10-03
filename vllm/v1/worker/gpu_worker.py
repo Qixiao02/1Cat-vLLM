@@ -880,6 +880,17 @@ class Worker(WorkerBase):
 
         activate_triton_jit_monitor()
 
+        # SX_OPT_COMPILE_CACHE: one greppable line per rank with the
+        # compile/reload counters (sx_tests/compile-cache/cache_parity.py).
+        from vllm.compilation import sx_compile_cache
+        from vllm.compilation.counter import compilation_counter
+
+        if sx_compile_cache.compile_cache_enabled():
+            logger.info(
+                "SX compile-cache counters: %s",
+                sx_compile_cache.counters_line(compilation_counter),
+            )
+
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,

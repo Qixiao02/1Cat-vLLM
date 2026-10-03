@@ -23,6 +23,7 @@ from packaging.version import Version
 from pydantic import ConfigDict, Field, model_validator
 
 import vllm.envs as envs
+from vllm.compilation import sx_compile_cache as _sx_compile_cache
 from vllm.logger import enable_trace_function_call, init_logger
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.triton_utils import HAS_TRITON
@@ -1580,6 +1581,18 @@ class VllmConfig:
             vllm_factors.append(additional_config_hash)
         else:
             vllm_factors.append("None")
+        if _sx_compile_cache.compile_cache_enabled():
+            # SX_OPT_COMPILE_CACHE: NVFP4 linears bake per-layer global scales
+            # into the traced graph, so the key carries the checkpoint files
+            # (names, sizes, mtimes, small json by content). Off: key unchanged.
+            vllm_factors.append(
+                (
+                    "sx_checkpoint",
+                    _sx_compile_cache.checkpoint_identity(
+                        self.model_config.model if self.model_config else None
+                    ),
+                )
+            )
         factors.append(vllm_factors)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()[
@@ -2782,7 +2795,13 @@ class VllmConfig:
                         "Flash-V100 0.0.3 compile graph quality parity; "
                         "greedy decode keeps the local-logits top1 shortcut."
                     )
-                if "VLLM_USE_AOT_COMPILE" not in os.environ:
+                # SX_OPT_COMPILE_CACHE (default off): reuse the torch.compile
+                # cache across restarts instead of forcing the opt-out below.
+                # Off keeps every original branch unchanged.
+                sx_cache_policy = _sx_compile_cache.plan_policy()
+                if sx_cache_policy.mode != _sx_compile_cache.MODE_OFF:
+                    _sx_compile_cache.apply_policy(sx_cache_policy, log=logger)
+                elif "VLLM_USE_AOT_COMPILE" not in os.environ:
                     os.environ["VLLM_USE_AOT_COMPILE"] = "1"
                     logger.info_once(
                         "Auto-setting VLLM_USE_AOT_COMPILE=1 for SM70 "
@@ -2801,7 +2820,9 @@ class VllmConfig:
                             "configuration: regular torch.compile reproduced "
                             "deterministic greedy token drift."
                         )
-                if envs.VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING:
+                if sx_cache_policy.mode != _sx_compile_cache.MODE_OFF:
+                    pass  # SX_OPT_COMPILE_CACHE: no forced opt-out (see above)
+                elif envs.VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING:
                     logger.warning_once(
                         "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING=1: "
                         "leaving VLLM_DISABLE_COMPILE_CACHE unset for "

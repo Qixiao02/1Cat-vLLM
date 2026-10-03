@@ -873,6 +873,12 @@ def disable_compile_cache() -> bool:
         "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH",
         "0",
     ).strip().lower() in ("1", "true", "yes", "on")
+    # SX_OPT_COMPILE_CACHE (default off): the Flash-V100 compile graph stops
+    # forcing the opt-out; see vllm/compilation/sx_compile_cache.py.
+    if sm70_compile_graph:
+        from vllm.compilation.sx_compile_cache import compile_cache_enabled
+
+        sm70_compile_graph = not compile_cache_enabled()
     default_value = "1" if sm70_compile_graph else "0"
     return bool(int(os.getenv("VLLM_DISABLE_COMPILE_CACHE", default_value)))
 
@@ -890,6 +896,13 @@ def use_aot_compile() -> bool:
         or (is_torch_equal_or_newer("2.10.0") and not disable_compile_cache())
         else "0"
     )
+    # SX_OPT_COMPILE_CACHE=1/subgraph reuses compiled subgraphs without the AOT
+    # FX-graph reload; "aot" keeps the lane default. Off changes nothing.
+    from vllm.compilation.sx_compile_cache import aot_default, compile_cache_mode
+
+    sx_aot_default = aot_default(compile_cache_mode())
+    if sx_aot_default is not None:
+        default_value = sx_aot_default
 
     return os.environ.get("VLLM_USE_AOT_COMPILE", default_value) == "1"
 
@@ -5063,7 +5076,17 @@ def compile_factors() -> dict[str, object]:
             continue
         if name in factors or name in ignored_factors:
             continue
+        if name == "SX_OPT_COMPILE_CACHE":
+            # Recorded below as the canonical mode, and only when it is on, so
+            # "0" and "unset" keep the pre-switch key.
+            continue
         factors[name] = normalize_value(value)
+
+    # SX_OPT_COMPILE_CACHE: with the cache reuse on, the key also carries the
+    # build identity (versions, device, source and native fingerprints).
+    from vllm.compilation.sx_compile_cache import extra_compile_factors
+
+    factors.update(extra_compile_factors())
 
     ray_noset_env_vars = [
         # Refer to
