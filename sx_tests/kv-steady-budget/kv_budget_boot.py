@@ -309,6 +309,7 @@ def worker_class(
         is_device_capability=lambda cap, device_id=None: is_sm70 and cap in (70, (7, 0)),
     )
     namespace = {
+        "os": os,
         "torch": fake_torch,
         "envs": envs,
         "CUDAGraphMode": _Mode,

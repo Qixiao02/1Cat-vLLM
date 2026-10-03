@@ -45,7 +45,12 @@ What the switch does (everything else in the worker stays as it is):
 1. The graph pool is reserved before the KV cache is sized, as upstream does
    for SM70 V2 (4bbaf64fc, ``get_sm70_cudagraph_memory_reserve``: the profiled
    activation peak): ``available = requested - non_kv - graph_reserve``. This is
-   the *utilisation* bound.
+   the *utilisation* bound. The two admitted lanes skip that reserve here (an
+   explicit ``VLLM_V2_CUDAGRAPH_MEM_MIB`` is still honoured): their lane
+   reference ``P`` below is the whole run's measured peak, graph pool included, so
+   charging it twice would only shrink the KV cache at an unchanged utilisation
+   (the no-MTP lane at util 0.90: 410,988 -> 325,088 tokens, measured on the
+   first default-on run). Any other model keeps the reserve.
 2. A *physical* bound is added: the KV cache may not take memory that the
    rest of the steady state needs. ``F_prof`` is the device-free memory right
    after the measured profile (activations freed; weights, residue, CUDA

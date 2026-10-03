@@ -172,8 +172,9 @@ def test_switch_off_keeps_an_explicit_runner_estimate():
 
 
 def test_switch_on_applies_the_activation_peak_as_graph_reserve(monkeypatch):
+    # A lane without a measured reference keeps upstream's arithmetic.
     monkeypatch.setenv(kb.ENV_SWITCH, "1")
-    worker, logger, _ = make_worker(util=0.87, spec_method="mtp")
+    worker, logger, _ = make_worker(util=0.87, spec_method="mtp", lane_contract=None)
     available = worker.determine_available_memory()
     assert worker.cudagraph_memory_estimate == ACTIVATION
     assert "SM70 graph memory reserve before KV allocation: 1.17 GiB" in logger.text()
@@ -253,7 +254,9 @@ def test_switch_on_without_v2_or_sm70_changes_nothing(monkeypatch):
 
 def test_estimator_disabled_means_no_graph_reserve(monkeypatch):
     monkeypatch.setenv(kb.ENV_SWITCH, "1")
-    worker, _, _ = make_worker(util=0.87, spec_method="mtp", estimate_cudagraphs=False)
+    worker, _, _ = make_worker(
+        util=0.87, spec_method="mtp", lane_contract=None, estimate_cudagraphs=False
+    )
     available = worker.determine_available_memory()
     assert worker._sx_steady_plan.graph_reserve == 0
     assert available == legacy_budget_at(0.87, 0)
@@ -266,6 +269,44 @@ def test_explicit_graph_reserve_override_is_honoured(monkeypatch):
     available = worker.determine_available_memory()
     assert worker._sx_steady_plan.graph_reserve == 700 * MiB
     assert available == legacy_budget_at(0.87, 700 * MiB)
+
+
+@pytest.mark.parametrize("spec_method", ["mtp", None])
+def test_admitted_lanes_do_not_charge_the_graph_reserve_twice(monkeypatch, spec_method):
+    """The lane reference already contains the graph pool: at an unchanged
+    utilisation the KV cache is the legacy size (never smaller), the physical
+    bound only caps it. The no-MTP lane at util 0.90 lost 21% before this."""
+    monkeypatch.setenv(kb.ENV_SWITCH, "1")
+    worker, logger, _ = make_worker(util=0.87, spec_method=spec_method)
+    available = worker.determine_available_memory()
+    plan = worker._sx_steady_plan
+    assert plan.graph_reserve == 0
+    assert plan.limiting == "utilisation"
+    assert available == legacy_budget_at(0.87, 0) == plan.kv_bytes
+    assert "lane reference already contains the graph pool" in logger.text("info")
+    # the reserve was computed (and logged) first, then not charged
+    assert worker.cudagraph_memory_estimate == ACTIVATION
+
+
+@pytest.mark.parametrize("spec_method", ["mtp", None])
+def test_admitted_lanes_still_take_the_physical_bound_at_a_high_utilisation(
+    monkeypatch, spec_method
+):
+    monkeypatch.setenv(kb.ENV_SWITCH, "1")
+    worker, _, _ = make_worker(util=0.99, spec_method=spec_method)
+    available = worker.determine_available_memory()
+    plan = worker._sx_steady_plan
+    assert plan.limiting == "physical"
+    assert available == plan.kv_physical < plan.kv_utilisation
+
+
+def test_an_explicit_graph_reserve_is_kept_on_an_admitted_lane(monkeypatch):
+    monkeypatch.setenv(kb.ENV_SWITCH, "1")
+    monkeypatch.setenv("VLLM_V2_CUDAGRAPH_MEM_MIB", "700")
+    worker, logger, _ = make_worker(util=0.87, spec_method=None)
+    worker.determine_available_memory()
+    assert worker._sx_steady_plan.graph_reserve == 700 * MiB
+    assert "lane reference already contains the graph pool" not in logger.text("info")
 
 
 def test_explicit_kv_bytes_skips_the_plan(monkeypatch):

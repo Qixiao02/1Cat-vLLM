@@ -739,6 +739,25 @@ class Worker(WorkerBase):
             lane = "mtp"
         else:
             lane = "other"
+        if lane in kv_budget.LANE_REFERENCES and (
+            "VLLM_V2_CUDAGRAPH_MEM_MIB" not in os.environ
+        ):
+            # The lane reference (the highest memory.used of a whole run, graph
+            # pool included) already covers the graph pool, so the upstream-style
+            # activation-peak reserve is not charged against the utilisation as
+            # well. Otherwise the no-MTP lane at its production utilisation 0.90
+            # would lose 21% of its KV cache (410,988 -> 325,088 tokens); now an
+            # unchanged --gpu-memory-utilization never gives a smaller KV cache
+            # than without the budget, the physical bound only caps it.
+            if graph_reserve:
+                logger.info(
+                    "KV steady budget: the %s lane reference already contains "
+                    "the graph pool, so the %.2f GiB graph reserve is not "
+                    "charged against --gpu-memory-utilization.",
+                    lane,
+                    graph_reserve / 2**30,
+                )
+            graph_reserve = 0
         inputs = kv_budget.BudgetInputs(
             total_memory=int(self.init_snapshot.total_memory),
             requested_memory=int(self.requested_memory),
