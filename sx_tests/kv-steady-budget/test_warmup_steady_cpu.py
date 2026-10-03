@@ -39,16 +39,36 @@ kb = boot.load_budget()
 WARMUP = os.path.join(boot.REPO, "vllm", "v1", "worker", "gpu", "warmup.py")
 
 
+class FakeSamplingParams:
+    """``SamplingParams.for_sampler_warmup()`` as the warm-up builds it."""
+
+    def __init__(self, prompt_logprobs: int | None = 1) -> None:
+        self.prompt_logprobs = prompt_logprobs
+        self.logprobs = 5
+
+    @staticmethod
+    def for_sampler_warmup(prompt_logprobs: int | None = 1) -> "FakeSamplingParams":
+        return FakeSamplingParams(prompt_logprobs)
+
+
 def load_helpers():
     source = open(WARMUP, encoding="utf-8").read()
-    wanted = {"_steady_warmup_tokens", "_kernel_prefill_warmup_token_counts"}
+    wanted = {
+        "_steady_warmup_tokens",
+        "_kernel_prefill_warmup_token_counts",
+        "_profile_sampling_params",
+    }
     parts = [
         boot._segment(source, node)
         for node in ast.parse(source).body
         if isinstance(node, ast.FunctionDef) and node.name in wanted
     ]
     assert len(parts) == len(wanted), "warm-up helpers not found"
-    namespace = {"kv_steady_budget": kb, "GPUModelRunner": object}
+    namespace = {
+        "kv_steady_budget": kb,
+        "GPUModelRunner": object,
+        "SamplingParams": FakeSamplingParams,
+    }
     exec(compile("\n\n".join(parts), WARMUP, "exec"), namespace)  # noqa: S102
     return namespace
 
@@ -113,3 +133,20 @@ def test_tokens_override(monkeypatch, value, expected):
 def test_a_length_already_advertised_is_not_duplicated(monkeypatch):
     monkeypatch.setenv(kb.ENV_SWITCH, "1")
     assert counts(runner(advertised=((33,), (8192,)))) == (6, 33, 8192)
+
+
+def test_the_full_chunk_profile_leaves_prompt_logprobs_out():
+    default = FakeSamplingParams()
+    pick = HELPERS["_profile_sampling_params"]
+    steady = pick(8192, 8192, default)
+    assert steady is not default
+    assert steady.prompt_logprobs is None and steady.logprobs == 5
+    # Every other profile (and the switch off, steady_tokens == 0) keeps the defaults.
+    assert pick(6, 8192, default) is default
+    assert pick(48, 8192, default) is default
+    assert pick(8192, 0, default) is default
+    assert default.prompt_logprobs == 1  # the shared object is not modified
+
+
+def test_pooling_models_have_no_sampling_params():
+    assert HELPERS["_profile_sampling_params"](8192, 8192, None) is None

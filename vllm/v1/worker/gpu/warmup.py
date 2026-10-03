@@ -40,6 +40,25 @@ def _steady_warmup_tokens(model_runner: GPUModelRunner) -> int:
     )
 
 
+def _profile_sampling_params(
+    prompt_len: int,
+    steady_tokens: int,
+    default_params: SamplingParams | None,
+) -> SamplingParams | None:
+    """Sampling parameters of one warm-up profile.
+
+    The sampler warm-up asks for ``prompt_logprobs``. Over the 6-48 token
+    prompts that is nothing, but over a full-chunk prefill it would also run the
+    prompt-logprob path (1024-row logits chunks of the whole vocabulary, a few
+    hundred MiB that the allocator then keeps cached) which ordinary requests
+    never touch. The SX_OPT_KV_STEADY_BUDGET full-chunk profile therefore
+    leaves it out.
+    """
+    if default_params is None or not steady_tokens or prompt_len != steady_tokens:
+        return default_params
+    return SamplingParams.for_sampler_warmup(prompt_logprobs=None)
+
+
 def _kernel_prefill_warmup_token_counts(
     model_runner: GPUModelRunner,
     default_prompt_len: int,
@@ -204,12 +223,15 @@ def warmup_kernels(
                     range(next_block_id, next_block_id := next_block_id + num_blocks)
                 )
 
+            profile_params = _profile_sampling_params(
+                prompt_len, steady_tokens if profile_idx else 0, sampling_params
+            )
             new_reqs = [
                 NewRequestData.from_request(
                     Request(
                         req_ids[i],
                         prompt_token_ids,
-                        sampling_params,
+                        profile_params,
                         pooling_params,
                     ),
                     block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
