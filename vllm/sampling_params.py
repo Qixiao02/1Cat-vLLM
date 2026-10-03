@@ -1038,7 +1038,7 @@ class SamplingParams(
         )
 
     @staticmethod
-    def for_sampler_warmup() -> "SamplingParams":
+    def for_sampler_warmup(prompt_logprobs: int | None = 1) -> "SamplingParams":
         """Set parameters to exercise all sampler logic."""
         return SamplingParams(
             temperature=0.9,
@@ -1052,7 +1052,7 @@ class SamplingParams(
             logit_bias={0: -1.0, 1: 0.5},
             _bad_words_token_ids=[[0], [1, 2]],
             logprobs=5,
-            prompt_logprobs=1,
+            prompt_logprobs=prompt_logprobs,
         )
 
 

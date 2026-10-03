@@ -252,6 +252,11 @@ def _sx_env_on(name: str) -> bool:
     return os.environ.get(name, "1").strip() != "0"
 
 
+def _sx_kv_steady_budget_enabled() -> bool:
+    """SX_OPT_KV_STEADY_BUDGET=1 (default off): steady-state KV budgeting."""
+    return os.environ.get("SX_OPT_KV_STEADY_BUDGET", "0").strip() == "1"
+
+
 def _sx_mtp_lane_enabled() -> bool:
     return _sx_env_on("SX_OPT_MTP_LANE")
 
@@ -2782,7 +2787,18 @@ class VllmConfig:
                         "Auto-setting VLLM_MQ_BROADCASTER_MAX_CHUNKS=64 for "
                         "SM70 Flash-V100 0.0.3 compile graph startup."
                     )
-                if "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" not in os.environ:
+                if "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" in os.environ:
+                    pass
+                elif _sx_kv_steady_budget_enabled() and self.use_v2_model_runner:
+                    # SX_OPT_KV_STEADY_BUDGET (vllm/v1/worker/kv_steady_budget.py):
+                    # V2 reserves its graph pool before the KV cache is sized
+                    # (upstream 4bbaf64fc), so the legacy estimator stays on.
+                    logger.info_once(
+                        "SX_OPT_KV_STEADY_BUDGET=1: keeping the graph memory "
+                        "estimate on; V2 budgets its graph reserve before KV "
+                        "allocation."
+                    )
+                else:
                     os.environ["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] = "0"
                     logger.info_once(
                         "Auto-setting VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 "

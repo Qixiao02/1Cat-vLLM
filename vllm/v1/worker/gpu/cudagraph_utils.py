@@ -63,6 +63,25 @@ def get_explicit_cudagraph_memory_reserve(cudagraph_mode: CUDAGraphMode) -> int:
     return reserve_bytes
 
 
+def get_sm70_cudagraph_memory_reserve(
+    cudagraph_mode: CUDAGraphMode, activation_peak_bytes: int
+) -> int:
+    """Budget a profiled activation peak for graph pools, unless overridden.
+
+    V2 cannot capture the real graphs before allocating KV. Reserve the measured
+    forward scratch peak instead of silently reserving zero on SM70. This is an
+    admission estimate, not a hard cap on the CUDA caching allocator.
+
+    Port of upstream 1CatAI/1Cat-vLLM 4bbaf64fc (#671). The fork only reaches
+    it through SX_OPT_KV_STEADY_BUDGET (see vllm/v1/worker/kv_steady_budget.py).
+    """
+    if "VLLM_V2_CUDAGRAPH_MEM_MIB" in os.environ:
+        return get_explicit_cudagraph_memory_reserve(cudagraph_mode)
+    if cudagraph_mode == CUDAGraphMode.NONE:
+        return 0
+    return max(0, activation_peak_bytes)
+
+
 def _use_split_sm70_mtp_cudagraphs(vllm_config: VllmConfig) -> bool:
     speculative_config = vllm_config.speculative_config
     return bool(
