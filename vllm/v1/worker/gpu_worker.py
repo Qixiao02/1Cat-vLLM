@@ -589,6 +589,7 @@ class Worker(WorkerBase):
 
         self.non_torch_memory = profile_result.non_torch_increase
         self.peak_activation_memory = profile_result.torch_peak_increase
+        self.warmup_torch_memory = warmup_torch_residual
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
 
         free_gpu_memory = profile_result.after_profile.free_memory
@@ -804,6 +805,7 @@ class Worker(WorkerBase):
 
             non_kv_cache_memory = (
                 self.model_runner.model_memory_usage
+                + self.warmup_torch_memory
                 + self.peak_activation_memory
                 + self.non_torch_memory
                 + cuda_graph_memory_bytes
@@ -828,7 +830,9 @@ class Worker(WorkerBase):
                 f"{format_gib(self.requested_memory)} GiB). "
                 f"Actual usage is {format_gib(self.model_runner.model_memory_usage)} "
                 f"GiB for weight, {format_gib(self.peak_activation_memory)} GiB "
-                f"for peak activation, {format_gib(self.non_torch_memory)} GiB "
+                f"for peak activation, {format_gib(self.warmup_torch_memory)} GiB "
+                f"for persistent warmup allocations, "
+                f"{format_gib(self.non_torch_memory)} GiB "
                 f"for non-torch memory, and {format_gib(cuda_graph_memory_bytes)} "
                 f"GiB for CUDAGraph memory. Replace gpu_memory_utilization "
                 f"config with `--kv-cache-memory="
