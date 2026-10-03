@@ -103,7 +103,7 @@ def test_strict_flag(monkeypatch):
 @pytest.mark.parametrize("raw", ["-1", "abc", "nan", "inf"])
 def test_bad_memory_knobs_are_refused(raw):
     with pytest.raises(ValueError, match="SX_OPT_KV_STEADY"):
-        kb.read_mib("SX_OPT_KV_STEADY_HEADROOM_MIB", 512, {"SX_OPT_KV_STEADY_HEADROOM_MIB": raw})
+        kb.read_mib("SX_OPT_KV_STEADY_HEADROOM_MIB", 576, {"SX_OPT_KV_STEADY_HEADROOM_MIB": raw})
 
 
 def test_read_mib_defaults_and_values():
@@ -147,7 +147,7 @@ def test_kv_grows_with_utilisation_until_the_physical_bound():
 def test_physical_bound_leaves_exactly_the_headroom(util):
     plan = kb.plan_kv_budget(inputs(util))
     assert plan.limiting == "physical"
-    assert plan.predicted_free_at_peak == plan.headroom == 512 * MiB
+    assert plan.predicted_free_at_peak == plan.headroom == kb.DEFAULT_HEADROOM_MIB * MiB
 
 
 def test_predicted_free_memory_is_larger_when_the_utilisation_limits():
@@ -169,7 +169,7 @@ def test_gain_over_todays_sizing_is_the_unused_headroom(activation, context):
     finally:
         ACTIVATION = saved
     ref = kb.LANE_REFERENCES["mtp"]
-    expected_gain = TOTAL - ref.peak_mib * MiB - 512 * MiB
+    expected_gain = TOTAL - ref.peak_mib * MiB - kb.DEFAULT_HEADROOM_MIB * MiB
     assert plan.limiting == "physical"
     assert plan.kv_bytes - KV_TODAY == expected_gain
 
@@ -186,7 +186,7 @@ def test_plan_predicts_headroom_for_every_lane_reference():
     for lane in ("mtp", "nomtp"):
         plan = kb.plan_kv_budget(inputs(0.99, lane=lane))
         assert plan.limiting == "physical"
-        assert plan.predicted_free_at_peak == 512 * MiB
+        assert plan.predicted_free_at_peak == kb.DEFAULT_HEADROOM_MIB * MiB
 
 
 def test_nomtp_reference_is_its_own_row():
@@ -217,7 +217,7 @@ def test_explicit_headroom_is_used():
     base = kb.plan_kv_budget(inputs(0.99))
     plan = kb.plan_kv_budget(inputs(0.99), {kb.ENV_HEADROOM_MIB: "256"})
     assert plan.headroom == 256 * MiB
-    assert plan.kv_physical - base.kv_physical == 256 * MiB
+    assert plan.kv_physical - base.kv_physical == (kb.DEFAULT_HEADROOM_MIB - 256) * MiB
 
 
 def test_lane_without_a_reference_uses_the_graph_reserve_plus_extra():
@@ -259,10 +259,11 @@ def test_estimate_table_for_the_four_utilisations():
         plan = kb.plan_kv_budget(inputs(util))
         rows[util] = (plan.kv_bytes / MiB, plan.limiting)
     # 0.87/0.90 are bound by the utilisation (graph reserve now charged);
-    # 0.93 and up by the physical bound, which is 187 MiB above today's 2048.
+    # 0.93 and up by the physical bound, which is 123 MiB above today's 2048
+    # (card total 32510 MiB, reference peak 31811 MiB, headroom 576 MiB).
     assert rows[0.87][1] == rows[0.90][1] == "utilisation"
     assert rows[0.93][1] == rows[0.95][1] == "physical"
-    assert rows[0.93][0] == rows[0.95][0] == pytest.approx(2048 + 187, abs=1)
+    assert rows[0.93][0] == rows[0.95][0] == pytest.approx(2048 + 123, abs=1)
     assert rows[0.93][0] > KV_TODAY / MiB
 
 
@@ -279,7 +280,7 @@ def audit_inputs(**over):
         activation_peak=1200 * MiB,
         graph_capture_bytes=1400 * MiB,
         post_sizing_planned=2600 * MiB,
-        headroom_planned=512 * MiB,
+        headroom_planned=kb.DEFAULT_HEADROOM_MIB * MiB,
         load_margin=384 * MiB,
     )
     base.update(over)

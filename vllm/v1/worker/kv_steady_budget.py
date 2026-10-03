@@ -50,7 +50,7 @@ What the switch does (everything else in the worker stays as it is):
    after the measured profile (activations freed; weights, residue, CUDA
    context and NCCL all live). The steady state still has to find room for the
    activation peak again, for every post-sizing allocation ``P`` and for a
-   fixed headroom ``H`` (CUDA-free memory, default 512 MiB)::
+   fixed headroom ``H`` (CUDA-free memory, default 576 MiB)::
 
        kv_physical = F_prof - activation_peak - P - H
 
@@ -72,8 +72,8 @@ What the switch does (everything else in the worker stays as it is):
 
 What it can and cannot give. The physical bound reproduces today's footprint at
 the reference point, so the KV cache grows by exactly the headroom today's
-sizing leaves unused: ``total - reference_peak - H`` (MTP lane: ~190 MiB if the
-card's CUDA total is 32510 MiB, ~450 MiB if it is 32768 MiB), plus whatever the
+sizing leaves unused: ``total - reference_peak - H`` (MTP lane: ~120 MiB if the
+card's CUDA total is 32510 MiB, ~380 MiB if it is 32768 MiB), plus whatever the
 idle-cache release frees once ``P`` is calibrated from the audit. Budgeting
 cannot create memory: upstream's 139015-token KV cache at util 0.95 needs a
 smaller non-KV footprint, not a better formula.
@@ -104,8 +104,11 @@ ENV_WARMUP_TOKENS = "SX_OPT_KV_STEADY_WARMUP_TOKENS"
 ENV_EMPTY_CACHE = "SX_OPT_KV_STEADY_EMPTY_CACHE"
 
 # Free device memory (CUDA's view: total minus used) the steady state must
-# still have at its peak. The task this was built for asked for ~500 MiB.
-DEFAULT_HEADROOM_MIB = 512
+# still have at its peak. The task this was built for asked for ~500 MiB and a
+# peak below 32200 MiB on a card that nvidia-smi lists with 32768 MiB: 576 MiB
+# keeps the predicted peak at or below 32192 MiB on such a card (and below 31934
+# MiB where CUDA's usable total is the 32510 MiB that torch reports).
+DEFAULT_HEADROOM_MIB = 576
 # Growth between the end of the warm-up and the worst load the lane was
 # measured under (four 8K prefills: +312 MiB MTP, +158 MiB no-MTP) plus margin
 # for the 16K/32K shapes. It is part of the lane reference below, so it only
