@@ -37,6 +37,7 @@ from vllm.tracing import instrument, instrument_manual
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.torch_utils import is_torch_equal_or_newer
 
+from . import sx_compile_cache as _sx_compile_cache
 from .compiler_interface import (
     CompilerInterface,
     EagerAdaptor,
@@ -54,6 +55,32 @@ from .passes.ir.inplace_functionalization import VllmIRInplaceFunctionalizationP
 from .passes.pass_manager import PostGradPassManager
 
 logger = init_logger(__name__)
+
+
+def _compute_backend_code_hash(
+    forward_code_files: Sequence[str], skip_frozen: bool = True
+) -> str:
+    """Hash of the traced source files (the code part of the backend cache key).
+
+    ``skip_frozen=False`` keeps the pre-SX_OPT_COMPILE_CACHE key, which also
+    hashed the names of frozen modules; the caller passes it while the switch
+    is off so existing cache directories keep their names.
+    """
+    hash_content = []
+    for filepath in sorted(forward_code_files):
+        if filepath == "<string>" or (skip_frozen and filepath.startswith("<frozen ")):
+            # Dynamo can trace frozen Python modules such as os.getenv, but
+            # SourceInfo does not restore them after AOT loading. They have no
+            # source file to hash; including their name makes the first reload
+            # miss the Inductor artifacts saved by the cold compile.
+            continue
+        hash_content.append(filepath)
+        try:
+            with open(filepath) as f:
+                hash_content.append(f.read())
+        except (OSError, UnicodeDecodeError):
+            logger.warning("Failed to read file %s", filepath)
+    return hashlib.sha256("\n".join(hash_content).encode()).hexdigest()
 
 
 def make_copy_and_call(
@@ -1034,20 +1061,9 @@ class VllmBackend:
             "Traced files (to be considered for compilation cache):\n%s",
             lazy(lambda: "\n".join(forward_code_files)),
         )
-        hash_content = []
-        for filepath in forward_code_files:
-            if filepath == "<string>":
-                # This means the function was dynamically generated, with
-                # e.g. exec(). We can't actually check these.
-                continue
-            hash_content.append(filepath)
-            try:
-                with open(filepath) as f:
-                    hash_content.append(f.read())
-            except (OSError, UnicodeDecodeError):
-                logger.warning("Failed to read file %s", filepath)
-                continue
-        code_hash = hashlib.sha256("\n".join(hash_content).encode()).hexdigest()
+        code_hash = _compute_backend_code_hash(
+            forward_code_files, skip_frozen=_sx_compile_cache.compile_cache_enabled()
+        )
         # Clear after consumption
         self.compilation_config.traced_files.clear()
         if not self.compilation_config.cache_dir:

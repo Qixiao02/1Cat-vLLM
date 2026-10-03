@@ -74,6 +74,12 @@ All switches default to on, and setting one to `0` restores the upstream code pa
 - 采样 decode 每步快 18–37%
 - 业务 JSON 24 并发：1.84 → 2.89 请求/秒
 
+## 实验开关（默认关）
+
+上面各项开关默认开，下面这个默认关，不在改动列表里。
+
+- **`SX_OPT_COMPILE_CACHE`**（默认 `0`，行为和之前逐字节相同）：重启时复用 torch.compile 的缓存，冷启动里约 185 秒的编译预计能省下 100–170 秒（预期值，还没有在 V100 上测过）。`1` 复用编译好的子图，`aot` 复用整个 AOT 产物。打开后缓存键会带上构建指纹（torch/CUDA 版本、源码内容、原生库、检查点文件），换了镜像或改了任何 `VLLM_*`/`SX_OPT_*` 开关都不会命中旧缓存。官方 1.5.1 默认打开缓存，但它自己的 27B 测试里 AOT 重载的输出和冷编译不一致，所以这里在 `sx_tests/compile-cache/cache_parity.sh` 通过之前不要在生产打开。分析、移植了官方哪些提交、风险见 [docs/design/sx_compile_cache.md](docs/design/sx_compile_cache.md)。
+
 ## 已知限制
 
 - **MTP 通道**：请在生产上保持关闭。KV 只有约 131K token（FP16）或 217K token（E4M3），每条在跑的请求固定占约 13% 的缓存池；E4M3 KV 下 4 并发的 decode 速度减半。数据见 README.md 实测第 3 组。
