@@ -122,6 +122,11 @@ DEFAULT_HEADROOM_MIB = 576
 # for the 16K/32K shapes. It is part of the lane reference below, so it only
 # matters for the audit, which cannot see load-time growth.
 DEFAULT_LOAD_MIB = 384
+# A SHORT audit within this many MiB is logged as a warning, not an error: the
+# 384 MiB load margin is an estimate (no-MTP stress added 0-238 MiB over the idle
+# state, MTP 448 MiB), and 22 MiB short at util 0.94 on the no-MTP lane still left
+# 937 MiB free at the stress peak. SX_OPT_KV_STEADY_STRICT=1 still raises.
+SHORT_TOLERANCE_MIB = 64
 # Reserve for lanes without a measured reference (DFlash2, other methods):
 # upstream's activation-peak graph reserve plus this.
 DEFAULT_UNREFERENCED_EXTRA_MIB = 1024
@@ -460,6 +465,7 @@ class AuditResult:
     surplus: int  # projected_min_free - headroom (negative = short)
     suggested_reserve_mib: int  # RESERVE value that makes the plan exact
     lines: tuple[str, ...]
+    marginal: bool = False  # short, but within SHORT_TOLERANCE_MIB
 
 
 def audit(a: AuditInputs) -> AuditResult:
@@ -479,6 +485,7 @@ def audit(a: AuditInputs) -> AuditResult:
     projected_min_free = a.free_at_end - deficit - a.load_margin
     surplus = projected_min_free - a.headroom_planned
     ok = surplus >= 0
+    marginal = (not ok) and surplus >= -SHORT_TOLERANCE_MIB * MiB
     # The RESERVE (P) that would have made predicted free == headroom exactly:
     # P' = P_measured_with_load = measured + load margin.
     suggested = max(0, (measured + a.load_margin) // MiB)
@@ -519,13 +526,19 @@ def audit(a: AuditInputs) -> AuditResult:
         lines.append(
             "KV steady audit: SHORT by %.0f MiB; the steady peak will leave "
             "%.0f MiB free, below the %.0f MiB headroom. Set %s=%d (or lower "
-            "--gpu-memory-utilization)."
+            "--gpu-memory-utilization).%s"
             % (
                 -surplus / MiB,
                 projected_min_free / MiB,
                 a.headroom_planned / MiB,
                 ENV_RESERVE_MIB,
                 suggested,
+                (
+                    " Within %d MiB of the estimate, so only a warning."
+                    % SHORT_TOLERANCE_MIB
+                    if marginal
+                    else ""
+                ),
             )
         )
     return AuditResult(
@@ -538,6 +551,7 @@ def audit(a: AuditInputs) -> AuditResult:
         surplus=surplus,
         suggested_reserve_mib=suggested,
         lines=tuple(lines),
+        marginal=marginal,
     )
 
 

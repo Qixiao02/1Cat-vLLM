@@ -330,6 +330,20 @@ def test_audit_short_names_the_remedy():
     assert res.suggested_reserve_mib == 2860
 
 
+def test_audit_short_within_the_tolerance_is_marginal():
+    res = kb.audit(audit_inputs(warm=3126))  # P_true 2620 vs P_plan 2600
+    assert not res.ok and res.surplus == -20 * MiB
+    assert res.marginal
+    assert "SHORT by 20 MiB" in res.lines[-1] and "only a warning" in res.lines[-1]
+    far = kb.audit(audit_inputs(warm=3366))
+    assert not far.ok and not far.marginal and "only a warning" not in far.lines[-1]
+    # surplus = 3106 - warm (MiB) for these inputs: -64 is the edge, -65 is beyond
+    edge = kb.audit(audit_inputs(warm=3170))
+    assert edge.surplus == -64 * MiB and edge.marginal
+    beyond = kb.audit(audit_inputs(warm=3171))
+    assert beyond.surplus == -65 * MiB and not beyond.ok and not beyond.marginal
+
+
 def test_the_suggested_reserve_would_have_left_exactly_the_headroom():
     """Size the same startup by the suggested P: the KV cache shrinks by the
     shortfall, the warm-up takes what it took before, and the audit of that run

@@ -881,8 +881,13 @@ class Worker(WorkerBase):
                 load_margin=(load_margin_mib or 0) * (1 << 20),
             )
         )
+        level = (
+            logger.info
+            if result.ok
+            else (logger.warning if result.marginal else logger.error)
+        )
         for line in result.lines:
-            (logger.info if result.ok else logger.error)("%s", line)
+            level("%s", line)
         if not result.ok and kv_budget.strict_enabled():
             raise RuntimeError(
                 "KV steady audit: the post-sizing allocations do not fit the "

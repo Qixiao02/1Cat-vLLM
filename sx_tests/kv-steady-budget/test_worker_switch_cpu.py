@@ -446,6 +446,26 @@ def test_audit_reports_short_as_an_error(monkeypatch):
     assert kb.ENV_RESERVE_MIB in logger.text("error")
 
 
+def test_a_marginal_short_is_a_warning_but_strict_mode_still_raises(monkeypatch):
+    worker, logger, cuda = planned_worker(monkeypatch)
+    plan = worker._sx_steady_plan
+    run_startup(
+        worker, cuda, kv=plan.kv_bytes, init_extra=20 * MiB,
+        warmup_growth=ACTIVATION + plan.post_sizing - 384 * MiB,  # short by 20 MiB
+        cached=ACTIVATION,
+    )
+    assert "KV steady audit: SHORT by 20 MiB" in logger.text("warning")
+    assert "SHORT" not in logger.text("error")
+    monkeypatch.setenv(kb.ENV_STRICT, "1")
+    worker, logger, cuda = planned_worker(monkeypatch)
+    plan = worker._sx_steady_plan
+    with pytest.raises(RuntimeError, match="do not fit the reservation"):
+        run_startup(
+            worker, cuda, kv=plan.kv_bytes, init_extra=20 * MiB,
+            warmup_growth=ACTIVATION + plan.post_sizing - 384 * MiB, cached=ACTIVATION,
+        )
+
+
 def test_strict_mode_raises_when_short(monkeypatch):
     monkeypatch.setenv(kb.ENV_STRICT, "1")
     worker, logger, cuda = planned_worker(monkeypatch)
