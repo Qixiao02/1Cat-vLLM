@@ -68,6 +68,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from ...model_executor.model_loader import TensorizerLoader
+from . import kv_steady_budget as kv_budget
 from .gpu.warmup import warmup_kernels
 from .utils import request_memory
 
@@ -561,6 +562,28 @@ class Worker(WorkerBase):
                 != CUDAGraphMode.NONE
             ):
                 cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
+                if (
+                    self.use_v2_model_runner
+                    and kv_budget.steady_budget_enabled()
+                    and current_platform.is_device_capability(70)
+                ):
+                    # Upstream 4bbaf64fc (#671): V2 cannot capture its graphs
+                    # before the KV cache exists, so reserve the measured
+                    # activation peak for the graph pools. Only with
+                    # SX_OPT_KV_STEADY_BUDGET=1: it lowers the KV budget by
+                    # that peak at an unchanged --gpu-memory-utilization.
+                    from vllm.v1.worker.gpu.cudagraph_utils import (
+                        get_sm70_cudagraph_memory_reserve,
+                    )
+
+                    cudagraph_memory_estimate = get_sm70_cudagraph_memory_reserve(
+                        self.vllm_config.compilation_config.cudagraph_mode,
+                        profile_torch_peak - profile_result.before_profile.torch_peak,
+                    )
+                    logger.info(
+                        "SM70 graph memory reserve before KV allocation: %.2f GiB",
+                        cudagraph_memory_estimate / 2**30,
+                    )
 
         # Use the pre-cudagraph torch peak to avoid double-counting.
         profile_result.torch_peak_increase = (
@@ -609,6 +632,14 @@ class Worker(WorkerBase):
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
         )
+
+        if kv_budget.steady_budget_enabled():
+            steady_plan = self._sx_plan_steady_budget(
+                profile_result, cudagraph_memory_estimate_applied
+            )
+            if steady_plan is not None:
+                self._sx_steady_plan = steady_plan
+                self.available_kv_cache_memory_bytes = steady_plan.kv_bytes
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(
@@ -669,6 +700,139 @@ class Worker(WorkerBase):
 
         return int(self.available_kv_cache_memory_bytes)
 
+    def _sx_plan_steady_budget(
+        self, profile_result: Any, graph_reserve: int
+    ) -> "kv_budget.BudgetPlan | None":
+        """SX_OPT_KV_STEADY_BUDGET: bound the KV cache by what the rest of the
+        steady state needs (vllm/v1/worker/kv_steady_budget.py)."""
+        if not (
+            self.use_v2_model_runner
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(70)
+        ):
+            logger.warning_once(
+                "SX_OPT_KV_STEADY_BUDGET=1 only applies to SM70 on the V2 model "
+                "runner; the KV budget is unchanged."
+            )
+            return None
+        speculative_config = self.vllm_config.speculative_config
+        # The lane references were measured on the admitted Qwen3.8 TP4 lanes
+        # only; any other model gets the generic (unreferenced) reserve.
+        from vllm.config.vllm import (
+            _is_sm70_qwen38_mtp_lane_contract,
+            _is_sm70_qwen38_nomtp_dual_compile_contract,
+        )
+
+        model_config = self.vllm_config.model_config
+        parallel_config = self.vllm_config.parallel_config
+        if speculative_config is None and (
+            _is_sm70_qwen38_nomtp_dual_compile_contract(
+                model_config, None, parallel_config
+            )
+        ):
+            lane = "nomtp"
+        elif speculative_config is not None and (
+            _is_sm70_qwen38_mtp_lane_contract(
+                model_config, speculative_config, parallel_config
+            )
+        ):
+            lane = "mtp"
+        else:
+            lane = "other"
+        inputs = kv_budget.BudgetInputs(
+            total_memory=int(self.init_snapshot.total_memory),
+            requested_memory=int(self.requested_memory),
+            util=float(self.cache_config.gpu_memory_utilization),
+            init_cuda_memory=int(self.init_snapshot.cuda_memory),
+            free_after_profile=int(profile_result.after_profile.free_memory),
+            non_kv_cache_memory=int(profile_result.non_kv_cache_memory),
+            activation_peak=int(profile_result.torch_peak_increase),
+            graph_reserve=int(graph_reserve),
+            lane=lane,
+        )
+        plan = kv_budget.plan_kv_budget(inputs)
+        for line in plan.lines:
+            logger.info("%s", line)
+        self._sx_steady_marks: list[tuple[str, int]] = [
+            ("after_profile", inputs.free_after_profile)
+        ]
+        return plan
+
+    def _sx_mark(self, label: str) -> None:
+        """Log the device-free memory at a startup phase boundary (switch on)."""
+        if getattr(self, "_sx_steady_plan", None) is None:
+            return
+        torch.accelerator.synchronize()
+        free = int(torch.cuda.mem_get_info(self.device)[0])
+        previous = self._sx_steady_marks[-1][1]
+        self._sx_steady_marks.append((label, free))
+        logger.info(
+            "KV steady phase %s: %.0f MiB free (%+.0f MiB since the previous phase)",
+            label,
+            free / (1 << 20),
+            (free - previous) / (1 << 20),
+        )
+
+    def _sx_release_idle_cache(self) -> None:
+        """Hand the capture streams' idle allocator blocks back to the driver.
+
+        The V1 runner ends its capture with ``empty_cache()``; the V2 runner
+        starts with one and never calls it again. Blocks cached by the capture
+        streams (graph warm-ups, tuner leftovers) are not reused by the stream
+        that serves, so they only add to the peak. Blocks owned by captured
+        graphs are not released, and the allocator re-grows for serving.
+        """
+        if getattr(self, "_sx_steady_plan", None) is None:
+            return
+        if not kv_budget.empty_cache_enabled():
+            return
+        torch.accelerator.synchronize()
+        gc.collect()
+        torch.accelerator.empty_cache()
+        self._sx_mark("after_empty_cache")
+
+    def _sx_after_kv_cache_init(self, kv_cache_config: KVCacheConfig) -> None:
+        if getattr(self, "_sx_steady_plan", None) is None:
+            return
+        self._sx_kv_bytes_allocated = sum(
+            int(t.size) for t in kv_cache_config.kv_cache_tensors
+        )
+        self._sx_mark("after_kv_cache")
+
+    def _sx_steady_audit(self, graph_capture_bytes: int) -> None:
+        """Compare the measured post-sizing growth with the plan's assumption."""
+        plan = getattr(self, "_sx_steady_plan", None)
+        if plan is None:
+            return
+        self._sx_mark("end_of_warmup")
+        marks = dict(self._sx_steady_marks)
+        reserved = int(torch.cuda.memory_reserved(self.device))
+        allocated = int(torch.cuda.memory_allocated(self.device))
+        load_margin_mib = kv_budget.read_mib(
+            kv_budget.ENV_LOAD_MIB, kv_budget.DEFAULT_LOAD_MIB
+        )
+        result = kv_budget.audit(
+            kv_budget.AuditInputs(
+                free_after_profile=marks["after_profile"],
+                kv_bytes_allocated=getattr(self, "_sx_kv_bytes_allocated", 0),
+                free_after_kv=marks.get("after_kv_cache", marks["after_profile"]),
+                free_at_end=marks["end_of_warmup"],
+                cached_free=max(0, reserved - allocated),
+                activation_peak=int(self.peak_activation_memory),
+                graph_capture_bytes=int(graph_capture_bytes),
+                post_sizing_planned=plan.post_sizing,
+                headroom_planned=plan.headroom,
+                load_margin=(load_margin_mib or 0) * (1 << 20),
+            )
+        )
+        for line in result.lines:
+            (logger.info if result.ok else logger.error)("%s", line)
+        if not result.ok and kv_budget.strict_enabled():
+            raise RuntimeError(
+                "KV steady audit: the post-sizing allocations do not fit the "
+                "reservation (%s=1); see the log above" % kv_budget.ENV_STRICT
+            )
+
     def get_kv_connector_handshake_metadata(self) -> dict | None:
         """Get KV connector metadata from this worker if available."""
 
@@ -716,6 +880,7 @@ class Worker(WorkerBase):
 
         with self._maybe_get_memory_pool_context(tag="kv_cache"):
             self.model_runner.initialize_kv_cache(kv_cache_config)
+        self._sx_after_kv_cache_init(kv_cache_config)
 
         if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()
@@ -760,16 +925,20 @@ class Worker(WorkerBase):
             logger.info("Compile and warming up model for size %d", size)
             self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
+        self._sx_mark("dummy_runs")
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
         kernel_warmup(self)
         if hasattr(self.model_runner, "_warmup_sm70_aux_kernels"):
             self.model_runner._warmup_sm70_aux_kernels()
+        self._sx_mark("kernel_warmup")
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
             cuda_graph_memory_bytes = self.model_runner.capture_model()
+        self._sx_mark("graph_capture")
+        self._sx_release_idle_cache()
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (
@@ -850,6 +1019,7 @@ class Worker(WorkerBase):
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+            self._sx_steady_audit(cuda_graph_memory_bytes)
         elif get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory

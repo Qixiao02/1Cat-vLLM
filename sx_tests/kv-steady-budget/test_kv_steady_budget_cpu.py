@@ -87,6 +87,12 @@ def test_switch_reads_the_process_environment(monkeypatch):
     assert kb.steady_budget_enabled() is True
 
 
+def test_empty_cache_flag_defaults_on():
+    assert kb.empty_cache_enabled({}) is True
+    assert kb.empty_cache_enabled({kb.ENV_EMPTY_CACHE: "1"}) is True
+    assert kb.empty_cache_enabled({kb.ENV_EMPTY_CACHE: "0"}) is False
+
+
 def test_strict_flag(monkeypatch):
     monkeypatch.delenv(kb.ENV_STRICT, raising=False)
     assert kb.strict_enabled() is False

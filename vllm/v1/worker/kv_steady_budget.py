@@ -101,6 +101,7 @@ ENV_RESERVE_MIB = "SX_OPT_KV_STEADY_RESERVE_MIB"
 ENV_LOAD_MIB = "SX_OPT_KV_STEADY_LOAD_MIB"
 ENV_STRICT = "SX_OPT_KV_STEADY_STRICT"
 ENV_WARMUP_TOKENS = "SX_OPT_KV_STEADY_WARMUP_TOKENS"
+ENV_EMPTY_CACHE = "SX_OPT_KV_STEADY_EMPTY_CACHE"
 
 # Free device memory (CUDA's view: total minus used) the steady state must
 # still have at its peak. The task this was built for asked for ~500 MiB.
@@ -165,6 +166,15 @@ def steady_budget_enabled(environ: Mapping[str, str] | None = None) -> bool:
 def strict_enabled(environ: Mapping[str, str] | None = None) -> bool:
     env = os.environ if environ is None else environ
     return _parse_flag(env.get(ENV_STRICT))
+
+
+def empty_cache_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    """Release the capture streams' idle allocator blocks after the graph
+    capture (default on under the switch; ``SX_OPT_KV_STEADY_EMPTY_CACHE=0``
+    keeps them, e.g. if a graph-referenced buffer is not kept alive in Python:
+    upstream ac1e67685 fixed such a case that this fork's base lacks)."""
+    env = os.environ if environ is None else environ
+    return env.get(ENV_EMPTY_CACHE, "1").strip() != "0"
 
 
 def read_mib(
