@@ -143,6 +143,14 @@ def test_switch_off_is_the_old_arithmetic(monkeypatch, value):
     assert worker.cudagraph_memory_estimate == 0
 
 
+def test_switch_off_never_reads_the_v2_flag():
+    """Existing tests (tests/v1/worker/test_gpu_worker_memory_profile.py) build a
+    Worker without it; with the switch off the code must not touch it."""
+    worker, _, _ = make_worker(spec_method="mtp")
+    del worker.use_v2_model_runner
+    assert worker.determine_available_memory() == legacy_budget()
+
+
 def test_switch_off_does_not_apply_the_sm70_reserve_even_with_the_estimator_on():
     worker, logger, _ = make_worker(spec_method="mtp", estimate_cudagraphs=True)
     worker.determine_available_memory()

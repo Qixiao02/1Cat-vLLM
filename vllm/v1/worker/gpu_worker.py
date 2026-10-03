@@ -563,8 +563,8 @@ class Worker(WorkerBase):
             ):
                 cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
                 if (
-                    self.use_v2_model_runner
-                    and kv_budget.steady_budget_enabled()
+                    kv_budget.steady_budget_enabled()
+                    and self.use_v2_model_runner
                     and current_platform.is_device_capability(70)
                 ):
                     # Upstream 4bbaf64fc (#671): V2 cannot capture its graphs
