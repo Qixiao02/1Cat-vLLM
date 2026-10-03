@@ -1,0 +1,4 @@
+# Files that run on the Linux server or are applied with patch(1) must keep LF
+# line endings on a Windows checkout (core.autocrlf).
+tools/torch_patches/* text eol=lf
+sx_tests/compile-cache/*.sh text eol=lf

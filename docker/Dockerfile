@@ -850,6 +850,20 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 . /etc/environment && \
 uv pip list
 
+# Optional torch 2.10.0 backports (tools/torch_patches). Off by default: they
+# only matter for the bundled-AOT serializer, i.e. VLLM_USE_MEGA_AOT_ARTIFACT=1
+# on torch 2.10 (the default non-mega vLLM AOT path never calls it). The script
+# is idempotent, hash-checked and refuses a torch it does not recognise.
+ARG SX_TORCH_BACKPORTS=0
+COPY tools/torch_patches /tmp/torch_patches
+RUN if [ "${SX_TORCH_BACKPORTS}" = "1" ]; then \
+        apt-get update -y \
+        && apt-get install -y --no-install-recommends patch \
+        && rm -rf /var/lib/apt/lists/* \
+        && bash /tmp/torch_patches/apply.sh python3; \
+    fi; \
+    rm -rf /tmp/torch_patches
+
 # Pytorch now installs NVSHMEM, setting LD_LIBRARY_PATH
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
