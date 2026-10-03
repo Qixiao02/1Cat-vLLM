@@ -67,6 +67,23 @@ python3 pfx_bench.py --port 8001 --model <served-model-name> --out result.json \
 | `results/2026-10-01-fork-vs-official-best/` | 本分支对官方最新，双方最佳参数（README 实测第 1 组）。文件名前缀：`F1` 本分支开前缀缓存（线上配置），`F2` 本分支关前缀缓存，`O1` 官方最佳参数（关前缀缓存），`O2` 官方开前缀缓存，`OM` 官方开 MTP，`FM` 本分支开 MTP。`*_sweep_c<N>.json` 是 8K 输入、贪心、N 并发；`*_long.json` 是 4 并发 8K–64K、默认采样；`*_l128k.json` 是单条 128K；`*_mtp.json` 是自然 prompt 的 MTP 测试；`*_answers.json` 是答题对照；`summary_nomtp.txt` 是不开 MTP 的汇总 |
 | `results/2026-10-01-wheel-1001/` | 发行的 wheel（1001）：`detail_wheel_1001_c4.json` 是和第 1 组同样的压测，`answers_*.json` 是 1001 和 0930 的答题对照 |
 | `results/2026-09-30-mtp-fp16-vs-e4m3/` | 开 MTP（k=4）时 FP16 KV 和 E4M3 KV。`c1s`、`c1g` 是单请求 8K（采样、贪心），`c4s2k`、`c4g2k` 是 4 并发 2K（采样、贪心），`c4` 是 4 并发 8K/16K/32K；`answers_*.json` 是输出对照，`kv_scale_report.json` 是标定得到的各层 K、V 最大值和 scale |
-| `results/2026-10-03-fork-vs-official-v1.5.1/` | 本分支 1003 对官方 v1.5.1（README 实测第 5、6 组）。文件名前缀：`F1`、`F2`、`FM`、`FM2` 是本分支，`V1`、`V2`、`V2b`、`V2c`、`VM`、`VMa` 是官方 v1.5.1（`V2`、`V2c`、`VM` 显存溢出，数据作废或只有一部分有效）。`*_sweep_c*` 是 8K 并发扫描，`*_long` 是 4 并发 8K–64K，`*_l128k` 是 128K，`*_mtp*` 是 MTP 测试，`*_answers.json` 是答题，`engine_*.log` 是引擎日志，`compose.*.yaml` 是各配置的 compose。`O1_HEAD_hang_pyspy.txt` 和 `engine_O1_HEAD_hang.log` 是官方 main 起不来的证据。`REPORT_TABLES.md` 是脚本生成的全部对比表 |
+| `results/2026-10-03-fork-vs-official-v1.5.1/` | 本分支 1003 对官方 v1.5.1（README 实测第 5、6 组）。文件名前缀是测试时的内部简称，对照见下表。`*_sweep_c*` 是 8K 并发扫描，`*_long` 是 4 并发 8K–64K，`*_l128k` 是 128K，`*_mtp*` 是 MTP 测试，`*_answers.json` 是答题，`engine_*.log` 是引擎日志，`compose.*.yaml` 是各配置的 compose。`O1_HEAD_hang_pyspy.txt` 和 `engine_O1_HEAD_hang.log` 是官方 main 起不来的证据。`REPORT_TABLES.md` 是脚本生成的全部对比表 |
+
+`results/2026-10-03-fork-vs-official-v1.5.1/` 的文件名前缀：
+
+| 前缀 | 配置 |
+|---|---|
+| `F1` | 本分支 1003，不开 MTP，前缀缓存开（线上配置，24 路，显存利用率 0.90） |
+| `F2` | 本分支 1003，不开 MTP，前缀缓存关 |
+| `FM` | 本分支 1003，开 MTP，默认（显存利用率 0.87） |
+| `FM2` | 本分支 1003，开 MTP，打开 KV 稳态预算（显存利用率 0.93） |
+| `V1` | 官方 v1.5.1，不开 MTP，前缀缓存关，显存利用率 0.94 |
+| `V2` | 官方 v1.5.1，前缀缓存开，显存利用率 0.94（显存溢出，作废） |
+| `V2b` | 官方 v1.5.1，前缀缓存开，显存利用率 0.90 |
+| `V2c` | 官方 v1.5.1，前缀缓存开，显存利用率 0.92（显存溢出，只有一部分有效） |
+| `VM` | 官方 v1.5.1，开 MTP，显存利用率 0.95，每步 prefill 8192（显存溢出，作废） |
+| `VMa` | 官方 v1.5.1，开 MTP，显存利用率 0.92，每步 prefill 4096 |
+| `F1W` | 发行的 wheel 的验证（README 第 7 组） |
+| `*_sweep_c*`、`*_long`、`*_l128k`、`*_mtp*`、`*_answers` | 并发扫描、4 并发长上下文、128K、MTP 测试、答题 |
 
 开/关前缀缓存那一轮用的是脚本的第一版，测法和指标算法相同，只是没有上面“详细记录”里的那些字段。
