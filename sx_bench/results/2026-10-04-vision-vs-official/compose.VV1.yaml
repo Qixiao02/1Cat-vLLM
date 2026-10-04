@@ -1,0 +1,73 @@
+# Comparison arm VV1 (see /mnt/2t/build/cmp1003/arm_compose_1003.py). Temporary.
+name: sx-cmp-vv1
+services:
+  cmp:
+    image: shixiang/1cat-vllm-v100:official-v1.5.1-ubuntu2404-sm70main
+    container_name: sx-cmp-vv1
+    restart: "no"
+    init: true
+    ipc: host       # host IPC namespace, so /dev/shm is the host's (no shm_size needed, same as swift-tp4)
+    user: "997:983"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    tmpfs: ["/tmp:exec,mode=1777", "/run:mode=0755"]
+    ulimits: {memlock: {soft: -1, hard: -1}, stack: 67108864}   # memlock -1: 47.7 GiB of PLE is pinned host memory
+    ports: ["127.0.0.1:8141:8001"]
+    volumes:
+      - {type: bind, source: /mnt/2t/models, target: /models, read_only: true}
+      - {type: bind, source: /opt/shixiang-inference/cache-official-v151-flashnext-tp4, target: /cache}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      VLLM_QWEN4EXP_PLE_HOST_GIB: "12"
+      VLLM_ENGINE_READY_TIMEOUT_S: "1800"
+      HOME: "/cache/home"
+      XDG_CACHE_HOME: "/cache"
+      HF_HOME: "/cache/huggingface"
+      HUGGINGFACE_HUB_CACHE: "/cache/huggingface/hub"
+      TORCH_HOME: "/cache/torch"
+      TRITON_CACHE_DIR: "/cache/triton"
+      TILELANG_CACHE_DIR: "/cache/tilelang"
+      USER: "sx-inference"
+      LOGNAME: "sx-inference"
+      VLLM_DISABLE_COMPILE_CACHE: "1"
+      OMP_NUM_THREADS: "1"
+      VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+      VLLM_SM70_QWEN38_BATCH_FASTPATH: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["4","5","6","7"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8001/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 40
+      start_period: 30m
+    stop_grace_period: 2m
+    entrypoint: ["vllm", "serve"]
+    command:
+      - '/models/Swift-1.5-Qwen3.8-Flash-Next-NVFP4'
+      - '--served-model-name=Swift-1.5-Qwen3.8-Flash-Next'
+      - '--host=0.0.0.0'
+      - '--port=8001'
+      - '--tensor-parallel-size=4'
+      - '--dtype=half'
+      - '--attention-backend=FLASH_ATTN_V100'
+      - '--max-model-len=131072'
+      - '--max-num-seqs=16'
+      - '--max-num-batched-tokens=8192'
+      - '--gpu-memory-utilization=0.94'
+      - '--kv-cache-dtype=auto'
+      - '--trust-remote-code'
+      - '--no-enable-prefix-caching'
+      - '--enable-chunked-prefill'
+      - '--enable-auto-tool-choice'
+      - '--tool-call-parser=qwen3_coder'
+      - '--reasoning-parser=qwen3'
+      - '--mm-processor-cache-gb=2'
+      - '--limit-mm-per-prompt={"image":1,"video":0}'

@@ -1,0 +1,126 @@
+{
+ "C1": {
+  "requests": [
+   {
+    "seed": 100,
+    "ttft": 0.3317904472351074,
+    "e2e": 0.5936553478240967,
+    "tokens": 21,
+    "tok_s": 80.19402353185394,
+    "text": "This image displays a uniform field of cyan-colored digital noise, resembling static on an old television screen."
+   },
+   {
+    "seed": 101,
+    "ttft": 0.3161013126373291,
+    "e2e": 0.5648565292358398,
+    "tokens": 20,
+    "tok_s": 80.40032395493384,
+    "text": "This image is a uniform field of light blue digital noise, resembling a blank screen with static."
+   },
+   {
+    "seed": 102,
+    "ttft": 0.3038322925567627,
+    "e2e": 0.555323600769043,
+    "tokens": 20,
+    "tok_s": 79.52561121165381,
+    "text": "This image displays a uniform field of green digital noise, resembling static on an old television screen."
+   },
+   {
+    "seed": 103,
+    "ttft": 0.3090994358062744,
+    "e2e": 0.6353867053985596,
+    "tokens": 26,
+    "tok_s": 79.68438374101602,
+    "text": "This image displays a uniform field of orange with fine, speckled noise texture, resembling digital static or grainy fil"
+   },
+   {
+    "seed": 104,
+    "ttft": 0.35274410247802734,
+    "e2e": 0.731170654296875,
+    "tokens": 30,
+    "tok_s": 79.27562126867082,
+    "text": "This image displays a uniform field of digital noise, predominantly in shades of teal and blue, with no discernible obje"
+   },
+   {
+    "seed": 105,
+    "ttft": 0.3158080577850342,
+    "e2e": 0.7066857814788818,
+    "tokens": 31,
+    "tok_s": 79.30868944652508,
+    "text": "This image displays a uniform field of fine, high-frequency digital noise with a dominant reddish-orange hue, resembling"
+   }
+  ],
+  "wall": 7.899774551391602,
+  "errors": 0
+ },
+ "C4": {
+  "requests": [
+   {
+    "seed": 200,
+    "ttft": 0.8964691162109375,
+    "e2e": 0.9023802280426025,
+    "tokens": 20,
+    "tok_s": 3383.458234179002,
+    "text": "This image displays a uniform field of green digital noise, resembling static on an old television screen."
+   },
+   {
+    "seed": 201,
+    "ttft": 0.35201072692871094,
+    "e2e": 1.1805086135864258,
+    "tokens": 20,
+    "tok_s": 24.140073646636576,
+    "text": "This image displays a uniform field of blue digital noise, resembling static on an old television screen."
+   },
+   {
+    "seed": 202,
+    "ttft": 0.5645127296447754,
+    "e2e": 1.3320574760437012,
+    "tokens": 27,
+    "tok_s": 35.17710221674418,
+    "text": "This image is a square of digital noise, featuring a dense, uniform pattern of multicolored pixels on a light cyan backg"
+   },
+   {
+    "seed": 203,
+    "ttft": 0.6059169769287109,
+    "e2e": 1.3482201099395752,
+    "tokens": 27,
+    "tok_s": 36.373280401613,
+    "text": "This image displays a uniform field of vibrant blue, overlaid with a fine, grainy texture that resembles digital noise o"
+   },
+   {
+    "seed": 204,
+    "ttft": 0.32604002952575684,
+    "e2e": 0.9988317489624023,
+    "tokens": 34,
+    "tok_s": 50.53569926287071,
+    "text": "This image displays a uniform field of vibrant magenta-pink noise, resembling digital static or a textured surface with "
+   },
+   {
+    "seed": 205,
+    "ttft": 0.3949770927429199,
+    "e2e": 1.2677457332611084,
+    "tokens": 22,
+    "tok_s": 25.207138500001502,
+    "text": "This image displays a uniform field of bright yellow-green digital noise, resembling static on an old television screen."
+   },
+   {
+    "seed": 206,
+    "ttft": 0.5834956169128418,
+    "e2e": 1.0259807109832764,
+    "tokens": 11,
+    "tok_s": 24.859594475399494,
+    "text": " This image is a blue square with black dots."
+   },
+   {
+    "seed": 207,
+    "ttft": 0.49399566650390625,
+    "e2e": 1.2304778099060059,
+    "tokens": 51,
+    "tok_s": 69.24811478036794,
+    "text": "This image displays a uniform field of digital noise, characterized by a dense, granular pattern of multicolored pixels\u2014"
+   }
+  ],
+  "wall": 7.6863625049591064,
+  "errors": 0
+ }
+}

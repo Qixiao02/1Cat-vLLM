@@ -98,7 +98,7 @@ All switches default to on, and setting one to `0` restores the upstream code pa
 ## 已知限制
 
 - **MTP 通道**：请在生产上保持关闭。1003 的 MTP 速度已经高于官方 v1.5.1（README.md 第 5 组），但 KV 缓存只有 89,367 token（util 0.87）、109,723 token（util 0.93，1004 默认）或约 120,000（util 0.93 加 `SX_OPT_KV_STEADY_RESERVE_MIB=2012`），都放不下 4 条 32K 并发；每张卡显存峰值 31.1–31.9 GiB，整卡 32 GiB，余量不到 1 GiB；E4M3 KV 下 4 并发的 decode 速度减半（README.md 第 3 组，那是 1001 的数据）。MTP 只测了 1 并发和 4 并发。
-- **视觉**：所有测试都不开视觉（`--language-model-only`）。开视觉时快速通道不进，decode 慢约 23%，prefill 慢约 36%；`--kv-cache-dtype fp8_e4m3`（没有标定的 scale）同样让 decode 慢约 24%，两项一起也不会更慢。数据见 README.md 第 9 组；最佳启动参数见 README.md 快速开始。
+- **视觉**：除 README.md 第 9、11 组外，所有测试都不开视觉（`--language-model-only`）。开视觉时快速通道不进，本分支 1 并发 decode 慢约 22%（官方同样慢约 22%）；`--kv-cache-dtype fp8_e4m3`（没有标定的 scale）同样让 decode 慢约 24%，两项一起也不会更慢。两边都开视觉的对比（README.md 第 11 组，2026-10-04）：decode 和长 prompt 本分支领先，前缀缓存开的单请求 prefill 和 128K prefill、开 MTP（单请求官方快 25–33%，KV 容量官方 2.45 倍）是本分支的短板，原因没有查，也没有改。最佳启动参数见 README.md 快速开始。
 - **和官方的对比有边界**：官方一侧是 v1.5.1 发布版，装在我们自己做的 Ubuntu 24.04 镜像里，不是官方原样镜像；官方 `main@e53d02171` 在我们的环境里起不来，没有拿它比；两边参数不完全相同；每格只有 1–2 遍。官方在前缀缓存开时只有显存利用率 0.90 能稳定运行（0.92、0.94 会显存溢出）。
 - **1 token prompt**：全新请求的 prompt 只有 1 个 token 时，状态槽没有清零。官方也有同样问题。聊天接口的 prompt 带模板，不会触发。
 - **开前缀缓存时长 prompt 的 KV 占用偏高（版本 0930 的问题，1001 起已修）**：版本 0930 在 4 条 64K 并发时 KV 占用峰值是 86%，关前缀缓存是 64%；1001 起是 64.4%。原因是 prefill 一步跨多个状态块时，换下来的状态块要到请求结束才释放，1001 起处理完对应的 token 就释放（改动第 7 项）。

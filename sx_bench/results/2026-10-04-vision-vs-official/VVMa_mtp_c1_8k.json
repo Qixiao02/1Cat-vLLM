@@ -1,0 +1,1390 @@
+{
+ "schema": 2,
+ "args": {
+  "port": 8141,
+  "model": "Swift-1.5-Qwen3.8-Flash-Next",
+  "out": "/mnt/2t/build/cmp1003/VVMa_mtp_c1_8k.json",
+  "lengths": "8000",
+  "conc": 1,
+  "gen": 256,
+  "passes": 2,
+  "seed": 2026100101,
+  "gpus": "4,5,6,7",
+  "temperature": 0.0
+ },
+ "started": "2026-10-04 10:58:36",
+ "engine": {
+  "version": "1.5.1",
+  "models": [
+   {
+    "id": "Swift-1.5-Qwen3.8-Flash-Next",
+    "max_model_len": 32768
+   }
+  ],
+  "cache_config": {
+   "_block_size_resolved": "True",
+   "block_size": "16",
+   "cache_dtype": "auto",
+   "cache_dtype_from_checkpoint": "False",
+   "calculate_kv_scales": "False",
+   "enable_prefix_caching": "True",
+   "engine": "0",
+   "gpu_memory_utilization": "0.92",
+   "hash_block_size": "None",
+   "is_attention_free": "False",
+   "kv_cache_dtype_skip_layers": "[]",
+   "kv_cache_memory_bytes": "None",
+   "kv_offloading_backend": "native",
+   "kv_offloading_size": "None",
+   "kv_sharing_fast_prefill": "False",
+   "mamba_block_size": "16",
+   "mamba_cache_dtype": "auto",
+   "mamba_cache_mode": "align",
+   "mamba_page_size_padded": "None",
+   "mamba_ssm_cache_dtype": "float32",
+   "num_cpu_blocks": "None",
+   "num_gpu_blocks": "422",
+   "num_gpu_blocks_override": "None",
+   "prefix_cache_retention_interval": "0",
+   "prefix_caching_hash_algo": "sha256",
+   "sliding_window": "None",
+   "user_specified_block_size": "False",
+   "user_specified_mamba_block_size": "False"
+  }
+ },
+ "cells": [
+  {
+   "wall_start": "2026-10-04 10:58:41",
+   "loadavg": [
+    "13.90",
+    "13.18",
+    "14.01"
+   ],
+   "kv_peak": 0.076,
+   "waiting_peak": 0,
+   "running_peak": 1,
+   "cache_hit_tokens": 0,
+   "preemptions": 0,
+   "server": {
+    "spec_decode_num_drafts_total": 102.0,
+    "spec_decode_num_draft_tokens_total": 408.0,
+    "spec_decode_num_accepted_tokens_total": 153.0,
+    "spec_decode_num_accepted_tokens_per_pos_total": 153.0,
+    "prefix_cache_queries_total": 7996.0,
+    "prompt_tokens_total": 7996.0,
+    "prompt_tokens_by_source_total": 7996.0,
+    "generation_tokens_total": 256.0,
+    "request_success_total": 1.0,
+    "request_prompt_tokens_count": 1.0,
+    "request_prompt_tokens_sum": 7996.0,
+    "request_generation_tokens_count": 1.0,
+    "request_generation_tokens_sum": 256.0,
+    "iteration_tokens_total_count": 103.0,
+    "iteration_tokens_total_sum": 8252.0,
+    "request_max_num_generation_tokens_count": 1.0,
+    "request_max_num_generation_tokens_sum": 256.0,
+    "request_params_n_count": 1.0,
+    "request_params_n_sum": 1.0,
+    "request_params_max_tokens_count": 1.0,
+    "request_params_max_tokens_sum": 256.0,
+    "time_to_first_token_seconds_count": 1.0,
+    "time_to_first_token_seconds_sum": 1.5822,
+    "inter_token_latency_seconds_count": 102.0,
+    "inter_token_latency_seconds_sum": 2.8116,
+    "request_time_per_output_token_seconds_count": 1.0,
+    "request_time_per_output_token_seconds_sum": 0.011,
+    "e2e_request_latency_seconds_count": 1.0,
+    "e2e_request_latency_seconds_sum": 4.3936,
+    "request_queue_time_seconds_count": 1.0,
+    "request_queue_time_seconds_sum": 0.0001,
+    "request_inference_time_seconds_count": 1.0,
+    "request_inference_time_seconds_sum": 4.3259,
+    "request_prefill_time_seconds_count": 1.0,
+    "request_prefill_time_seconds_sum": 1.5143,
+    "request_decode_time_seconds_count": 1.0,
+    "request_decode_time_seconds_sum": 2.8116,
+    "request_prefill_kv_computed_tokens_count": 1.0,
+    "request_prefill_kv_computed_tokens_sum": 7996.0
+   },
+   "timeline": [
+    {
+     "t": 0.0,
+     "kv": 0.0,
+     "running": 0,
+     "waiting": 0,
+     "gpu": [
+      [
+       0.0,
+       32091.0,
+       67.85
+      ],
+      [
+       0.0,
+       32091.0,
+       72.17
+      ],
+      [
+       0.0,
+       32091.0,
+       74.04
+      ],
+      [
+       0.0,
+       32091.0,
+       67.41
+      ]
+     ]
+    },
+    {
+     "t": 1.0,
+     "kv": 0.0641,
+     "running": 1,
+     "waiting": 0,
+     "gpu": [
+      [
+       99.0,
+       32091.0,
+       239.27
+      ],
+      [
+       99.0,
+       32091.0,
+       231.86
+      ],
+      [
+       99.0,
+       32091.0,
+       249.94
+      ],
+      [
+       98.0,
+       32091.0,
+       228.54
+      ]
+     ]
+    },
+    {
+     "t": 2.0,
+     "kv": 0.0736,
+     "running": 1,
+     "waiting": 0,
+     "gpu": [
+      [
+       96.0,
+       32091.0,
+       135.8
+      ],
+      [
+       97.0,
+       32091.0,
+       140.77
+      ],
+      [
+       94.0,
+       32091.0,
+       149.46
+      ],
+      [
+       96.0,
+       32091.0,
+       131.77
+      ]
+     ]
+    },
+    {
+     "t": 3.0,
+     "kv": 0.0736,
+     "running": 1,
+     "waiting": 0,
+     "gpu": [
+      [
+       96.0,
+       32091.0,
+       146.31
+      ],
+      [
+       96.0,
+       32091.0,
+       144.21
+      ],
+      [
+       95.0,
+       32091.0,
+       143.73
+      ],
+      [
+       95.0,
+       32091.0,
+       132.73
+      ]
+     ]
+    },
+    {
+     "t": 4.0,
+     "kv": 0.076,
+     "running": 1,
+     "waiting": 0,
+     "gpu": [
+      [
+       97.0,
+       32091.0,
+       129.03
+      ],
+      [
+       95.0,
+       32091.0,
+       139.43
+      ],
+      [
+       94.0,
+       32091.0,
+       142.01
+      ],
+      [
+       96.0,
+       32091.0,
+       130.9
+      ]
+     ]
+    }
+   ],
+   "prompt_tokens": [
+    7996
+   ],
+   "completion_tokens": [
+    256
+   ],
+   "ttft": [
+    1.59
+   ],
+   "ttft_first": 1.59,
+   "ttft_last": 1.59,
+   "prefill_tok_s": 5028.4,
+   "decode_window_s": 2.806,
+   "decode_tok_s": 90.88,
+   "decode_tok_s_min": 90.88,
+   "decode_tok_s_max": 90.88,
+   "decode_agg_tok_s": 90.88,
+   "e2e_s": 4.396,
+   "wave": 1,
+   "wave_ttft_last": 1.59,
+   "wave_prefill_tok_s": 5028.4,
+   "wave_window_s": 2.806,
+   "wave_decode_tok_s": 90.88,
+   "wave_decode_agg_tok_s": 90.88,
+   "requests": [
+    {
+     "i": 0,
+     "prompt_tokens": 7996,
+     "completion_tokens": 256,
+     "send_offset_s": 0.0,
+     "ttft_s": 1.59,
+     "finish_s": 4.396,
+     "own_decode_tok_s": 90.88,
+     "window_decode_tok_s": 90.88,
+     "in_wave": true,
+     "tokens_before_window": 1,
+     "itl_ms": {
+      "p50": 27.3,
+      "p90": 27.9,
+      "p99": 29.4,
+      "max": 46.9
+     },
+     "events": [
+      [
+       1590,
+       1
+      ],
+      [
+       1637,
+       3
+      ],
+      [
+       1664,
+       4
+      ],
+      [
+       1691,
+       8
+      ],
+      [
+       1718,
+       11
+      ],
+      [
+       1745,
+       16
+      ],
+      [
+       1772,
+       18
+      ],
+      [
+       1799,
+       20
+      ],
+      [
+       1826,
+       25
+      ],
+      [
+       1853,
+       30
+      ],
+      [
+       1880,
+       32
+      ],
+      [
+       1908,
+       33
+      ],
+      [
+       1936,
+       36
+      ],
+      [
+       1962,
+       38
+      ],
+      [
+       1989,
+       41
+      ],
+      [
+       2016,
+       44
+      ],
+      [
+       2044,
+       47
+      ],
+      [
+       2071,
+       49
+      ],
+      [
+       2098,
+       51
+      ],
+      [
+       2125,
+       55
+      ],
+      [
+       2153,
+       56
+      ],
+      [
+       2179,
+       58
+      ],
+      [
+       2207,
+       60
+      ],
+      [
+       2234,
+       65
+      ],
+      [
+       2261,
+       67
+      ],
+      [
+       2288,
+       68
+      ],
+      [
+       2315,
+       70
+      ],
+      [
+       2342,
+       72
+      ],
+      [
+       2370,
+       77
+      ],
+      [
+       2399,
+       82
+      ],
+      [
+       2427,
+       86
+      ],
+      [
+       2455,
+       87
+      ],
+      [
+       2484,
+       89
+      ],
+      [
+       2512,
+       93
+      ],
+      [
+       2539,
+       94
+      ],
+      [
+       2566,
+       95
+      ],
+      [
+       2594,
+       96
+      ],
+      [
+       2620,
+       98
+      ],
+      [
+       2648,
+       100
+      ],
+      [
+       2675,
+       102
+      ],
+      [
+       2702,
+       107
+      ],
+      [
+       2729,
+       109
+      ],
+      [
+       2757,
+       113
+      ],
+      [
+       2784,
+       118
+      ],
+      [
+       2811,
+       123
+      ],
+      [
+       2839,
+       126
+      ],
+      [
+       2866,
+       127
+      ],
+      [
+       2892,
+       129
+      ],
+      [
+       2919,
+       132
+      ],
+      [
+       2947,
+       135
+      ],
+      [
+       2974,
+       140
+      ],
+      [
+       3002,
+       143
+      ],
+      [
+       3029,
+       145
+      ],
+      [
+       3057,
+       147
+      ],
+      [
+       3085,
+       149
+      ],
+      [
+       3112,
+       151
+      ],
+      [
+       3139,
+       152
+      ],
+      [
+       3166,
+       154
+      ],
+      [
+       3194,
+       157
+      ],
+      [
+       3221,
+       159
+      ],
+      [
+       3248,
+       164
+      ],
+      [
+       3277,
+       167
+      ],
+      [
+       3304,
+       169
+      ],
+      [
+       3332,
+       170
+      ],
+      [
+       3359,
+       171
+      ],
+      [
+       3386,
+       173
+      ],
+      [
+       3413,
+       174
+      ],
+      [
+       3441,
+       175
+      ],
+      [
+       3468,
+       179
+      ],
+      [
+       3496,
+       184
+      ],
+      [
+       3523,
+       185
+      ],
+      [
+       3550,
+       187
+      ],
+      [
+       3576,
+       190
+      ],
+      [
+       3604,
+       191
+      ],
+      [
+       3630,
+       193
+      ],
+      [
+       3658,
+       195
+      ],
+      [
+       3685,
+       197
+      ],
+      [
+       3712,
+       198
+      ],
+      [
+       3740,
+       200
+      ],
+      [
+       3768,
+       202
+      ],
+      [
+       3795,
+       203
+      ],
+      [
+       3822,
+       205
+      ],
+      [
+       3850,
+       206
+      ],
+      [
+       3878,
+       208
+      ],
+      [
+       3906,
+       209
+      ],
+      [
+       3933,
+       211
+      ],
+      [
+       3961,
+       216
+      ],
+      [
+       3988,
+       218
+      ],
+      [
+       4015,
+       221
+      ],
+      [
+       4042,
+       223
+      ],
+      [
+       4070,
+       225
+      ],
+      [
+       4097,
+       229
+      ],
+      [
+       4124,
+       233
+      ],
+      [
+       4151,
+       236
+      ],
+      [
+       4178,
+       237
+      ],
+      [
+       4205,
+       239
+      ],
+      [
+       4233,
+       242
+      ],
+      [
+       4260,
+       243
+      ],
+      [
+       4287,
+       244
+      ],
+      [
+       4315,
+       246
+      ],
+      [
+       4341,
+       250
+      ],
+      [
+       4369,
+       251
+      ],
+      [
+       4396,
+       256
+      ]
+     ]
+    }
+   ],
+   "conc": 1,
+   "length": 8000,
+   "pass": 0
+  },
+  {
+   "wall_start": "2026-10-04 10:58:46",
+   "loadavg": [
+    "14.23",
+    "13.26",
+    "14.04"
+   ],
+   "kv_peak": 0.076,
+   "waiting_peak": 0,
+   "running_peak": 1,
+   "cache_hit_tokens": 0,
+   "preemptions": 0,
+   "server": {
+    "spec_decode_num_drafts_total": 102.0,
+    "spec_decode_num_draft_tokens_total": 408.0,
+    "spec_decode_num_accepted_tokens_total": 153.0,
+    "spec_decode_num_accepted_tokens_per_pos_total": 153.0,
+    "prefix_cache_queries_total": 7999.0,
+    "prompt_tokens_total": 7999.0,
+    "prompt_tokens_by_source_total": 7999.0,
+    "generation_tokens_total": 256.0,
+    "request_success_total": 1.0,
+    "request_prompt_tokens_count": 1.0,
+    "request_prompt_tokens_sum": 7999.0,
+    "request_generation_tokens_count": 1.0,
+    "request_generation_tokens_sum": 256.0,
+    "iteration_tokens_total_count": 103.0,
+    "iteration_tokens_total_sum": 8255.0,
+    "request_max_num_generation_tokens_count": 1.0,
+    "request_max_num_generation_tokens_sum": 256.0,
+    "request_params_n_count": 1.0,
+    "request_params_n_sum": 1.0,
+    "request_params_max_tokens_count": 1.0,
+    "request_params_max_tokens_sum": 256.0,
+    "time_to_first_token_seconds_count": 1.0,
+    "time_to_first_token_seconds_sum": 1.5496,
+    "inter_token_latency_seconds_count": 102.0,
+    "inter_token_latency_seconds_sum": 2.833,
+    "request_time_per_output_token_seconds_count": 1.0,
+    "request_time_per_output_token_seconds_sum": 0.0111,
+    "e2e_request_latency_seconds_count": 1.0,
+    "e2e_request_latency_seconds_sum": 4.3823,
+    "request_queue_time_seconds_count": 1.0,
+    "request_queue_time_seconds_sum": 0.0,
+    "request_inference_time_seconds_count": 1.0,
+    "request_inference_time_seconds_sum": 4.3431,
+    "request_prefill_time_seconds_count": 1.0,
+    "request_prefill_time_seconds_sum": 1.51,
+    "request_decode_time_seconds_count": 1.0,
+    "request_decode_time_seconds_sum": 2.833,
+    "request_prefill_kv_computed_tokens_count": 1.0,
+    "request_prefill_kv_computed_tokens_sum": 7999.0
+   },
+   "timeline": [
+    {
+     "t": 0.0,
+     "kv": 0.0,
+     "running": 0,
+     "waiting": 0,
+     "gpu": [
+      [
+       0.0,
+       32091.0,
+       68.28
+      ],
+      [
+       0.0,
+       32091.0,
+       73.13
+      ],
+      [
+       0.0,
+       32091.0,
+       74.09
+      ],
+      [
+       0.0,
+       32091.0,
+       67.46
+      ]
+     ]
+    },
+    {
+     "t": 1.0,
+     "kv": 0.0641,
+     "running": 1,
+     "waiting": 0,
+     "gpu": [
+      [
+       97.0,
+       32091.0,
+       246.7
+      ],
+      [
+       99.0,
+       32091.0,
+       267.66
+      ],
+      [
+       98.0,
+       32091.0,
+       270.39
+      ],
+      [
+       98.0,
+       32091.0,
+       223.94
+      ]
+     ]
+    },
+    {
+     "t": 2.0,
+     "kv": 0.0736,
+     "running": 1,
+     "waiting": 0,
+     "gpu": [
+      [
+       94.0,
+       32091.0,
+       133.8
+      ],
+      [
+       93.0,
+       32091.0,
+       140.68
+      ],
+      [
+       94.0,
+       32091.0,
+       154.81
+      ],
+      [
+       95.0,
+       32091.0,
+       132.34
+      ]
+     ]
+    },
+    {
+     "t": 3.0,
+     "kv": 0.0736,
+     "running": 1,
+     "waiting": 0,
+     "gpu": [
+      [
+       94.0,
+       32091.0,
+       137.71
+      ],
+      [
+       95.0,
+       32091.0,
+       143.54
+      ],
+      [
+       94.0,
+       32091.0,
+       146.5
+      ],
+      [
+       94.0,
+       32091.0,
+       133.68
+      ]
+     ]
+    },
+    {
+     "t": 4.0,
+     "kv": 0.076,
+     "running": 1,
+     "waiting": 0,
+     "gpu": [
+      [
+       96.0,
+       32091.0,
+       128.07
+      ],
+      [
+       96.0,
+       32091.0,
+       140.1
+      ],
+      [
+       95.0,
+       32091.0,
+       150.04
+      ],
+      [
+       96.0,
+       32091.0,
+       138.75
+      ]
+     ]
+    }
+   ],
+   "prompt_tokens": [
+    7999
+   ],
+   "completion_tokens": [
+    256
+   ],
+   "ttft": [
+    1.559
+   ],
+   "ttft_first": 1.559,
+   "ttft_last": 1.559,
+   "prefill_tok_s": 5131.1,
+   "decode_window_s": 2.826,
+   "decode_tok_s": 90.22,
+   "decode_tok_s_min": 90.22,
+   "decode_tok_s_max": 90.22,
+   "decode_agg_tok_s": 90.22,
+   "e2e_s": 4.385,
+   "wave": 1,
+   "wave_ttft_last": 1.559,
+   "wave_prefill_tok_s": 5131.1,
+   "wave_window_s": 2.826,
+   "wave_decode_tok_s": 90.22,
+   "wave_decode_agg_tok_s": 90.22,
+   "requests": [
+    {
+     "i": 0,
+     "prompt_tokens": 7999,
+     "completion_tokens": 256,
+     "send_offset_s": 0.0,
+     "ttft_s": 1.559,
+     "finish_s": 4.385,
+     "own_decode_tok_s": 90.22,
+     "window_decode_tok_s": 90.22,
+     "in_wave": true,
+     "tokens_before_window": 1,
+     "itl_ms": {
+      "p50": 27.6,
+      "p90": 28.4,
+      "p99": 35.2,
+      "max": 41.6
+     },
+     "events": [
+      [
+       1559,
+       1
+      ],
+      [
+       1601,
+       3
+      ],
+      [
+       1628,
+       4
+      ],
+      [
+       1654,
+       8
+      ],
+      [
+       1682,
+       11
+      ],
+      [
+       1710,
+       16
+      ],
+      [
+       1738,
+       19
+      ],
+      [
+       1765,
+       21
+      ],
+      [
+       1793,
+       26
+      ],
+      [
+       1821,
+       31
+      ],
+      [
+       1850,
+       33
+      ],
+      [
+       1878,
+       34
+      ],
+      [
+       1906,
+       37
+      ],
+      [
+       1934,
+       39
+      ],
+      [
+       1962,
+       42
+      ],
+      [
+       1989,
+       45
+      ],
+      [
+       2017,
+       46
+      ],
+      [
+       2044,
+       47
+      ],
+      [
+       2072,
+       49
+      ],
+      [
+       2100,
+       52
+      ],
+      [
+       2127,
+       53
+      ],
+      [
+       2155,
+       56
+      ],
+      [
+       2184,
+       58
+      ],
+      [
+       2212,
+       59
+      ],
+      [
+       2240,
+       60
+      ],
+      [
+       2269,
+       62
+      ],
+      [
+       2297,
+       65
+      ],
+      [
+       2325,
+       67
+      ],
+      [
+       2354,
+       68
+      ],
+      [
+       2381,
+       70
+      ],
+      [
+       2409,
+       75
+      ],
+      [
+       2436,
+       80
+      ],
+      [
+       2464,
+       85
+      ],
+      [
+       2492,
+       90
+      ],
+      [
+       2521,
+       91
+      ],
+      [
+       2548,
+       95
+      ],
+      [
+       2576,
+       100
+      ],
+      [
+       2604,
+       102
+      ],
+      [
+       2632,
+       103
+      ],
+      [
+       2660,
+       105
+      ],
+      [
+       2688,
+       107
+      ],
+      [
+       2716,
+       112
+      ],
+      [
+       2744,
+       115
+      ],
+      [
+       2772,
+       118
+      ],
+      [
+       2799,
+       119
+      ],
+      [
+       2827,
+       121
+      ],
+      [
+       2855,
+       123
+      ],
+      [
+       2883,
+       125
+      ],
+      [
+       2910,
+       127
+      ],
+      [
+       2938,
+       130
+      ],
+      [
+       2966,
+       132
+      ],
+      [
+       2993,
+       134
+      ],
+      [
+       3020,
+       135
+      ],
+      [
+       3048,
+       140
+      ],
+      [
+       3074,
+       142
+      ],
+      [
+       3102,
+       144
+      ],
+      [
+       3129,
+       145
+      ],
+      [
+       3157,
+       148
+      ],
+      [
+       3185,
+       153
+      ],
+      [
+       3212,
+       158
+      ],
+      [
+       3239,
+       161
+      ],
+      [
+       3266,
+       164
+      ],
+      [
+       3293,
+       167
+      ],
+      [
+       3321,
+       170
+      ],
+      [
+       3347,
+       174
+      ],
+      [
+       3374,
+       175
+      ],
+      [
+       3402,
+       176
+      ],
+      [
+       3429,
+       178
+      ],
+      [
+       3456,
+       179
+      ],
+      [
+       3484,
+       184
+      ],
+      [
+       3511,
+       186
+      ],
+      [
+       3538,
+       188
+      ],
+      [
+       3566,
+       191
+      ],
+      [
+       3593,
+       192
+      ],
+      [
+       3621,
+       194
+      ],
+      [
+       3649,
+       197
+      ],
+      [
+       3676,
+       199
+      ],
+      [
+       3703,
+       200
+      ],
+      [
+       3730,
+       202
+      ],
+      [
+       3758,
+       204
+      ],
+      [
+       3786,
+       205
+      ],
+      [
+       3813,
+       207
+      ],
+      [
+       3840,
+       208
+      ],
+      [
+       3867,
+       210
+      ],
+      [
+       3895,
+       211
+      ],
+      [
+       3922,
+       213
+      ],
+      [
+       3950,
+       215
+      ],
+      [
+       3977,
+       220
+      ],
+      [
+       4012,
+       224
+      ],
+      [
+       4031,
+       229
+      ],
+      [
+       4059,
+       231
+      ],
+      [
+       4086,
+       232
+      ],
+      [
+       4113,
+       235
+      ],
+      [
+       4140,
+       237
+      ],
+      [
+       4167,
+       239
+      ],
+      [
+       4195,
+       242
+      ],
+      [
+       4221,
+       243
+      ],
+      [
+       4248,
+       246
+      ],
+      [
+       4275,
+       247
+      ],
+      [
+       4302,
+       250
+      ],
+      [
+       4329,
+       251
+      ],
+      [
+       4357,
+       253
+      ],
+      [
+       4385,
+       256
+      ]
+     ]
+    }
+   ],
+   "conc": 1,
+   "length": 8000,
+   "pass": 1
+  }
+ ],
+ "warmup": [
+  {
+   "prefill_tok_s": 3422.6,
+   "decode_tok_s": 107.68,
+   "ttft": [
+    0.583
+   ],
+   "errors": null
+  },
+  {
+   "prefill_tok_s": 5108.0,
+   "decode_tok_s": 99.74,
+   "ttft": [
+    3.133
+   ],
+   "errors": null
+  }
+ ],
+ "finished": "2026-10-04 10:58:51"
+}

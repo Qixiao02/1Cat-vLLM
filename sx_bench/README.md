@@ -27,6 +27,7 @@
 | `as_run/prof_1003.sh`、`add_prof_arms.py`、`analyze_eager2.py`、`make_profile_tables.py` | 2026-10-04 单步 decode 剖析：`add_prof_arms.py` 加两个配置（eager 加 record_shapes；CUDA graph），`prof_1003.sh` 依次启动，每个窗口等所有请求出了第一个 token 后抓 3 秒 decode（`prof_window.py` 在服务器上，没有收进仓库）；`analyze_eager2.py` 是修了 TensorList 输入形状解析的版本（原版在带 TensorList 参数的算子上崩溃）；`make_profile_tables.py` 把分析输出变成 `PROFILE_TABLES.md` |
 | `as_run/make_vision_tables.py` | 从 `results/2026-10-04-vision-fp8-probe/` 的原始日志生成 `RESULTS.md`（开视觉和 FP8 KV 各自的代价）。启动脚本 `vision_probe.sh` 和 `image_check.py` 在同一个结果目录里 |
 | `as_run/build_1004.sh`、`validate_wheel_1004.sh`、`add_arms_1004.py` | 1004 wheel 的构建（仓库自己的 Dockerfile，参数和 1003 相同，BuildKit 缓存已清掉，冷构建 50 分钟）和验证：取出 wheel，做验证镜像（1003 镜像换上新 wheel），不开 MTP 和开 MTP 各一组“默认”和一组“开关设 0”的同镜像对照，另有 util 0.94 和 MTP util 0.93 |
+| `as_run/make_vision_cmp_report.py` | 从 `results/2026-10-04-vision-vs-official/` 的原始日志算出 `RESULTS.md`（两边都开视觉的对比，含“开视觉对两边各慢多少”）。运行脚本 `run_vision_cmp.sh`、配置 `add_arms_vision.py` 和图片压测 `image_bench.py` 在同一个结果目录里 |
 | `as_run/make_wheel1004_report.py` | 从 `results/2026-10-04-wheel-1004/` 的原始日志算出 `RESULTS.md`（1004 wheel 验证的所有表，不手算） |
 
 `as_run/` 下的脚本带着我们服务器上的路径、容器名和 compose 文件名，换机器要改。`pfx_bench.py` 和 `summarize.py` 不依赖这些，只用 Python 标准库。
@@ -75,6 +76,7 @@ python3 pfx_bench.py --port 8001 --model <served-model-name> --out result.json \
 | `results/2026-10-04-decode-profile/` | 单步 decode 的时间分布（README 实测第 10 组）：`PROFILE_TABLES.md` 是汇总，`LEVERS.md` 是“还能优化什么”的排序（预计收益是估计，不是实测），`raw/` 是每个窗口的分析输出（`G_*` 是 CUDA graph，`E_*` 是 eager 加形状）。完整 trace 文件没有收进仓库 |
 | `results/2026-10-04-vision-fp8-probe/` | 开视觉和 FP8 KV 各自的代价（README 实测第 9 组）：`RESULTS.md` 是汇总；`F1`、`T_VISION`、`T_FP8` 分别是生产参数、只开视觉、只用 FP8 KV（`*_vp_*` 是这一轮的数据）；`theirs_command/` 是别人那条命令的更早一次测试 |
 | `results/2026-10-04-kv-default-on/` | KV 稳态预算默认开的显存验证（README 实测第 8 组）：`first-run-graph-reserve-charged/` 是第一版（不开 MTP 通道 KV −21%，从没发布）的数据，`final-overlay-run/` 是修正后的数据，目录里的 `README.md` 有汇总 |
+| `results/2026-10-04-vision-vs-official/` | 两边都开视觉：本分支 1004 对官方 v1.5.1（README 实测第 11 组）。文件名前缀：`FV1` / `VV2b` 本分支 / 官方前缀缓存开，`FV2` / `VV1` 前缀缓存关，`FVM` / `VVMa` 开 MTP；`*_img.json` 是图片请求，其余同上表。`RESULTS.md` 是汇总 |
 | `results/2026-10-04-wheel-1004/` | 发行的 wheel（1004）的验证（README 实测第 8 组）。文件名前缀：`F1A` 不开 MTP 默认（util 0.90），`F1Z` 同样但 `SX_OPT_KV_STEADY_BUDGET=0`，`F1B` 不开 MTP util 0.94，`FMA` 开 MTP 默认（util 0.87），`FMZ` 同样但开关设 0，`FMB` 开 MTP util 0.93（不设预留量）。其余文件名同上表 |
 
 `results/2026-10-03-fork-vs-official-v1.5.1/` 的文件名前缀：
