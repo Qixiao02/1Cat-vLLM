@@ -1145,7 +1145,7 @@ _SxRowsConfig(enabled=True, max_m=24, table={'gdn_in': 24, 'gdn_out': 4, 'qsa_qk
 
 - 两次控制轮只差 1.76 s（+1.0%）⇒ 这条链上没有 14.3 那种主机漂移，可以直接比。以控制均值 185.87 s 为基准：**多线程装载 −68.1 s（−36.6%）**、`/health` 390.5 → 318 s（**−72.5 s**）；`prefetch` 策略只有 **−13.1 s（−7.0%）**。生产容器自己的装载是 `159.7–161.1 s`（页缓存更热），所以产线上的绝对收益会小于实验值，但方向与原因相同。
 - **这一项是"采纳"的**：两个装载 flag 都只作用于装载段，不改任何计算路径；四份 `PA_answers.json`（ctl/mt/pf/ctl2）**字节完全相同**（md5 `3802442a65fa652e6f73fadb0ba4f12f`），needle 8/8 与 4 道短题答案逐字一致，KV 池 410,988 token、`Available KV cache memory` 不变，引擎错误 0。
-- 补丁 `mk_prod_load.py` 只往 command 末尾加 `--model-loader-extra-config` + `{"enable_multithread_load": true, "num_threads": 8}`（19 → 21 条 flag），**不动** `VLLM_DISABLE_COMPILE_CACHE: "1"`；干跑对现网 compose 的非注释 diff 只有 `90a91,92` 两行，`COMPOSE_OK`。**未执行（待批）**。
+- 补丁 `mk_prod_load.py` 只往 command 末尾加 `--model-loader-extra-config` + `{"enable_multithread_load": true, "num_threads": 8}`（19 → 21 条 flag），**不动** `VLLM_DISABLE_COMPILE_CACHE: "1"`；干跑对现网 compose 的非注释 diff 只有 `90a91,92` 两行，`COMPOSE_OK`。**已于 2026-10-04 17:02–17:09 按这条干跑结果上线，见 14.5**。
 - 原计划第 5 轮（多线程重复样本）在启动 7 秒后被终止（`zz_cut_round5.sh`，服务器 16:03:38 检测 → 16:03:43 `CUT_ROUND5_DONE`），控制重复轮已经把漂移钉死，省 17 分钟；`chain_load.sh` 照常收尾并打 `CHAIN_LOAD_DONE`，后面的 parity 门槛按时接力。
 - 每个 flag 轮都跑过 needle 答案（24/24）与 C1 sweep，KV 池 410,988 token 不变。
 
@@ -1168,14 +1168,15 @@ CACHE_PARITY_RC=1
 - 因此：**生产保持 `VLLM_DISABLE_COMPILE_CACHE: "1"`，不加 `SX_OPT_COMPILE_CACHE`**。30–45 秒的收益放弃，换输出的可复现性 —— 这正是本仓库一直写着"输出一致性没有验证过，生产不要开"的原因，现在有了实测依据。
 - 粗粒度答案检查抓不到它：needle/short 的**答案文本**在缓存关/缓存开/装载各臂之间逐字相同（只有 `seconds` 计时字段不同，所以文件 md5 不同），差异只在 512 token 级的长贪心生成里显现。
 - 巧合的是，两种编译路径本来就不同：缓存关时引擎自动 `VLLM_USE_AOT_COMPILE=1`（`vllm/config/vllm.py:2847`，生产日志里也看得到），开缓存走 subgraph 并强制 `VLLM_USE_AOT_COMPILE=0`（`sx_compile_cache.py:225-232`）—— 也就是说这个开关同时改变了编译管线，不能只当作"纯省时间"。
-- **落地（待用户批，尚未执行）**：只上 14.4 的装载 flag，补丁 `mk_prod_load.py` 干跑通过（非注释 diff 仅 `90a91,92`、`命令 19 -> 21`、缓存开关仍在第 86 行、`COMPOSE_OK`）；执行流程照 `upgrade_8031_seq32.sh`：备份 → 生成 + `config -q` + 打印非注释 diff → `/metrics` 的 running/waiting 必须为 0 → 停旧起新 → 最多等 30 分钟 `/health`（容器非 running 或超时则回滚）→ 后检查 `/version`、KV cache size、graph capturing、`kvq_check.py` 答案与 `prod8031_1004_answers.json` 逐条对比、smoke chat、引擎错误计数。
+- **落地（已上线，2026-10-04 17:02 → 17:09）**：只上 14.4 的装载 flag，补丁 `mk_prod_load.py` 干跑通过（非注释 diff 仅 `90a91,92`、`命令 19 -> 21`、缓存开关仍在第 86 行、`COMPOSE_OK`）；执行流程照 `upgrade_8031_seq32.sh`：备份 → 生成 + `config -q` + 打印非注释 diff → `/metrics` 的 running/waiting 必须为 0 → 停旧起新 → 最多等 30 分钟 `/health`（容器非 running 或超时则回滚）→ 后检查 `/version`、KV cache size、graph capturing、`kvq_check.py` 答案与 `prod8031_1004_answers.json` 逐条对比、smoke chat、引擎错误计数。备份文件是 `compose.swift15-flashnext-tp4-gpu0123.yaml.bak-load-pre-upgrade-20261004170209`（回滚 = 还原该文件 + `docker compose up -d`）；现役容器 `shixiang-inference-swift15-flashnext-tp4` 的 `docker inspect .Config.Cmd` 里确有 `--model-loader-extra-config` + `{"enable_multithread_load": true, "num_threads": 8}`，并与 `--cudagraph-capture-sizes 1 2 4 8 16 20 24 32`（第 15 组）并存——这就是当前的生产配置。中立性：部署后的 `PA_answers.json` 与部署前基线、以及装载臂对照（`1004ldctl`）**7/7 逐题一致**。
+- **装载耗时的线上口径（不光报好数字）**：受控 A/B 里装载臂比对照快 68.1 s（14.4）；同一窗口的线上实测是 **166.28 s vs 139.66 s**（看起来更慢），但那次采样正处在宿主高争用（load 17.9、swap 满）⇒ **该样本不可比**。安静窗口的两次线上实测是 **70.05 s（回滚重启）与 71.43 s（捕获尺寸部署重启）**，说明装载耗时被宿主状态主导。结论：flag 依据受控 A/B 采纳并已上线，**线上耗时的收益待安静窗口复测**。
 
 #### 没有做的
 
 - QPN2/QPN4/QPN8 的移植都没有重编 wheel（三重不可达已经证否）；MoE grouped 33–127 行真空带、上游挂死报给官方这些改动都没有做。（`_SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES` 加 20/24 当时列在这一条里，后来由[第 15 组](#15-把-decode-剖析的三条杠杆做成实测全部为负顺带找到一条纯配置杠杆2026-10-04)的采纳清单单独提交：`5a238832e`。）
 - 启动实验只测到 `/health`，没有测"第一个请求可用"的口径；`SX_OPT_COMPILE_CACHE` 的 `aot` 等其它取值没测（`sx_compile_cache.py:233-241` 明确那是上游 parity 失败路径）。
 - 编译缓存的生产采纳**被 parity 门槛否决**（14.5），不是"没来得及做"；parity 只跑了生产形（`nomtp`）航道，MTP 航道等上线 MTP 再补。
-- 装载 flag 的生产采纳尚未执行（用户未要求改生产，补丁已干跑通过）。
+- 装载 flag 的生产采纳**已经执行**（2026-10-04 17:02–17:09 上线，备份 `compose.swift15-flashnext-tp4-gpu0123.yaml.bak-load-pre-upgrade-20261004170209`），见 14.5——本组两个启动杠杆一个被 parity 门槛否决、一个已落地，没有剩下未执行项。
 
 ### 13. 并发上限从 24 提到 32（2026-10-04）
 
