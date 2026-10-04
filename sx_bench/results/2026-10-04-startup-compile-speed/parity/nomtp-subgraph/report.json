@@ -1,0 +1,221 @@
+{
+ "lane": "nomtp",
+ "mode": "subgraph",
+ "verdict": "FAIL",
+ "reasons": [
+  "off vs cold: 6/10 prompts identical",
+  "off vs warm: 7/10 prompts identical",
+  "cold vs warm: 6/10 prompts identical"
+ ],
+ "notes": [],
+ "pairs": [
+  {
+   "a": "off",
+   "b": "cold",
+   "equal": 6,
+   "total": 10,
+   "differences": [
+    {
+     "id": "p01_code_lru",
+     "reason": "first difference at token 43 of 512/512",
+     "position": 43,
+     "lengths": [
+      512,
+      512
+     ],
+     "a_tail": "ations\n\nimport threading\nimport time\nfrom collections import OrderedDict\nfrom typing import Any, Gen",
+     "b_tail": "ations\n\nimport threading\nimport time\nfrom collections import OrderedDict\nfrom typing import Any, Gen"
+    },
+    {
+     "id": "p02_math",
+     "reason": "first difference at token 98 of 256/256",
+     "position": 98,
+     "lengths": [
+      256,
+      256
+     ],
+     "a_tail": "# Step 1: Determine Individual Rates\n\nLet the total capacity of the tank be $1$ unit.\n\nThe rate of w",
+     "b_tail": "# Step 1: Determine Individual Rates\n\nLet the total capacity of the tank be $1$ unit.\n\nThe rate of w"
+    },
+    {
+     "id": "p03_zh",
+     "reason": "first difference at token 160 of 210/218",
+     "position": 160,
+     "lengths": [
+      210,
+      218
+     ],
+     "a_tail": "",
+     "b_tail": ""
+    },
+    {
+     "id": "p08_summary_16k",
+     "reason": "first difference at token 7 of 107/108",
+     "position": 7,
+     "lengths": [
+      107,
+      108
+     ],
+     "a_tail": "The provided text consists entirely of a random sequence of unrelated nouns and c",
+     "b_tail": "The provided text consists entirely of a randomized sequence of common nouns and "
+    }
+   ],
+   "spec_equal": null,
+   "spec_difference": {},
+   "identical": false
+  },
+  {
+   "a": "off",
+   "b": "warm",
+   "equal": 7,
+   "total": 10,
+   "differences": [
+    {
+     "id": "p01_code_lru",
+     "reason": "first difference at token 9 of 512/512",
+     "position": 9,
+     "lengths": [
+      512,
+      512
+     ],
+     "a_tail": "```python\n\"\"\"\nThread-safe LRU cache with per-entry TTL.\n\"\"\"\n\nfrom __future__ import ann",
+     "b_tail": "```python\n\"\"\"\nThread-safe LRU Cache with per-entry TTL.\n\"\"\"\n\nfrom __future__ import ann"
+    },
+    {
+     "id": "p03_zh",
+     "reason": "first difference at token 43 of 210/200",
+     "position": 43,
+     "lengths": [
+      210,
+      200
+     ],
+     "a_tail": "\uff0c\u80fd\u591f\u540c\u65f6\u6267\u884c\u5927\u91cf\u7b80\u5355\u7684\u7b97\u672f\u8fd0\u7b97\u3002\u77e9\u9635\u4e58\u6cd5\u672c\u8d28\u4e0a\u662f\u9ad8\u5ea6\u5e76\u884c\u7684\u7ebf\u6027\u4ee3\u6570\u64cd\u4f5c\uff0c\u6d89\u53ca\u6d77\u91cf\u7684\u72ec\u7acb\u4e58\u52a0\u8fd0\u7b97\uff0c\u8fd9\u5b8c\u7f8e\u5951\u5408\u4e86 GPU \u7684\u5e76\u884c\u5904\u7406\u80fd\u529b\u3002\n\n\u4ee5\u8bad\u7ec3\u4e00\u4e2a\u5305\u542b\u6570\u767e\u4e07\u53c2\u6570\u7684\u795e\u7ecf\u7f51\u7edc\u4e3a\u4f8b\uff0c\u524d\u5411\u4f20\u64ad\u8fc7\u7a0b\u4e2d\u9700\u8981\u8fde",
+     "b_tail": "\uff0c\u80fd\u591f\u540c\u65f6\u6267\u884c\u5927\u91cf\u7b80\u5355\u7684\u7b97\u672f\u8fd0\u7b97\u3002\u77e9\u9635\u4e58\u6cd5\u672c\u8d28\u4e0a\u662f\u9ad8\u5ea6\u5e76\u884c\u7684\u7ebf\u6027\u4ee3\u6570\u64cd\u4f5c\uff0c\u6d89\u53ca\u6d77\u91cf\u72ec\u7acb\u7684\u6570\u636e\u70b9\u8ba1\u7b97\uff0c\u8fd9\u5b8c\u7f8e\u5951\u5408\u4e86 GPU \u7684\u5e76\u884c\u5904\u7406\u80fd\u529b\u3002\n\n\u4ee5\u6df1\u5ea6\u5b66\u4e60\u4e2d\u7684\u56fe\u50cf\u8bc6\u522b\u4e3a\u4f8b\uff0c\u5f53\u795e\u7ecf\u7f51\u7edc\u5904\u7406\u4e00\u5f20\u9ad8\u5206\u8fa8\u7387\u56fe\u7247"
+    },
+    {
+     "id": "p08_summary_16k",
+     "reason": "first difference at token 25 of 107/114",
+     "position": 25,
+     "lengths": [
+      107,
+      114
+     ],
+     "a_tail": " of a random sequence of unrelated nouns and contains no coherent narrative, data, or logical struct",
+     "b_tail": " of a random sequence of unrelated nouns and contains no coherent narrative, data, or logical struct"
+    }
+   ],
+   "spec_equal": null,
+   "spec_difference": {},
+   "identical": false
+  },
+  {
+   "a": "cold",
+   "b": "warm",
+   "equal": 6,
+   "total": 10,
+   "differences": [
+    {
+     "id": "p01_code_lru",
+     "reason": "first difference at token 9 of 512/512",
+     "position": 9,
+     "lengths": [
+      512,
+      512
+     ],
+     "a_tail": "```python\n\"\"\"\nThread-safe LRU cache with per-entry TTL.\n\"\"\"\n\nfrom __future__ import ann",
+     "b_tail": "```python\n\"\"\"\nThread-safe LRU Cache with per-entry TTL.\n\"\"\"\n\nfrom __future__ import ann"
+    },
+    {
+     "id": "p02_math",
+     "reason": "first difference at token 98 of 256/256",
+     "position": 98,
+     "lengths": [
+      256,
+      256
+     ],
+     "a_tail": "# Step 1: Determine Individual Rates\n\nLet the total capacity of the tank be $1$ unit.\n\nThe rate of w",
+     "b_tail": "# Step 1: Determine Individual Rates\n\nLet the total capacity of the tank be $1$ unit.\n\nThe rate of w"
+    },
+    {
+     "id": "p03_zh",
+     "reason": "first difference at token 43 of 218/200",
+     "position": 43,
+     "lengths": [
+      218,
+      200
+     ],
+     "a_tail": "\uff0c\u80fd\u591f\u540c\u65f6\u6267\u884c\u5927\u91cf\u7b80\u5355\u7684\u7b97\u672f\u8fd0\u7b97\u3002\u77e9\u9635\u4e58\u6cd5\u672c\u8d28\u4e0a\u662f\u9ad8\u5ea6\u5e76\u884c\u7684\u7ebf\u6027\u4ee3\u6570\u64cd\u4f5c\uff0c\u6d89\u53ca\u6d77\u91cf\u7684\u72ec\u7acb\u4e58\u52a0\u8fd0\u7b97\uff0c\u8fd9\u5b8c\u7f8e\u5951\u5408\u4e86 GPU \u7684\u5e76\u884c\u5904\u7406\u80fd\u529b\u3002\n\n\u4ee5\u8bad\u7ec3\u4e00\u4e2a\u5305\u542b\u6570\u767e\u4e07\u53c2\u6570\u7684\u795e\u7ecf\u7f51\u7edc\u4e3a\u4f8b\uff0c\u524d\u5411\u4f20\u64ad\u8fc7\u7a0b\u4e2d\u9700\u8981\u8fde",
+     "b_tail": "\uff0c\u80fd\u591f\u540c\u65f6\u6267\u884c\u5927\u91cf\u7b80\u5355\u7684\u7b97\u672f\u8fd0\u7b97\u3002\u77e9\u9635\u4e58\u6cd5\u672c\u8d28\u4e0a\u662f\u9ad8\u5ea6\u5e76\u884c\u7684\u7ebf\u6027\u4ee3\u6570\u64cd\u4f5c\uff0c\u6d89\u53ca\u6d77\u91cf\u72ec\u7acb\u7684\u6570\u636e\u70b9\u8ba1\u7b97\uff0c\u8fd9\u5b8c\u7f8e\u5951\u5408\u4e86 GPU \u7684\u5e76\u884c\u5904\u7406\u80fd\u529b\u3002\n\n\u4ee5\u6df1\u5ea6\u5b66\u4e60\u4e2d\u7684\u56fe\u50cf\u8bc6\u522b\u4e3a\u4f8b\uff0c\u5f53\u795e\u7ecf\u7f51\u7edc\u5904\u7406\u4e00\u5f20\u9ad8\u5206\u8fa8\u7387\u56fe\u7247"
+    },
+    {
+     "id": "p08_summary_16k",
+     "reason": "first difference at token 7 of 108/114",
+     "position": 7,
+     "lengths": [
+      108,
+      114
+     ],
+     "a_tail": "The provided text consists entirely of a randomized sequence of common nouns and ",
+     "b_tail": "The provided text consists entirely of a random sequence of unrelated nouns and c"
+    }
+   ],
+   "spec_equal": null,
+   "spec_difference": {},
+   "identical": false
+  }
+ ],
+ "controls": [
+  {
+   "a": "off",
+   "b": "off2",
+   "equal": 10,
+   "total": 10,
+   "differences": [],
+   "spec_equal": null,
+   "spec_difference": {},
+   "identical": true
+  }
+ ],
+ "timing": {
+  "off": {
+   "healthy_s": 593.7177171707153,
+   "model_loading_s": 197.122858,
+   "torch_compile_total_s": 164.96,
+   "dynamo_max_s": 19.99,
+   "compile_range_max_s": 48.47,
+   "cache_load_max_s": 0.0,
+   "graph_capture_max_s": 131.0,
+   "init_engine_max_s": 317.7
+  },
+  "off2": {
+   "healthy_s": 382.0852007865906,
+   "model_loading_s": 195.923223,
+   "torch_compile_total_s": 88.36,
+   "dynamo_max_s": 20.15,
+   "compile_range_max_s": 4.46,
+   "cache_load_max_s": 0.0,
+   "graph_capture_max_s": 54.0,
+   "init_engine_max_s": 117.87
+  },
+  "cold": {
+   "healthy_s": 573.1796188354492,
+   "model_loading_s": 209.303371,
+   "torch_compile_total_s": 190.0,
+   "dynamo_max_s": 21.03,
+   "compile_range_max_s": 44.64,
+   "cache_load_max_s": 0.0,
+   "graph_capture_max_s": 116.0,
+   "init_engine_max_s": 284.65
+  },
+  "warm": {
+   "healthy_s": 366.9976878166199,
+   "model_loading_s": 220.307353,
+   "torch_compile_total_s": 57.05,
+   "dynamo_max_s": 20.54,
+   "compile_range_max_s": 0.0,
+   "cache_load_max_s": 1.804,
+   "graph_capture_max_s": 36.0,
+   "init_engine_max_s": 78.85
+  }
+ }
+}

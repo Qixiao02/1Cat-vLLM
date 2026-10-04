@@ -1,0 +1,99 @@
+=== run_one 1004su3 concs='8' long=0 14:44:12 avail=GiB
+cache: /opt/shixiang-inference/cache-forkwheel-flashnext-tp4
+last lines: ['echo "=== port facts (engine_PA/PM logs)"', 'for a in PA PM; do [ -f engine_$a.log ] || continue; echo "--- $a"; grep -oE "capture_sizes=[^ ]*|GPU KV cache size: [0-9,]+ tokens|Maximum concurrency for [0-9,]+ tokens per request: [0-9.]+x|Model loading took [0-9.]+ GiB and [0-9.]+ s|Graph capturing finished in [0-9]+ secs" engine_$a.log | sort -u | head -8; done', 'echo "RUN_PORT_1004su3_DONE $(date +%T)"']
+=== start 2026-10-04 14:44:12  (fork arms first; the official image is still being built)
+=== start PA 14:44:13  MemAvailable 163 GiB
+ Container sx-cmp-pa Started 
+[PA] healthy after 346s
+[PA] [vllm.py:2243] Asynchronous scheduling is enabled.
+[PA] [vllm.py:2553] Auto-setting VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=1 for the SM70 Flash-V100 baseline. Set it explicitly to override.
+[PA] [vllm.py:2553] Auto-setting VLLM_SM70_GDN_KKT_SCHEDULE=1 for the SM70 Flash-V100 baseline. Set it explicitly to override.
+[PA] [vllm.py:2553] Auto-setting VLLM_SM70_GDN_DELTA_H_SCHEDULE=1 for the SM70 Flash-V100 baseline. Set it explicitly to override.
+[PA] [vllm.py:2553] Auto-setting VLLM_SM70_GDN_CHUNK_O_SCHEDULE=1 for the SM70 Flash-V100 baseline. Set it explicitly to override.
+[PA] [vllm.py:2553] Auto-setting VLLM_SM70_FLA_RECURRENT_SCHEDULE=1 for the SM70 Flash-V100 baseline. Set it explicitly to override.
+[PA] [vllm.py:2553] Auto-setting VLLM_SM70_FUSED_SIGMOID_GATING_SCHED=1 for the SM70 Flash-V100 baseline. Set it explicitly to override.
+[PA] [vllm.py:2553] Auto-setting VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE=1 for the SM70 Flash-V100 baseline. Set it explicitly to override.
+[PA] [vllm.py:2553] Auto-setting VLLM_SM70_GDN_DECODE_FLASHQLA=1 for the SM70 Flash-V100 baseline. Set it explicitly to override.
+[PA] [vllm.py:2573] Auto-setting VLLM_SM70_QWEN38_FP16_GEMV=1 for the quality-qualified SM70 Qwen3.8 NVFP4 TP4 no-MTP path. Set it explicitly to override.
+[PA] [vllm.py:2573] Auto-setting VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16=1 for the quality-qualified SM70 Qwen3.8 NVFP4 TP4 no-MTP path. Set it explicitly to override.
+[PA] [vllm.py:2573] Auto-setting VLLM_SM70_QWEN38_FUSED_HC_FP16=1 for the quality-qualified SM70 Qwen3.8 NVFP4 TP4 no-MTP path. Set it explicitly to override.
+[PA] [vllm.py:2573] Auto-setting VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP=1 for the quality-qualified SM70 Qwen3.8 NVFP4 TP4 no-MTP path. Set it explicitly to override.
+[PA] [vllm.py:2573] Auto-setting VLLM_SM70_MOE_ADD_ALLREDUCE=1 for the quality-qualified SM70 Qwen3.8 NVFP4 TP4 no-MTP path. Set it explicitly to override.
+[PA] acceleration report: {"detail":"Not Found"}
+=== tests PA 14:49:59
+[PA] [kvq 8141] needle 24/24, short 3/4
+[PA sweep_c8] pass 0 C8  len   8000 prompt 7999 | ttft first/last   1.42/  9.54 s | prefill  6706.2 tok/s | decode  49.49 tok/s per stream,  395.95 agg (window 5.0s) | e2e   14.7s | kv peak 25.8% | wait 5 | cache hits 0 | preempt 0
+[PA sweep_c8] pass 1 C8  len   8000 prompt 8000 | ttft first/last   2.52/  9.46 s | prefill  6761.1 tok/s | decode  49.55 tok/s per stream,  396.37 agg (window 5.0s) | e2e   14.6s | kv peak 25.8% | wait 4 | cache hits 0 | preempt 0
+[PA] gpu mem (MiB): 31649 31649 31649 31649 
+[PA] errors in engine log: 0
+ Network sx-cmp-pa_default Removed 
+=== port facts (engine_PA/PM logs)
+--- PA
+capture_sizes=(1,
+GPU KV cache size: 410,988 tokens
+Graph capturing finished in 36 secs
+Maximum concurrency for 131,072 tokens per request: 3.14x
+Model loading took 21.38 GiB and 186.884126 s
+Model loading took 21.38 GiB and 186.922527 s
+Model loading took 21.38 GiB and 186.932130 s
+Model loading took 21.38 GiB and 186.932533 s
+RUN_PORT_1004su3_DONE 14:51:09
+--- 1004su3 timings
+[PA] healthy after 346s
+(APIServer pid=69) INFO 10-04 06:44:30 [sx_compile_cache.py:113] SX_OPT_COMPILE_CACHE=subgraph: leaving VLLM_DISABLE_COMPILE_CACHE unset for the SM70 Flash-V100 compile graph; compiled artifacts are reused across restarts. The cache key carries the build identity, so another build never reuses them.
+(APIServer pid=69) INFO 10-04 06:44:30 [sx_compile_cache.py:113] SX_OPT_COMPILE_CACHE=subgraph: reusing compiled subgraphs without the AOT FX-graph reload (VLLM_USE_AOT_COMPILE=0); Dynamo still traces the graph on every start.
+(Worker_TP2 pid=171) INFO 10-04 06:48:17 [model_runner.py:490] Model loading took 21.38 GiB and 186.884126 seconds
+(Worker_TP1 pid=170) INFO 10-04 06:48:17 [model_runner.py:490] Model loading took 21.38 GiB and 186.922527 seconds
+(Worker_TP3 pid=172) INFO 10-04 06:48:17 [model_runner.py:490] Model loading took 21.38 GiB and 186.932533 seconds
+(Worker_TP0 pid=169) INFO 10-04 06:48:17 [model_runner.py:490] Model loading took 21.38 GiB and 186.932130 seconds
+=== done 1004su3 14:51:15
+=== run_one 1004ctl3 concs='8' long=0 14:51:15 avail=GiB
+cache: /opt/shixiang-inference/cache-forkwheel-flashnext-tp4
+last lines: ['echo "=== port facts (engine_PA/PM logs)"', 'for a in PA PM; do [ -f engine_$a.log ] || continue; echo "--- $a"; grep -oE "capture_sizes=[^ ]*|GPU KV cache size: [0-9,]+ tokens|Maximum concurrency for [0-9,]+ tokens per request: [0-9.]+x|Model loading took [0-9.]+ GiB and [0-9.]+ s|Graph capturing finished in [0-9]+ secs" engine_$a.log | sort -u | head -8; done', 'echo "RUN_PORT_1004ctl3_DONE $(date +%T)"']
+=== start 2026-10-04 14:51:16  (fork arms first; the official image is still being built)
+=== start PA 14:51:16  MemAvailable 163 GiB
+ Container sx-cmp-pa Started 
+[PA] healthy after 391s
+[PA] [vllm.py:2243] Asynchronous scheduling is enabled.
+[PA] [vllm.py:2553] Auto-setting VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=1 for the SM70 Flash-V100 baseline. Set it explicitly to override.
+[PA] [vllm.py:2553] Auto-setting VLLM_SM70_GDN_KKT_SCHEDULE=1 for the SM70 Flash-V100 baseline. Set it explicitly to override.
+[PA] [vllm.py:2553] Auto-setting VLLM_SM70_GDN_DELTA_H_SCHEDULE=1 for the SM70 Flash-V100 baseline. Set it explicitly to override.
+[PA] [vllm.py:2553] Auto-setting VLLM_SM70_GDN_CHUNK_O_SCHEDULE=1 for the SM70 Flash-V100 baseline. Set it explicitly to override.
+[PA] [vllm.py:2553] Auto-setting VLLM_SM70_FLA_RECURRENT_SCHEDULE=1 for the SM70 Flash-V100 baseline. Set it explicitly to override.
+[PA] [vllm.py:2553] Auto-setting VLLM_SM70_FUSED_SIGMOID_GATING_SCHED=1 for the SM70 Flash-V100 baseline. Set it explicitly to override.
+[PA] [vllm.py:2553] Auto-setting VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE=1 for the SM70 Flash-V100 baseline. Set it explicitly to override.
+[PA] [vllm.py:2553] Auto-setting VLLM_SM70_GDN_DECODE_FLASHQLA=1 for the SM70 Flash-V100 baseline. Set it explicitly to override.
+[PA] [vllm.py:2573] Auto-setting VLLM_SM70_QWEN38_FP16_GEMV=1 for the quality-qualified SM70 Qwen3.8 NVFP4 TP4 no-MTP path. Set it explicitly to override.
+[PA] [vllm.py:2573] Auto-setting VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16=1 for the quality-qualified SM70 Qwen3.8 NVFP4 TP4 no-MTP path. Set it explicitly to override.
+[PA] [vllm.py:2573] Auto-setting VLLM_SM70_QWEN38_FUSED_HC_FP16=1 for the quality-qualified SM70 Qwen3.8 NVFP4 TP4 no-MTP path. Set it explicitly to override.
+[PA] [vllm.py:2573] Auto-setting VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP=1 for the quality-qualified SM70 Qwen3.8 NVFP4 TP4 no-MTP path. Set it explicitly to override.
+[PA] [vllm.py:2573] Auto-setting VLLM_SM70_MOE_ADD_ALLREDUCE=1 for the quality-qualified SM70 Qwen3.8 NVFP4 TP4 no-MTP path. Set it explicitly to override.
+[PA] acceleration report: {"detail":"Not Found"}
+=== tests PA 14:57:48
+[PA] [kvq 8141] needle 24/24, short 3/4
+[PA sweep_c8] pass 0 C8  len   8000 prompt 7999 | ttft first/last   2.50/  9.49 s | prefill  6737.3 tok/s | decode  49.83 tok/s per stream,  398.64 agg (window 5.0s) | e2e   14.6s | kv peak 25.8% | wait 4 | cache hits 0 | preempt 0
+[PA sweep_c8] pass 1 C8  len   8000 prompt 8000 | ttft first/last   1.41/  9.52 s | prefill  6723.9 tok/s | decode  50.01 tok/s per stream,  400.11 agg (window 4.9s) | e2e   14.6s | kv peak 25.8% | wait 5 | cache hits 0 | preempt 0
+[PA] gpu mem (MiB): 31649 31649 31649 31649 
+[PA] errors in engine log: 0
+ Network sx-cmp-pa_default Removed 
+=== port facts (engine_PA/PM logs)
+--- PA
+capture_sizes=(1,
+GPU KV cache size: 410,988 tokens
+Graph capturing finished in 57 secs
+Maximum concurrency for 131,072 tokens per request: 3.14x
+Model loading took 21.38 GiB and 206.723914 s
+Model loading took 21.38 GiB and 207.739107 s
+Model loading took 21.38 GiB and 207.779074 s
+Model loading took 21.38 GiB and 208.576218 s
+RUN_PORT_1004ctl3_DONE 14:58:58
+--- 1004ctl3 timings
+[PA] healthy after 391s
+(Worker_TP0 pid=169) INFO 10-04 06:55:39 [model_runner.py:490] Model loading took 21.38 GiB and 206.723914 seconds
+(Worker_TP1 pid=170) INFO 10-04 06:55:40 [model_runner.py:490] Model loading took 21.38 GiB and 207.739107 seconds
+(Worker_TP3 pid=172) INFO 10-04 06:55:41 [model_runner.py:490] Model loading took 21.38 GiB and 207.779074 seconds
+(Worker_TP2 pid=171) INFO 10-04 06:55:41 [model_runner.py:490] Model loading took 21.38 GiB and 208.576218 seconds
+(Worker_TP0 pid=169) INFO 10-04 06:56:30 [monitor.py:53] torch.compile took 48.04 s in total
+(Worker_TP0 pid=169) INFO 10-04 06:57:35 [monitor.py:53] torch.compile took 45.26 s in total
+=== done 1004ctl3 14:58:59
+STARTUP_AB_REV_DONE 14:58:59
