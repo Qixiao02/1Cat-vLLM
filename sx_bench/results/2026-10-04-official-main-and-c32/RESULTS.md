@@ -57,7 +57,7 @@
 | KV 峰值（%） | 72 | 72 | 95 | — | — | — |
 | 抢占次数 | 0 | 0 | 0 | — | — | — |
 
-**读这张表要注意捕获尺寸这个干扰项**：`engine_F1.log` 是 `capture_sizes=(1, 2, 4, 8, 16, 24)`，`engine_F1C32.log` 是 `capture_sizes=(1, 2, 4, 8, 16, 32)`（`vllm/config/vllm.py:540-549`）。`vllm/v1/worker/gpu/cudagraph_utils.py:566-583` 的 `dispatch()` 按 `num_tokens` 精确查 `self._candidates[num_tokens]`，查不到就返回 `cg_mode=NONE`；所以 24 路这一波在 F1C32 上没有图可重放（走 eager），同一个 24 路负载比 F1 慢 4.2%（合计也低 4.2%）。C8、C16 两个配置都有对应图，实测差 −0.7% / −0.1%，在噪声内。
+**读这张表要注意捕获尺寸这个干扰项**：`engine_F1.log` 是 `capture_sizes=(1, 2, 4, 8, 16, 24)`，`engine_F1C32.log` 是 `capture_sizes=(1, 2, 4, 8, 16, 32)`（`vllm/config/vllm.py:540-549`）。`_init_candidates()`（`vllm/v1/worker/gpu/cudagraph_utils.py:387-472`，铺表在 `:461-468`）把每个捕获尺寸铺到下一个尺寸之前，`dispatch()`（`:559-583`）取第一个 `_is_compatible`（`:149-164`，只要图宽 ≥ 批大小）的描述符；所以 24 路这一波在 F1C32 上重放的是 M=32 的图（填充是零长 query 窗口，`vllm/v1/worker/gpu/model_runner.py:1132-1141`、`:1172`），**不是**走 eager，同一个 24 路负载比 F1 慢 4.2%（合计也低 4.2%），这笔宽度税后来由 `--cudagraph-capture-sizes 1 2 4 8 16 20 24 32` 补回（见 `../2026-10-04-cudagraph-capture-sizes/RESULTS.md`）。C8、C16 两个配置都有对应图，实测差 −0.7% / −0.1%，在噪声内。
 
 - **C32 已经贴近 KV 上限**：32 × 8K 时 KV 峰值 95.1–95.3%（池 410,988 token）、wait 28、0 抢占；再长一点或再多一条请求就会开始抢占。
 - **启动代价**：F1C32 511 s 健康（图捕获 93 s / 1.02 GiB），F1 457 s（55 s / 1.04 GiB）；多一个捕获尺寸多约 38 s。两者的 KV 容量相同（410,988 token）、引擎日志都是 0 错误、needle 都是 24/24。

@@ -242,11 +242,15 @@ if 24 in c32 and 32 in c32:
     L.append("")
     L.append("**读这张表要注意捕获尺寸这个干扰项**：`engine_F1.log` 是 "
              "`capture_sizes=(1, 2, 4, 8, 16, 24)`，`engine_F1C32.log` 是 `capture_sizes=(1, 2, 4, 8, 16, 32)`"
-             "（`vllm/config/vllm.py:540-549`）。`vllm/v1/worker/gpu/cudagraph_utils.py:566-583` 的 `dispatch()` "
-             "按 `num_tokens` 精确查 `self._candidates[num_tokens]`，查不到就返回 `cg_mode=NONE`；"
-             "所以 24 路这一波在 F1C32 上没有图可重放（走 eager），"
+             "（`vllm/config/vllm.py:540-549`）。`_init_candidates()`"
+             "（`vllm/v1/worker/gpu/cudagraph_utils.py:387-472`，铺表在 `:461-468`）把每个捕获尺寸铺到"
+             "下一个尺寸之前，`dispatch()`（`:559-583`）取第一个 `_is_compatible`（`:149-164`，只要图宽 ≥ "
+             "批大小）的描述符；所以 24 路这一波在 F1C32 上重放的是 M=32 的图（填充是零长 query 窗口，"
+             "`vllm/v1/worker/gpu/model_runner.py:1132-1141`、`:1172`），**不是**走 eager，"
              f"同一个 24 路负载比 F1 慢 {abs(100 * (p24 / fp - 1)):.1f}%（合计也低 "
-             f"{abs(100 * (a24 / fa - 1)):.1f}%）。"
+             f"{abs(100 * (a24 / fa - 1)):.1f}%），这笔宽度税后来由 "
+             "`--cudagraph-capture-sizes 1 2 4 8 16 20 24 32` 补回"
+             "（见 `../2026-10-04-cudagraph-capture-sizes/RESULTS.md`）。"
              "C8、C16 两个配置都有对应图，实测差 −0.7% / −0.1%，在噪声内。")
     L.append("")
     L.append("- **C32 已经贴近 KV 上限**：32 × 8K 时 KV 峰值 95.1–95.3%（池 410,988 token）、wait 28、"
