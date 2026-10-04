@@ -32,8 +32,16 @@ namespace {
 
 constexpr int kPrepareThreads = 256;
 constexpr int kQpn2RowsPerCta = 8;
-constexpr int kQpn2MaxRows = 64;
-constexpr int kQpn2DispatchMaxRows = 32;
+// Ported from ChainZeaxion/1Cat-vLLM tag v1.3.1-cu128-zxvllm120-16c-20261004
+// (nvfp4_qpn2_sm70.cu: kQpn2MaxRows = 128, kQpn2DispatchMaxRows = 128).
+// Speculative decoding multiplies the verifier row count by
+// batch * (1 + num_speculative_tokens): 16 x (1 + 7) = 128 rows.  With a
+// 32-row window that whole batch is sent to the TurboMind fallback (FP16
+// scale expansion plus the generic FP4 GEMM) on every step.  Only the
+// TORCH_CHECK bound and the dispatch boundary move here; the native kernels
+// are already M-agnostic (row blocks are derived from m at launch time).
+constexpr int kQpn2MaxRows = 128;
+constexpr int kQpn2DispatchMaxRows = 128;
 
 __device__ __forceinline__ int qpn2_col_from_lane(int lane) {
   return ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);

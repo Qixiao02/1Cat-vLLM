@@ -1530,7 +1530,7 @@ def nvfp4_qpn2_dispatch_sm70_out(
     tm_q_ld: int,
     gated_silu: bool,
 ) -> None:
-    """Select QPN2 for M<=32 and TurboMind for larger dynamic M."""
+    """Select QPN2 for M<=128 and TurboMind for larger dynamic M."""
     _op("nvfp4_qpn2_dispatch_sm70_out")(
         out,
         input,
