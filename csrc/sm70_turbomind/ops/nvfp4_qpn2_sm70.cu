@@ -705,7 +705,20 @@ void nvfp4_qpn2_dispatch_sm70_impl(torch::Tensor out, torch::Tensor input,
                                    torch::Tensor tm_scales,
                                    int64_t tm_group_size, int64_t tm_k_ld,
                                    int64_t tm_q_ld, bool gated_silu) {
-  if (input.size(0) <= kQpn2DispatchMaxRows) {
+  const int64_t dispatch_m = input.size(0);
+  if (dispatch_m <= kQpn2DispatchMaxRows) {
+    if (dispatch_m > 32) {
+      // Only reachable with the widened window.  Keeps the port observable in
+      // the engine log without touching the hot path.
+      static std::once_flag wide_native_log_once;
+      std::call_once(wide_native_log_once, [dispatch_m]() {
+        std::fprintf(stderr,
+                     "INFO SM70 NVFP4 QPN2 dispatch: M=%lld uses the native "
+                     "wide-M path (window %d rows).\n",
+                     static_cast<long long>(dispatch_m),
+                     kQpn2DispatchMaxRows);
+      });
+    }
     if (gated_silu) {
       nvfp4_qpn2_gated_sm70_impl<TurboMindLayout>(
           out, input, codes, scales, global_scale, split_k, accumulator_chains);
@@ -715,6 +728,14 @@ void nvfp4_qpn2_dispatch_sm70_impl(torch::Tensor out, torch::Tensor input,
     }
     return;
   }
+
+  static std::once_flag fallback_log_once;
+  std::call_once(fallback_log_once, [dispatch_m]() {
+    std::fprintf(stderr,
+                 "INFO SM70 NVFP4 QPN2 dispatch: M=%lld exceeds the %d-row "
+                 "window, using the TurboMind fallback.\n",
+                 static_cast<long long>(dispatch_m), kQpn2DispatchMaxRows);
+  });
 
   if constexpr (TurboMindLayout) {
     if (tm_scales.scalar_type() == torch::kUInt8) {
